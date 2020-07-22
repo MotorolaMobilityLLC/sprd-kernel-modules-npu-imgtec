@@ -550,6 +550,7 @@ static long vha_ioctl_map(struct vha_session *session, void __user *buf)
 	struct vha_map_data data;
 	struct vha_dev *vha = session->vha;
 	struct miscdevice *miscdev = &vha->miscdev;
+	int ret = 0;
 
 	if (copy_from_user(&data, buf, sizeof(data))) {
 		dev_err(miscdev->this_device,
@@ -557,8 +558,12 @@ static long vha_ioctl_map(struct vha_session *session, void __user *buf)
 		return -EFAULT;
 	}
 
-	return vha_map_buffer(session, data.buf_id,
+	vha_session_pm_get(session);
+	ret = vha_map_buffer(session, data.buf_id,
 				data.virt_addr, data.flags);
+	vha_session_pm_put(session);
+
+	return ret;
 }
 
 static long vha_ioctl_unmap(struct vha_session *session, void __user *buf)
@@ -566,6 +571,7 @@ static long vha_ioctl_unmap(struct vha_session *session, void __user *buf)
 	struct vha_unmap_data data;
 	struct vha_dev *vha = session->vha;
 	struct miscdevice *miscdev = &vha->miscdev;
+	int ret = 0;
 
 	if (copy_from_user(&data, buf, sizeof(data))) {
 		dev_err(miscdev->this_device,
@@ -573,7 +579,11 @@ static long vha_ioctl_unmap(struct vha_session *session, void __user *buf)
 		return -EFAULT;
 	}
 
-	return vha_unmap_buffer(session, data.buf_id);
+	vha_session_pm_get(session);
+	ret = vha_unmap_buffer(session, data.buf_id);
+	vha_session_pm_put(session);
+
+	return ret;
 }
 
 static long vha_ioctl_buf_status(struct vha_session *session, void __user *buf)
