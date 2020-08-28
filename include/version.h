@@ -42,6 +42,6 @@
 #ifndef VERSION_H
 #define VERSION_H
 
-#define VERSION_STRING "REL_2.6-cl5749543"
+#define VERSION_STRING "REL_2.6-cl5777119"
 
 #endif  // VERSION_H
