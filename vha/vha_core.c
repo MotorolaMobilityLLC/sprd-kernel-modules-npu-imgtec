@@ -184,14 +184,6 @@ struct vha_biterr {
 };
 #define ERR_EVENT_DESC(b) VHA_CR_OS(VHA_EVENT_STATUS_VHA_##b##_EN), __stringify(b)
 
-/* Status of command execution attempt. */
-enum do_cmd_status {
-	CMD_OK = 0,      /* command scheduled */
-	CMD_IN_HW,       /* command already in hardware */
-	CMD_WAIT_INBUFS, /* command waiting for input buffers */
-	CMD_HW_BUSY      /* hardware is busy with other command */
-};
-
 static void cmd_worker(struct work_struct *work);
 static bool vha_is_busy(struct vha_dev *vha);
 static void vha_sched_apm(struct vha_dev *vha, uint32_t delay_ms);
@@ -2283,7 +2275,7 @@ static bool vha_is_queue_full(struct vha_dev *vha, struct vha_cmd *cmd)
 static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 {
 	struct vha_session *session = cmd->session;
-
+	enum do_cmd_status cmd_status = CMD_OK;
 	/* already submitted, wait until processed */
 	if (cmd->in_hw)
 		return CMD_IN_HW;
@@ -2306,9 +2298,9 @@ static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 		img_pdump_printf("-- ALLOC_END\n");
 
 	/* at this point we should be able to process the cmd */
-	vha_do_cnn_cmd(cmd);
+	cmd_status = vha_do_cnn_cmd(cmd);
 
-	return CMD_OK;
+	return cmd_status;
 }
 
 /* check if there is any work to be done */
@@ -2320,6 +2312,7 @@ static void cmd_worker(struct work_struct *work)
 	bool queued, in_hw;
 	bool retry = false;
 	bool retrying = false;
+	enum do_cmd_status cmd_status = CMD_OK;
 
 	dev_dbg(vha->dev, "%s\n", __func__);
 	mutex_lock(&vha->lock);
@@ -2353,8 +2346,10 @@ static void cmd_worker(struct work_struct *work)
 					in_hw = cmd->in_hw;
 				}
 				/* Attempt to schedule command for execution. */
-				vha_do_cmd(cmd);
-
+				cmd_status = vha_do_cmd(cmd);
+				if (cmd_status == CMD_NOTIFIED) {
+					continue;
+				}
 				/* For hw commands... */
 				if (CMD_EXEC_ON_HW(cmd)) {
 					/* For low latency processing... */
@@ -2744,6 +2739,7 @@ err_fences:
 	for (; i >= 0; i--) {
 		img_mem_remove_fence(session->mem_ctx, buf_ids[i]);
 	}
+	kfree(fences);
 	kfree(cb_data);
 	return ret;
 }

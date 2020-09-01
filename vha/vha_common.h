@@ -401,6 +401,15 @@ struct vha_onchip_map {
 	uint64_t            devvirt; /* device virtual address */
 };
 
+/* Status of command execution attempt. */
+enum do_cmd_status {
+	CMD_OK = 0,      /* command scheduled */
+	CMD_IN_HW,       /* command already in hardware */
+	CMD_WAIT_INBUFS, /* command waiting for input buffers */
+	CMD_HW_BUSY,     /* hardware is busy with other command */
+	CMD_NOTIFIED     /* command is notified to user space */
+};
+
 int vha_deinit(void);
 uint64_t vha_buf_addr(struct vha_session *session, struct vha_buffer *buf);
 int vha_map_buffer(struct vha_session *session,
@@ -466,7 +475,7 @@ int vha_api_rm_dev(struct device *dev, struct vha_dev *vha);
 
 void vha_mmu_setup(struct vha_session *session);
 
-int vha_do_cnn_cmd(struct vha_cmd *cmd);
+enum do_cmd_status vha_do_cnn_cmd(struct vha_cmd *cmd);
 void vha_cmd_notify(struct vha_cmd *cmd);
 
 void vha_dev_hwwdt_setup(struct vha_dev *vha, uint64_t cycles, uint64_t mode);

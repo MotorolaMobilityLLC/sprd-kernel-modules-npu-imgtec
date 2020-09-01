@@ -674,7 +674,7 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
  * Perform a command, as requested by user.
  * note: this function is called with vha_dev.lock == locked
  */
-int vha_do_cnn_cmd(struct vha_cmd *cmd)
+enum do_cmd_status vha_do_cnn_cmd(struct vha_cmd *cmd)
 {
 	struct vha_session *session = cmd->session;
 	const struct vha_user_cmd *user_cmd = &cmd->user_cmd;
@@ -718,9 +718,10 @@ int vha_do_cnn_cmd(struct vha_cmd *cmd)
 	if (!CMD_EXEC_ON_HW(cmd) || status) {
 		vha_cnn_cmd_completed(cmd, status);
 		vha_cmd_notify(cmd);
+		return CMD_NOTIFIED;
 	}
 
-	return 0;
+	return CMD_OK;
 }
 
 void vha_cnn_dump_status(struct vha_dev *vha)
