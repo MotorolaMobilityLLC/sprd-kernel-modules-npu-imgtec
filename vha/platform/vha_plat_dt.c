@@ -55,10 +55,8 @@
 #include <linux/version.h>
 #include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
-#include <linux/sprd_dfs_drv.h>
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
-#include <linux/sprd_dfs_drv.h>
 
 #include <img_mem_man.h>
 #include "vha_common.h"
@@ -294,38 +292,22 @@ static int vha_plat_runtime_idle(struct device *dev)
 
 static int vha_plat_runtime_suspend(struct device *dev)
 {
-	int ret = 0;
-
 	dev_info(dev, "runtime_pm: vha_plat_runtime_suspend!\n");
 	vha_clockdomain_unsetup();
 	vha_powerdomain_unsetup();
 	pm_relax(dev);
-
-	dev_info(dev, "Set dfs_vol_vote as 0\n");
-	ret = dfs_vol_vote(0);
-	if (ret < 0) {
-		dev_err(dev, "dfs_vol_vote return error, ret = %d!\n", ret);
-	}
 
 	return 0;
 }
 
 static int vha_plat_runtime_resume(struct device *dev)
 {
-	int ret = 0;
-
 	dev_info(dev, "runtime_pm: vha_plat_runtime_resume!\n");
 	pm_stay_awake(dev);
 	vha_powerdomain_setup();
 	vha_clockdomain_setup();
 	vha_clockdomain_select(dev);
 	vha_set_qos(dev);
-
-	dev_info(dev, "Set dfs_vol_vote vote as 1\n");
-	ret = dfs_vol_vote(1);
-	if (ret < 0) {
-		dev_err(dev, "dfs_vol_vote return error, ret = %d!\n", ret);
-	}
 
 	return 0;
 }
