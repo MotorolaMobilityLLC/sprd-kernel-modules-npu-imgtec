@@ -68,6 +68,11 @@ static int ocm_heap_alloc(struct device *device, struct heap *heap,
 
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		buffer->id, buffer);
+	if (size > heap->options.ocm.size) {
+		pr_err("%s requested size bigger than ocm size !\n",
+				__func__);
+		return -EINVAL;
+	}
 
 	buffer_data = kzalloc(sizeof(struct buffer_data), GFP_KERNEL);
 	if (!buffer_data)
@@ -146,9 +151,9 @@ static struct heap_ops ocm_heap_ops = {
 
 int img_mem_ocm_init(const struct heap_config *heap_cfg, struct heap *heap)
 {
-	pr_debug("%s phys:%#llx size:%zu\n", __func__,
+	pr_debug("%s phys:%#llx size:%zu attrs:%#x\n", __func__,
 		 (unsigned long long)heap->options.ocm.phys,
-		 heap->options.ocm.size);
+		 heap->options.ocm.size, heap->options.ocm.hattr);
 
 	heap->ops = &ocm_heap_ops;
 	heap->priv = NULL;

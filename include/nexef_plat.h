@@ -1,9 +1,5 @@
 /*!
  *****************************************************************************
- *
- * @File       img_mem_man.h
- * ---------------------------------------------------------------------------
- *
  * Copyright (c) Imagination Technologies Ltd.
  *
  * The contents of this file are subject to the MIT license as set out below.
@@ -42,73 +38,18 @@
  * "MIT_COPYING".
  *
  *****************************************************************************/
+#ifndef GYRUS_PLAT_H
+#define GYRUS_PLAT_H
 
-#ifndef IMG_MEM_MAN_UAPI_H
-#define IMG_MEM_MAN_UAPI_H
+#define NEXEF_NNA_DEVICE_NAME "nexef_nna"
 
-/* memory attributes */
-enum img_mem_attr {
-	IMG_MEM_ATTR_CACHED        = 0x00000001,
-	IMG_MEM_ATTR_UNCACHED      = 0x00000002,
-	IMG_MEM_ATTR_WRITECOMBINE  = 0x00000004,
-
-	/* Special */
-	IMG_MEM_ATTR_SECURE        = 0x00000010,
-	IMG_MEM_ATTR_NOMAP         = 0x00000020,
-	IMG_MEM_ATTR_NOSYNC        = 0x00000040,
-
-	/* Internal */
-	IMG_MEM_ATTR_MMU           = 0x10000000,
-	IMG_MEM_ATTR_OCM           = 0x20000000,
+struct nexef_nna_platform_data {
+    uint64_t nna_memory_offset;
+    uint64_t nna_memory_base;
+    uint64_t nna_memory_size;
 };
 
-/* Cache attributes mask */
-#define IMG_MEM_ATTR_CACHE_MASK 0xf
 
-/* Supported heap types */
-enum img_mem_heap_type {
-	IMG_MEM_HEAP_TYPE_UNKNOWN = 0,
-	IMG_MEM_HEAP_TYPE_UNIFIED,
-	IMG_MEM_HEAP_TYPE_CARVEOUT,
-	IMG_MEM_HEAP_TYPE_ION,
-	IMG_MEM_HEAP_TYPE_DMABUF,
-	IMG_MEM_HEAP_TYPE_COHERENT,
-	IMG_MEM_HEAP_TYPE_ANONYMOUS,
-	IMG_MEM_HEAP_TYPE_OCM,
-};
+#define TC_INTERRUPT_NNA 2
 
-/* Heap attributes */
-enum img_mem_heap_attrs {
-	IMG_MEM_HEAP_ATTR_INTERNAL  = 0x01,
-	IMG_MEM_HEAP_ATTR_IMPORT    = 0x02,
-	IMG_MEM_HEAP_ATTR_EXPORT    = 0x04,
-	IMG_MEM_HEAP_ATTR_SEALED    = 0x08,
-
-	/* User attributes */
-	IMG_MEM_HEAP_ATTR_LOCAL     = 0x10,
-	IMG_MEM_HEAP_ATTR_SHARED    = 0x20,
-};
-
-/* heaps ids */
-#define IMG_MEM_MAN_HEAP_ID_INVALID 0
-#define IMG_MEM_MAN_MIN_HEAP 1
-#define IMG_MEM_MAN_MAX_HEAP 16
-
-/* buffer ids (per memory context) */
-#define IMG_MEM_MAN_BUF_ID_INVALID 0
-#define IMG_MEM_MAN_MIN_BUFFER 1
-#define IMG_MEM_MAN_MAX_BUFFER 2000
-
-/* Definition of VA guard gap */
-#define IMG_MEM_VA_GUARD_GAP 0x1000
-
-/* Virtual memory space for buffers allocated
- * in the kernel - OCM & device debug buffers */
-#define IMG_MEM_VA_HEAP1_BASE 0x4000000ULL
-#define IMG_MEM_VA_HEAP1_SIZE 0x40000000ULL
-
-/* Virtual memory space for buffers allocated in the user space */
-#define IMG_MEM_VA_HEAP2_BASE (IMG_MEM_VA_HEAP1_BASE + IMG_MEM_VA_HEAP1_SIZE)
-#define IMG_MEM_VA_HEAP2_SIZE 0x3C0000000ULL
-
-#endif /* IMG_MEM_MAN_UAPI_H */
+#endif /* NEXEF_PLAT_H */

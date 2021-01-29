@@ -120,6 +120,7 @@ union heap_options {
 	struct {
 		phys_addr_t phys; /* physical address start of memory */
 		size_t size; /* size of memory */
+		enum img_mem_heap_attrs hattr; /* User attributes */
 	} ocm;
 };
 

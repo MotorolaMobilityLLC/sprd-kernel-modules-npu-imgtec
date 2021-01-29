@@ -50,7 +50,7 @@
 #include <uapi/vha.h>
 #include "vha_common.h"
 #include "vha_plat.h"
-#include "vha_regs.h"
+#include "vha_io.h"
 
 static uint32_t cnn_crc_size_kB;
 static uint32_t cnn_dbg_size_kB;
@@ -75,7 +75,7 @@ MODULE_PARM_DESC(cnn_dbg_modes,
 static uint32_t cnn_crc_mask = 0;
 module_param(cnn_crc_mask, uint, 0444);
 MODULE_PARM_DESC(cnn_crc_mask,
-	"CRC MASK: 0=no mask 1=debug silicon 2-safety critical 3-reserved");
+	"CRC MASK: 0=no mask 1=debug silicon 2=safety critical 3=reserved");
 #endif
 
 static uint32_t cnn_pdump_flush_dbg = 1;
@@ -83,25 +83,12 @@ module_param(cnn_pdump_flush_dbg, uint, 0444);
 MODULE_PARM_DESC(cnn_pdump_flush_dbg,
 	"PDUMP: flushing debug buffs: 0:session,1:stream(default)");
 
-struct vha_reg {
-	char *name;
-	unsigned offset;
-	uint64_t mask;
-};
-
-struct vha_regset {
-	const struct vha_reg *regs;
-	int nregs;
-	void __iomem *base;
-};
-
 struct vha_dbgfs_ctx {
 	struct dentry    *debugfs_dir;
 	struct vha_regset regset;
 	uint64_t          rtm_ctrl;
 	uint64_t          ioreg_addr;
 };
-
 
 /* MMU PTE dump info */
 struct vha_ptedump {
@@ -596,19 +583,28 @@ out_add_failed:
 	return -EFAULT;
 }
 
-/* enable CNN_CRC and CNN_DEBUG capture into buffers */
-int vha_dbg_enable_hwbufs(struct vha_session *session)
+/* create CNN_CRC and CNN_DEBUG capture into buffers */
+int vha_dbg_create_hwbufs(struct vha_session *session)
 {
 	struct vha_dev *vha = session->vha;
 	struct vha_dbgfs_ctx *ctx =
 			(struct vha_dbgfs_ctx *)vha->dbgfs_ctx;
 	int ret;
 
+
+	session->cnn_dbg.cnn_crc_mode = cnn_crc_mode;
+	session->cnn_dbg.cnn_crc_size_kB = cnn_crc_size_kB;
+#ifdef HW_AX3
+	session->cnn_dbg.cnn_crc_mask = cnn_crc_mask;
+#endif
+	memcpy(session->cnn_dbg.cnn_dbg_modes, cnn_dbg_modes, sizeof(cnn_dbg_modes));
+	session->cnn_dbg.cnn_dbg_size_kB = cnn_dbg_size_kB;
 	session->cnn_dbg.cnn_dbg_flush = cnn_pdump_flush_dbg;
+	session->cnn_dbg.cnn_dbg_pdump_enable = cnn_dbg_pdump_enable;
 
 	if (vha->mmu_mode &&
-		((cnn_crc_mode > 0 && cnn_crc_size_kB > 0) ||
-		 (cnn_dbg_size_kB > 0))) {
+		((session->cnn_dbg.cnn_crc_mode > 0 && session->cnn_dbg.cnn_crc_size_kB > 0) ||
+		 (session->cnn_dbg.cnn_crc_size_kB > 0))) {
 		ret = img_mmu_vaa_create(vha->dev,
 				IMG_MEM_VA_HEAP1_BASE, IMG_MEM_VA_HEAP1_SIZE,
 				&session->vaa_ctx);
@@ -647,18 +643,17 @@ int vha_dbg_enable_hwbufs(struct vha_session *session)
 					"%s: failed to create mem_usage_curr!\n",
 					__func__);
 
-            if (!debugfs_create_file("buffer_dump", S_IRUGO, session->dbgfs,
-                                     session, &vha_buffer_dump_fops))
-                dev_warn(vha->dev,
-                         "%s: failed to create buffer_dump!\n",
-                         __func__);
-
+			if (!debugfs_create_file("buffer_dump", S_IRUGO, session->dbgfs,
+								session, &vha_buffer_dump_fops))
+					dev_warn(vha->dev,
+							"%s: failed to create buffer_dump!\n",
+							__func__);
 		}
 	}
 
-	if (cnn_crc_mode > 0 && cnn_crc_size_kB > 0) {
+	if (session->cnn_dbg.cnn_crc_mode > 0 && session->cnn_dbg.cnn_crc_size_kB > 0) {
 		struct vha_buffer *buf;
-		size_t size = cnn_crc_size_kB * 1024;
+		size_t size = cnn_crc_size_kB * 1024 * vha->core_props.num_cnn_core_devs;
 
 		ret = vha_dbg_alloc_hwbuf(session, size, &buf, "CRC", true);
 		if (ret) {
@@ -672,14 +667,7 @@ int vha_dbg_enable_hwbufs(struct vha_session *session)
 
 	if (cnn_dbg_size_kB > 0) {
 		struct vha_buffer *buf;
-		size_t size = cnn_dbg_size_kB * 1024;
-		size_t max = VHA_CR_ALIGN_MAX_OS(CNN_DEBUG_SIZE, CNN_DEBUG_SIZE);
-
-		if (size > max) {
-			dev_warn(vha->dev, "warning: max cnn_dbg_size: %zx\n",
-				 max);
-			size = max;
-		}
+		size_t size = cnn_dbg_size_kB * 1024 * vha->core_props.num_cnn_core_devs;
 		ret = vha_dbg_alloc_hwbuf(session, size, &buf, "DBG", true);
 		if (ret) {
 			dev_err(vha->dev,
@@ -694,96 +682,8 @@ int vha_dbg_enable_hwbufs(struct vha_session *session)
 	return 0;
 
 out_disable:
-	vha_dbg_disable_hwbufs(session);
+	vha_dbg_destroy_hwbufs(session);
 	return ret;
-}
-
-/* prepare CRC and DEBUG data buffers */
-void vha_dbg_prepare_hwbufs(struct vha_session *session)
-{
-	struct vha_dev *vha = session->vha;
-
-	if (session->cnn_dbg.cnn_crc_buf) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf;
-		uint64_t val64;
-
-		/* enable CRC: address + mode */
-		val64 = VHA_CR_SETBITS_OS(CNN_CRC_CONTROL, CNN_CRC_ENABLE,
-				       cnn_crc_mode);
-		img_pdump_printf("-- CRC_CONTROL=%u buf '%s' size=%zx\n",
-				 cnn_crc_mode, buf->name, buf->size);
-		IOWRITE_PDUMP_BUFADDR(session, buf, 0, VHA_CR_OS(CNN_CRC_ADDRESS));
-
-		IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_CRC_CONTROL));
-
-#ifdef HW_AX3
-		img_pdump_printf("-- CRC_MASK=%#x\n", cnn_crc_mask);
-		IOWRITE64_PDUMP(cnn_crc_mask, VHA_CR_OS(CNN_CRC_MASK_CTRL));
-#endif
-	}
-	if (session->cnn_dbg.cnn_dbg_buf && cnn_dbg_pdump_enable) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf;
-		uint64_t val64;
-
-		/* enable DEBUG: address, perf mode, band mode */
-		img_pdump_printf("-- DEBUG_CONTROL=%u,%u buf '%s' size=%zx\n",
-				 cnn_dbg_modes[0], cnn_dbg_modes[1],
-				 buf->name, buf->size);
-		IOWRITE_PDUMP_BUFADDR(session, buf, 0,
-				      VHA_CR_OS(CNN_DEBUG_ADDRESS));
-		val64 = VHA_CR_ALIGN_SETBITS_OS(CNN_DEBUG_SIZE,
-					      CNN_DEBUG_SIZE,
-					      buf->size);
-		IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_DEBUG_SIZE));
-
-		/* Set the CONTROL register only if requested */
-		if (cnn_dbg_modes[0] > 0 || cnn_dbg_modes[1] > 0) {
-			val64 = VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL,
-				       CNN_PERF_ENABLE,
-				       cnn_dbg_modes[0]);
-			val64 |= VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL,
-				       CNN_BAND_ENABLE,
-				       cnn_dbg_modes[1]);
-			IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_DEBUG_CONTROL));
-		}
-	}
-}
-
-/* flush CRC and DEBUG data buffers */
-void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint)
-{
-	if (session->cnn_dbg.cnn_dbg_flush != checkpoint)
-		return;
-
-	if (session->cnn_dbg.cnn_crc_buf) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf;
-		/*
-		 * TOBEDONE: calculate CRC buffer size based
-		 * on num passes, num layers, etc
-		 */
-		img_pdump_printf("-- Save signatures\n");
-		img_pdump_printf("IF CHECK_CRCS\n");
-		img_pdump_printf("COM Checking CRCs ...\n");
-		vha_pdump_sab_buf(session, PDUMP_CRC,
-				  buf, 0, buf->size);
-		img_pdump_printf("ELSE CHECK_CRCS\n");
-		img_pdump_printf("COM Not checking CRCs!\n");
-		img_pdump_printf("FI CHECK_CRCS\n");
-	}
-	if (session->cnn_dbg.cnn_dbg_buf && cnn_dbg_pdump_enable) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf;
-		struct vha_dev *vha = session->vha;
-		/* read the size of the DEBUG buffer */
-		uint64_t size = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_DEBUG_STATUS));
-		/*
-		 * SAB the DBG buffer, even though "it is not deterministic"
-		 */
-		size = VHA_CR_GETBITS_OS(CNN_DEBUG_STATUS,
-					    CNN_DEBUG_OFFSET,
-					    size);
-		img_pdump_printf("-- Save DEBUG info\n");
-		vha_pdump_sab_buf(session, PDUMP_DBG, buf, 0, buf->size);
-	}
 }
 
 void vha_dbg_hwbuf_cleanup(struct vha_session *session,
@@ -801,34 +701,17 @@ void vha_dbg_hwbuf_cleanup(struct vha_session *session,
 	img_mem_free(session->mem_ctx, buf->id);
 }
 
-/* stop capturing CRC and DEBUG data and free the buffers */
-void vha_dbg_disable_hwbufs(struct vha_session *session)
+/* free the CRC and DEBUG buffers */
+void vha_dbg_destroy_hwbufs(struct vha_session *session)
 {
 	struct vha_dev *vha = session->vha;
 
-	/* Flush hw debug buffers */
-	vha_dbg_flush_hwbufs(session, 0);
-
 	if (session->cnn_dbg.cnn_crc_buf) {
 		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf;
-
-		IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_CRC_CONTROL));
 		vha_dbg_hwbuf_cleanup(session, buf);
 	}
 	if (session->cnn_dbg.cnn_dbg_buf) {
 		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf;
-		/* read the size of the DEBUG buffer */
-		uint64_t size = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_DEBUG_STATUS));
-
-		if (cnn_dbg_modes[0] > 0 || cnn_dbg_modes[1] > 0) {
-			IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_DEBUG_CONTROL));
-			/* just give a hint in the pdump:
-			 * dummy device returns 0 */
-			img_pdump_printf(
-					"-- POL64 :REG:%#x 0 0 0 1 1 -- DEBUG_STATUS=%llx\n",
-					 VHA_CR_OS(CNN_DEBUG_STATUS),
-				size);
-		}
 		vha_dbg_hwbuf_cleanup(session, buf);
 	}
 
@@ -847,7 +730,12 @@ static int _show_vha_regset(struct seq_file *s, void *data)
 	int i;
 
 	for (i = 0; i < regset->nregs; i++, reg++) {
-		uint64_t val = IOREAD64(regset->base, reg->offset);
+		uint64_t val;
+
+		if (reg->name == NULL)
+			break;
+
+		val = IOREAD64(regset->base, reg->offset);
 		sprintf(str, "%s(0x%04x) = 0x%016llx",
 				reg->name, reg->offset, val);
 		if (val & ~reg->mask)
@@ -871,48 +759,7 @@ static const struct file_operations vha_regset_fops = {
 };
 
 /* List of predefined registers to be shown in debugfs */
-static const struct vha_reg vha_regs[] = {
-#define REG_DESC(reg) VHA_CR_##reg, VHA_CR_##reg##_MASKFULL
-#define REG_DESC_OS(reg) VHA_CR_OS(reg), VHA_CR_OS(reg##_MASKFULL)
-	{"main_clocks_control  ", REG_DESC(CLK_CTRL0)},
-	{"main_clocks_status   ", REG_DESC(CLK_STATUS0)},
-	{"sys_clocks_control   ", REG_DESC(SYS_CLK_CTRL0)},
-	{"sys_clocks_status    ", REG_DESC(SYS_CLK_STATUS0)},
-	{"product_id           ", REG_DESC(PRODUCT_ID)},
-	{"core_id              ", REG_DESC(CORE_ID)},
-	{"soc_axi              ", REG_DESC(SOC_AXI)},
-	{"integrator_id        ", REG_DESC(CORE_IP_INTEGRATOR_ID)},
-	{"ip_changelist        ", REG_DESC(CORE_IP_CHANGELIST)},
-	{"reset                ", REG_DESC(RESET_CTRL)},
-	{"event_enable         ", REG_DESC_OS(VHA_EVENT_ENABLE)},
-	{"event_status         ", REG_DESC_OS(VHA_EVENT_STATUS)},
-	{"cnn_control          ", REG_DESC_OS(CNN_CONTROL)},
-	{"cnn_status           ", REG_DESC_OS(CNN_STATUS)},
-#ifdef HW_AX2
-	{"cnn_wdt_cmpmatch     ", REG_DESC(CNN_WDT_COMPAREMATCH)},
-	{"cnn_wdt_control      ", REG_DESC(CNN_WDT_CTRL)},
-	{"cnn_wdt_timer        ", REG_DESC(CNN_WDT_TIMER)},
-#endif
-	{"cnn_mem_wdt_cmpmatch ", REG_DESC(CNN_MEM_WDT_COMPAREMATCH)},
-	{"cnn_mem_wdt_control  ", REG_DESC(CNN_MEM_WDT_CTRL)},
-	{"cnn_mem_wdt_timer    ", REG_DESC(CNN_MEM_WDT_TIMER)},
-	{"mmu_control          ", REG_DESC_OS(MMU_CTRL)},
-	{"mmu_context          ", REG_DESC_OS(MMU_CBASE_MAPPING_CONTEXT)},
-	{"mmu_mapping          ", REG_DESC_OS(MMU_CBASE_MAPPING)},
-	{"mmu_status           ", REG_DESC(MMU_STATUS)},
-	{"mmu_fault_status1    ", REG_DESC_OS(MMU_FAULT_STATUS1)},
-	{"mmu_fault_status2    ", REG_DESC_OS(MMU_FAULT_STATUS2)},
-	{"slc_control          ", REG_DESC(SLC_CTRL)},
-#if 0
-	{"slc_bypass_control   ", REG_DESC(SLC_BYPASS_CTRL)},
-#endif
-	{"slc_status1          ", REG_DESC(SLC_STATUS1)},
-	{"slc_status2          ", REG_DESC(SLC_STATUS2)},
-	{"slc_status3          ", REG_DESC(SLC_STATUS3)},
-	{"slc_idle             ", REG_DESC(SLC_IDLE)},
-	{"bif_outstanding_read ", REG_DESC(BIF_OUTSTANDING_READ)},
-#undef REG_DESC
-};
+extern const struct vha_reg vha_regs[];
 
 static ssize_t vha_cnn_utilization_read(struct file *file, char __user *buf,
 			size_t count, loff_t *ppos)
@@ -960,14 +807,18 @@ static ssize_t vha_cnn_last_cycles_read(struct file *file, char __user *buf, siz
 #if defined(HW_AX2)
 	/* For Mirage cnn_last_cycles holds a valid value only
 	 * when we set WDT per segment */
-	if ((vha->wdt_mode & VHA_CR_CNN_WDT_CTRL_CNN_WDT_CTRL_MASK) ==
-				VHA_CR_CNN_WDT_CTRL_CNN_WDT_CTRL_KICK_PASS)
+#define WDT_CTRL_MASK (3)
+#define	WDT_CTRL_KICK_PASS (1)
+	if ((vha->wdt_mode & WDT_CTRL_MASK) ==
+				WDT_CTRL_KICK_PASS)
 		size = snprintf(cycles, sizeof(cycles), "n/a\n");
 	else
-#elif defined(HW_AX3)
+#elif defined(HW_AX3) && !defined(CONFIG_HW_MULTICORE)
 	/* For Aura cnn_last_cycles holds a valid value only
-	 * when debug mode is turned on to collect performance data per segment */
-	if (cnn_dbg_modes[0] != VHA_CR_CNN_DEBUG_CTRL_STREAM)
+	 * when debug mode is turned on to collect performance data per segment
+	 * VHA_CR_CNN_DEBUG_CTRL_STREAM */
+#define DEBUG_CTRL_STREAM (1)
+	if (cnn_dbg_modes[0] != DEBUG_CTRL_STREAM)
 		size = snprintf(cycles, sizeof(cycles), "n/a\n");
 	else
 #endif
@@ -988,7 +839,8 @@ static ssize_t vha_bvnc_read(struct file *file, char __user *buf, size_t len,
 {
 	struct vha_dev *vha = file->private_data;
 	char bvnc[4*6];
-	uint64_t core_id = IOREAD64(vha->reg_base, VHA_CR_CORE_ID);
+#define BVNC_OFFSET (0x20U)
+	uint64_t core_id = IOREAD64(vha->reg_base, BVNC_OFFSET);
 	size_t size = snprintf(bvnc, sizeof(bvnc), "%hu.%hu.%hu.%hu\n",
 		      (unsigned short)((core_id & 0xffff000000000000ULL) >> 48),
 		      (unsigned short)((core_id & 0x0000ffff00000000ULL) >> 32),
@@ -1020,21 +872,7 @@ static ssize_t vha_rtm_read(struct file *file, char __user *buf, size_t len,
 	if (!ret) {
 		size_t size;
 
-		/* Turn on all clocks forcefully */
-		IOWRITE64(vha->reg_base, VHA_CR_SYS_CLK_CTRL0, VHA_SYS_CLOCKS_DEFAULT(ON));
-		IOWRITE64(vha->reg_base, VHA_CR_CLK_CTRL0, VHA_MAIN_CLOCKS_DEFAULT(ON));
-
-		/* Set up address of the signal */
-		IOWRITE64(vha->reg_base, VHA_CR_RTM_CTRL,
-			ctx->rtm_ctrl | VHA_CR_RTM_CTRL_RTM_ENABLE_EN);
-
-		
-		/* but N_OF_RTM_STAGES is not accessible by SW*/
-		/* so waiting 1 ms for now */
-		msleep(1);
-
-		/* Read the data */
-		rtm_data = IOREAD64(vha->reg_base, VHA_CR_RTM_DATA);
+		rtm_data = vha_dbg_rtm_read(vha, ctx->rtm_ctrl);
 		size = snprintf(rtm, sizeof(rtm), "%#.8llx %#.8llx\n",
 			ctx->rtm_ctrl, rtm_data);
 
@@ -1150,7 +988,7 @@ void vha_dbg_init(struct vha_dev *vha)
 	/* and some registers for debug */
 	if (vha->reg_base) {
 		ctx->regset.regs = vha_regs;
-		ctx->regset.nregs = ARRAY_SIZE(vha_regs);
+		ctx->regset.nregs = vha->reg_size / sizeof(uint64_t);
 		ctx->regset.base = vha->reg_base;
 		if (!debugfs_create_file("regdump", S_IRUGO, ctx->debugfs_dir,
 					&ctx->regset, &vha_regset_fops))

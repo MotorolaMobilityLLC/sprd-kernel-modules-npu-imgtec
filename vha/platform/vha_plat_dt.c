@@ -54,9 +54,9 @@
 #include <linux/pm.h>
 #include <linux/version.h>
 #include <linux/pm_runtime.h>
-#include <linux/pm_wakeup.h>
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
+#include <linux/regulator/consumer.h>
 
 #include <img_mem_man.h>
 #include "vha_common.h"
@@ -95,6 +95,13 @@ static struct poll_timer {
 
 } irq_poll_timer;
 
+struct irq_functions {
+	char *irq_name;
+	irq_handler_t irq_top_half;
+	irq_handler_t irq_bottom_half;
+	int irq_num;
+};
+
 static irqreturn_t dt_plat_thread_irq(int irq, void *dev_id)
 {
 	struct platform_device *ofdev = (struct platform_device *)dev_id;
@@ -110,6 +117,52 @@ static irqreturn_t dt_plat_isrcb(int irq, void *dev_id)
 		return IRQ_NONE;
 
 	return vha_handle_irq(&ofdev->dev);
+}
+
+static struct irq_functions irq_func_table[] = {
+	[0].irq_name = "ai_powervr_0",
+	[0].irq_top_half = &dt_plat_isrcb,
+	[0].irq_bottom_half = &dt_plat_thread_irq,
+	[0].irq_num = 0,
+#if 0 //Only OSID0 irq is handled
+	[1].irq_name = "ai_powervr_1",
+	[1].irq_top_half = NULL,
+	[1].irq_bottom_half = NULL,
+	[1].irq_num = 0,
+	[2].irq_name = "ai_powervr_2",
+	[2].irq_top_half = NULL,
+	[2].irq_bottom_half = NULL,
+	[2].irq_num = 0,
+	[3].irq_name = "ai_mem_fw",
+	[3].irq_top_half = NULL,
+	[3].irq_bottom_half = NULL,
+	[3].irq_num = 0,
+	[4].irq_name = "ai_perf_busmon",
+	[4].irq_top_half = NULL,
+	[4].irq_bottom_half = NULL,
+	[4].irq_num = 0,
+#endif
+};
+
+static int dt_plat_reg_irqs(struct platform_device *ofdev)
+{
+	int ret = 0;
+	int i, irq_count = ARRAY_SIZE(irq_func_table);
+	for (i = 0; i < irq_count; i++) {
+		irq_func_table[i].irq_num = of_irq_get_byname(ofdev->dev.of_node, irq_func_table[i].irq_name);
+		if (irq_func_table[i].irq_num == 0) {
+			dev_err(&ofdev->dev, "could not map IRQ\n");
+			return -ENXIO;
+		}
+		ret = devm_request_threaded_irq(&ofdev->dev, irq_func_table[i].irq_num, irq_func_table[i].irq_top_half,
+				irq_func_table[i].irq_bottom_half, IRQF_SHARED, DEVICE_NAME, ofdev);
+		if (ret) {
+			dev_err(&ofdev->dev, "failed to request irq\n");
+			return ret;
+		}
+	}
+
+	return 0;
 }
 
 /* Interrupt polling function */
@@ -135,15 +188,38 @@ static void dt_plat_poll_interrupt(unsigned long ctx)
 			jiffies + msecs_to_jiffies(irq_poll_interval_ms));
 }
 
+static struct regulator *vddai;
+static int vddai_enable(struct device *dev)
+{
+	int err = 0;
+	if (!vddai) {
+		vddai = regulator_get(dev, "vddai");
+		if (IS_ERR_OR_NULL(vddai))
+		{
+			err = PTR_ERR(vddai);
+			return err;
+		}
+	}
+	if (!regulator_is_enabled(vddai)) {
+		regulator_enable(vddai);
+	}
+	return 0;
+}
+
+static void vddai_disable(struct device *dev)
+{
+	if (regulator_is_enabled(vddai)) {
+		regulator_disable(vddai);
+	}
+}
+
 static int vha_plat_probe(struct platform_device *ofdev)
 {
 	struct heap_config *heap_configs;
 	int num_heaps;
-	int ret, module_irq;
+	int ret;
 	struct resource res;
 	void __iomem *reg_addr;
-	void __iomem *sys_addr = NULL;
-	struct vha_sys_data *sys_data = NULL;
 	uint32_t reg_size, core_size;
 
 	ret = of_address_to_resource(ofdev->dev.of_node, 0, &res);
@@ -154,17 +230,15 @@ static int vha_plat_probe(struct platform_device *ofdev)
 	pr_info("%s: registers %#llx-%#llx\n", __func__,
 		(unsigned long long)res.start, (unsigned long long)res.end);
 
-	module_irq = irq_of_parse_and_map(ofdev->dev.of_node, 0);
-	if (module_irq == 0) {
-		dev_err(&ofdev->dev, "could not map IRQ\n");
-		return -ENXIO;
-	}
-
 	/* Assuming DT holds a single registers space entry that covers all regions,
 	 * So we need to do the split accordingly */
 	reg_size = res.end - res.start + 1;
 
+#ifdef CFG_SYS_VAGUS
+	core_size = _REG_SIZE + _REG_NNSYS_SIZE;
+#else
 	core_size = _REG_SIZE;
+#endif
 	if ((res.start + _REG_START) > res.end) {
 		dev_err(&ofdev->dev, "wrong system conf for core region!\n");
 		return -ENXIO;
@@ -175,28 +249,7 @@ static int vha_plat_probe(struct platform_device *ofdev)
 		core_size = reg_size - _REG_START;
 	}
 
-#ifdef CFG_SYS_VAGUS
-	{
-		uint32_t sys_size = _REG_NNSYS_SIZE;
 
-		if ((res.start + _REG_NNSYS_START) > res.end) {
-			dev_err(&ofdev->dev, "wrong system conf for sys region!\n");
-			return -ENXIO;
-		}
-
-		if ((res.start + _REG_NNSYS_START + sys_size) > res.end) {
-			dev_warn(&ofdev->dev, "trimming system conf for sys region!\n");
-			sys_size = reg_size - _REG_NNSYS_START;
-		}
-
-		sys_addr = devm_ioremap_nocache(&ofdev->dev, res.start +
-				_REG_NNSYS_START, sys_size);
-		if (!sys_addr) {
-			dev_err(&ofdev->dev, "failed to map sys registers\n");
-			return -ENXIO;
-		}
-	}
-#endif
 	reg_addr = devm_ioremap_nocache(&ofdev->dev, res.start +
 			_REG_START, core_size);
 	if (!reg_addr) {
@@ -204,39 +257,29 @@ static int vha_plat_probe(struct platform_device *ofdev)
 		return -ENXIO;
 	}
 
-	device_set_wakeup_capable(&ofdev->dev, true);
-	device_wakeup_enable(&ofdev->dev);
-
-	vha_powerdomain_init(&ofdev->dev);
-	vha_powerdomain_setup();
-	vha_clockdomain_init(&ofdev->dev);
-	vha_clock_init(&ofdev->dev);
-	vha_ai_parse_qos_dt(&ofdev->dev);
+	vddai_enable(&ofdev->dev);
+	vha_chip_init(&ofdev->dev);
 
 	pm_runtime_enable(&ofdev->dev);
-
 	pm_runtime_get_sync(&ofdev->dev);
 
-	ret = vha_plat_dt_hw_init(ofdev, &heap_configs, &num_heaps,
-			sys_addr, &sys_data);
+	ret = vha_plat_dt_hw_init(ofdev, &heap_configs, &num_heaps);
 	if (ret) {
 		dev_err(&ofdev->dev, "failed to init platform-specific hw!\n");
 		goto out_add_dev;
 	}
 
 	ret = vha_add_dev(&ofdev->dev, heap_configs, num_heaps,
-			  NULL /* plat priv data */, sys_data,
-			  reg_addr, core_size);
+			  NULL /* plat priv data */, reg_addr, core_size);
 	if (ret) {
 		dev_err(&ofdev->dev, "failed to intialize driver core!\n");
 		goto out_add_dev;
 	}
 
 	if (!poll_interrupts) {
-		ret = devm_request_threaded_irq(&ofdev->dev, module_irq, &dt_plat_isrcb,
-				&dt_plat_thread_irq, IRQF_SHARED, DEVICE_NAME, ofdev);
+		ret = dt_plat_reg_irqs(ofdev);
 		if (ret) {
-			dev_err(&ofdev->dev, "failed to request irq\n");
+			dev_err(&ofdev->dev, "failed to register irqs\n");
 			goto out_irq;
 		}
 	} else {
@@ -264,22 +307,16 @@ out_irq:
 	vha_rm_dev(&ofdev->dev);
 out_add_dev:
 	devm_iounmap(&ofdev->dev, reg_addr);
-#ifdef CFG_SYS_VAGUS
-	devm_iounmap(&ofdev->dev, sys_addr);
-#endif
 	return ret;
 }
 
 static int vha_plat_remove(struct platform_device *ofdev)
 {
 	vha_rm_dev(&ofdev->dev);
-
 	vha_plat_dt_hw_destroy(ofdev);
-	
 	pm_runtime_disable(&ofdev->dev);
-
-	device_wakeup_disable(&ofdev->dev);
-
+	vha_chip_deinit(&ofdev->dev);
+	vddai_disable(&ofdev->dev);
 	return 0;
 }
 
@@ -293,8 +330,7 @@ static int vha_plat_runtime_idle(struct device *dev)
 static int vha_plat_runtime_suspend(struct device *dev)
 {
 	dev_info(dev, "runtime_pm: vha_plat_runtime_suspend!\n");
-	vha_clockdomain_unsetup();
-	vha_powerdomain_unsetup();
+	vha_chip_runtime_suspend(dev);
 	pm_relax(dev);
 
 	return 0;
@@ -304,10 +340,7 @@ static int vha_plat_runtime_resume(struct device *dev)
 {
 	dev_info(dev, "runtime_pm: vha_plat_runtime_resume!\n");
 	pm_stay_awake(dev);
-	vha_powerdomain_setup();
-	vha_clockdomain_setup();
-	vha_clockdomain_select(dev);
-	vha_set_qos(dev);
+	vha_chip_runtime_resume(dev);
 
 	return 0;
 }

@@ -57,6 +57,22 @@
 /* Memory watchdog is set ~1ms @800MHz which is very safe value to avoid any false interrupts */
 #define VHA_MEM_WDT_CYCLES 0xfffff
 #endif
+#ifdef CONFIG_HW_MULTICORE
+/* System watchdog cycles default values */
+#define VHA_SYS_MEM_WDT_CYCLES       0xfffff
+/* WM watchdog cycles default values */
+#define VHA_WM_WL_WDT_CYCLES         0xfffff
+#define VHA_WM_WL_IDLE_WDT_CYCLES    0xfffff
+#define VHA_WM_SOCIF_WD_CYCLES       0xfffff
+/* Core watchdog cycles default values */
+#define VHA_CNN_HL_WDT_CYCLES        0xfffff
+#define VHA_CNN_MEM_WDT_CYCLES       0xfffff
+#define VHA_CNN_CORE_SYNC_WDT_CYCLES 0xfffff
+/* Clock calibration defines. */
+#define VHA_CALIBRATION_WM_ID     0
+#define VHA_CALIBRATION_CORE_ID   0
+#define VHA_CALIBRATION_CORE_MASK (1 << VHA_CALIBRATION_CORE_ID)
+#endif
 /* Memory burst size */
 #define VHA_CORE_MH_MAX_BURST_LENGTH 128
 /* SLC cache policy type (0-use cache, 1-bypass cache) */
@@ -69,13 +85,6 @@
 /* Suspend delay in ms after which the
  * runtime suspend callback is called */
 #define VHA_CORE_SUSPEND_DELAY 10
-
-/* Structure used to pass system level information
- * from platform to core component */
-struct vha_sys_data {
-	uint32_t ocm_size_kb;
-
-};
 
 /* IO hooks */
 uint64_t vha_plat_read64(void *addr);

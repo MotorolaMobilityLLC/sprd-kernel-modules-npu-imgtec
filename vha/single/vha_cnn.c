@@ -60,75 +60,6 @@ module_param(cnn_preloads_disable, bool, 0444);
 MODULE_PARM_DESC(cnn_preloads_disable,
 		"Disables CNN preloads");
 
-static bool test_without_bvnc_check;
-module_param(test_without_bvnc_check, bool, 0444);
-MODULE_PARM_DESC(test_without_bvnc_check,
-		"When set BVNC check is ignored, allowing to kick the hw");
-
-/* printk helper for converting core_id to BVNC */
-#define core_id_quad(core_id) \
-		(core_id >> 48), (core_id >> 32) & 0xffff, (core_id >> 16) & 0xffff, (core_id & 0xffff)
-
-#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
-		/* Dummy hw processing cycles in case none are provided in MBS. */
-#   define VHA_DUMMY_HW_PROCESSING_TIME_CYCLES 40000
-#endif
-
-
-/*
- * Returns: true if hardware has required capabilities, false otherwise.
- * Implementation is a simple check of expected BVNC against hw CORE_ID
- */
-static inline
-bool check_hw_capabilities(struct vha_dev* vha, uint64_t expected_hw_capabilities)
-{
-	uint64_t __maybe_unused hw = vha->core_props.core_id
-		& VHA_CR_CORE_ID_BVNC_CLRMSK;
-	uint64_t __maybe_unused mbs = expected_hw_capabilities
-		& VHA_CR_CORE_ID_BVNC_CLRMSK;
-
-	if (!test_without_bvnc_check) {
-		img_pdump_printf(
-						"IF SKIP_COREID_CHECK\n"
-						"COM Skip COREID Check\n"
-						"ELSE SKIP_COREID_CHECK\n"
-			"COM CHECKING CORE_ID: expecting BVNC:%llu.%llu.%llu.%llu\n",
-			core_id_quad(expected_hw_capabilities));
-		IOPOLL64_PDUMP(expected_hw_capabilities, 1, 1,
-					VHA_CR_CORE_ID_BVNC_CLRMSK,
-					VHA_CR_CORE_ID);
-				img_pdump_printf(
-						"FI SKIP_COREID_CHECK\n");
-	}
-
-	if ((expected_hw_capabilities >> 48) != HW_SERIES) {
-		dev_err(vha->dev,
-			"%s: network was compiled for incorrect hardware series: expected %llu / found %u\n",
-			__func__,
-			(expected_hw_capabilities >> 48), HW_SERIES);
-		return false;
-	}
-
-#ifndef CONFIG_VHA_DUMMY
-	if (hw != mbs) {
-		dev_warn(vha->dev,
-			"%s: network was compiled for an incorrect hardware variant (BVNC): "
-			"found %llu.%llu.%llu.%llu, expected %llu.%llu.%llu.%llu\n",
-			__func__,
-			core_id_quad(vha->core_props.core_id),
-			core_id_quad(expected_hw_capabilities));
-		/* Conditionally allow the hw to be kicked */
-		if (test_without_bvnc_check)
-			dev_warn(vha->dev, "%s: trying to kick the hw ... ", __func__);
-		else {
-			dev_err(vha->dev, "%s: can't kick the hardware!", __func__);
-			return false;
-		}
-	}
-#endif
-	return true;
-}
-
 /*
  * submit a command stream to the CNN hardware
  * input buffers:
@@ -153,6 +84,9 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 	struct vha_onchip_map *onchip_map = NULL;
 	int ret = -EINVAL;
 	uint64_t alt_addrs_used = 0;
+#ifdef VHA_DEVFREQ
+	ktime_t now;
+#endif
 
 	if (vha->hw_bypass) {
 		ret = -EAGAIN;
@@ -184,7 +118,7 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 		goto out_error;
 	}
 
-	if (!check_hw_capabilities(vha, user_cmd->expected_ip_capabilities)) {
+	if (!vha_dev_check_hw_capab(vha, user_cmd->expected_ip_capab)) {
 		ret = -ENODEV;
 		goto out_error;
 	}
@@ -390,6 +324,11 @@ hw_kick:
 
 	vha->stats.cnn_kicks++;
 
+#ifdef VHA_DEVFREQ
+	now = ktime_get();
+	vha_update_dvfs_state(vha, true, &now);
+#endif
+
 	/* notify any observers of the submit event */
 	if (vha_observers.submitted)
 		vha_observers.submitted(vha->id, cmd->user_cmd.cmd_id);
@@ -423,7 +362,7 @@ static int do_cmd_cnn_pdump_msg(const struct vha_cmd *cmd)
 /*
  * Simple procedure that generates watchdog interrupt
  */
-void vha_cnn_gen_wdt(struct vha_dev *vha)
+void vha_cnn_start_calib(struct vha_dev *vha)
 {
 	uint64_t clk;
 	uint32_t start;
@@ -505,13 +444,14 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 			- sizeof(struct vha_user_rsp);
 		uint32_t status_mask;
 		uint32_t ready_mask;
-#ifdef HW_AX2
+		uint32_t cmpl_val = VHA_CR_OS(VHA_EVENT_STATUS_VHA_CNN0_COMPLETE_EN);
+#if defined(HW_AX2)
 		/* status change: wait for any status change:
 		 * WDT, MMU_PF, ERROR, COMPLETE
 		 */
 		status_mask = 0xffffffff;
 		ready_mask = 0xffffffff;
-#else
+#elif defined(HW_AX3)
 		/* status mask: wait for a status change: either ERROR, COMPLETE:
 		 * note that, unlike the live driver, pdump will ignore the MMU_PF,
 		 * which will have to be detected by the WDT
@@ -519,6 +459,19 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 		status_mask = VHA_CR_OS(VHA_EVENT_STATUS_VHA_ERROR_CLRMSK)
 				| VHA_CR_OS(VHA_EVENT_STATUS_VHA_CNN0_COMPLETE_CLRMSK);
 		ready_mask = VHA_CR_OS(VHA_EVENT_STATUS_VHA_READY_CLRMSK);
+
+		/* Ignore PARITY when waiting for status change */
+		status_mask &= VHA_CR_OS(VHA_EVENT_STATUS_PARITY_CLRMSK);
+#ifdef VHA_SCF
+		if (session->vha->core_props.supported.parity &&
+				!session->vha->parity_disable) {
+			/* If complete bit is set then parity bit must be set as well ! */
+			cmpl_val |= VHA_CR_OS(VHA_EVENT_STATUS_PARITY_EN);
+		}
+#else
+		/* Ignore PARITY, so that non-SCF pdump may work with SC CSIM */
+		ready_mask &= VHA_CR_OS(VHA_EVENT_STATUS_PARITY_CLRMSK);
+#endif
 #endif
 		rsp = kzalloc(sz, GFP_KERNEL);
 		if (rsp == NULL) {
@@ -550,10 +503,21 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 		img_pdump_printf("-- Check for CNN_COMPLETE flag only\n"
 				"POL :REG:%#x %#x 0x%x 0 1 10\n",
 				VHA_CR_OS(VHA_EVENT_STATUS),
-				VHA_CR_OS(VHA_EVENT_STATUS_VHA_CNN0_COMPLETE_EN),
-				ready_mask
-				);
-
+				cmpl_val,
+				ready_mask);
+#ifdef VHA_SCF
+		if (session->vha->core_props.supported.parity &&
+				!session->vha->parity_disable) {
+			/* Check CNN_STATUS parity */
+			uint32_t cnn_status = VHA_CR_SETBITS_OS(CNN_STATUS,
+					STREAM_COUNT, 1);
+			cnn_status |= VHA_CR_SETBITS_OS(CNN_STATUS,
+					PARITY, 1);
+			img_pdump_printf("-- Check for CNN_STATUS parity\n"
+					"POL :REG:%#x %#x 0xffffffff 0 1 10\n",
+					VHA_CR_OS(CNN_STATUS), cnn_status);
+		}
+#endif
 		/* We do clear interrupts in the irq handler,
 		 * but this is not recorded into pdump because
 		 * of the irq context, so do it here */

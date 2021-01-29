@@ -25,10 +25,10 @@
 
 
 /*
- Clock is gated and the module is inactive */
+Clock is gated and the module is inactive */
 #define VHA_CR_CLK_STATUS0_MODE_GATED                     (0x00000000U)
 /*
- Clock is running */
+Clock is running */
 #define VHA_CR_CLK_STATUS0_MODE_RUNNING                   (0x00000001U)
 
 
@@ -356,10 +356,10 @@
 
 
 /*
- Clock is gated and the module is inactive */
+Clock is gated and the module is inactive */
 #define VHA_CR_SYS_CLK_STATUS0_MODE_GATED                 (0x00000000U)
 /*
- Clock is running */
+Clock is running */
 #define VHA_CR_SYS_CLK_STATUS0_MODE_RUNNING               (0x00000001U)
 
 
@@ -1002,13 +1002,13 @@
 
 #define VHA_CR_CLK_CTRL0_MODE_MASK                        (0x00000003U)
 /*
- The domain clock is forced off */
+The domain clock is forced off */
 #define VHA_CR_CLK_CTRL0_MODE_OFF                         (0x00000000U)
 /*
- The domain clock is forced on */
+The domain clock is forced on */
 #define VHA_CR_CLK_CTRL0_MODE_ON                          (0x00000001U)
 /*
- Automatic clock gating is active, the domain clock is only on whilst data is being processed */
+Automatic clock gating is active, the domain clock is only on whilst data is being processed */
 #define VHA_CR_CLK_CTRL0_MODE_AUTO                        (0x00000002U)
 
 
@@ -1260,13 +1260,13 @@
 
 #define VHA_CR_CNN_MEM_WDT_CTRL_CNN_MEM_WDT_CTRL_MASK     (0x00000003U)
 /*
- WDT is Disabled */
+WDT is Disabled */
 #define VHA_CR_CNN_MEM_WDT_CTRL_CNN_MEM_WDT_CTRL_NONE     (0x00000000U)
 /*
- WDT is Cleared when CMD Parser starts a pass or CMD parser is kicked*/
+WDT is Cleared when CMD Parser starts a pass or CMD parser is kicked*/
 #define VHA_CR_CNN_MEM_WDT_CTRL_CNN_MEM_WDT_CTRL_KICK_PASS (0x00000001U)
 /*
- WDT is Cleared when CMD Parser is kicked */
+WDT is Cleared when CMD Parser is kicked */
 #define VHA_CR_CNN_MEM_WDT_CTRL_CNN_MEM_WDT_CTRL_KICK     (0x00000002U)
 
 
@@ -1284,10 +1284,10 @@
 
 #define VHA_CR_CNN_HL_WDT_CTRL_CNN_HL_WDT_CTRL_MASK       (0x00000003U)
 /*
- WDT is Cleared when CMD Parser starts a pass or CMD parser is kicked*/
+WDT is Cleared when CMD Parser starts a pass or CMD parser is kicked*/
 #define VHA_CR_CNN_HL_WDT_CTRL_CNN_HL_WDT_CTRL_KICK_PASS  (0x00000001U)
 /*
- WDT is Cleared when CMD Parser is kicked */
+WDT is Cleared when CMD Parser is kicked */
 #define VHA_CR_CNN_HL_WDT_CTRL_CNN_HL_WDT_CTRL_KICK       (0x00000002U)
 
 
@@ -1353,13 +1353,13 @@
 
 #define VHA_CR_SYS_CLK_CTRL0_MODE_MASK                    (0x00000003U)
 /*
- The domain clock is forced off */
+The domain clock is forced off */
 #define VHA_CR_SYS_CLK_CTRL0_MODE_OFF                     (0x00000000U)
 /*
- The domain clock is forced on */
+The domain clock is forced on */
 #define VHA_CR_SYS_CLK_CTRL0_MODE_ON                      (0x00000001U)
 /*
- Automatic clock gating is active, the domain clock is only on whilst data is being processed */
+Automatic clock gating is active, the domain clock is only on whilst data is being processed */
 #define VHA_CR_SYS_CLK_CTRL0_MODE_AUTO                    (0x00000002U)
 
 
@@ -2107,16 +2107,16 @@
 
 #define VHA_CR_SLC_CTRL_ENUM_HASH_MODE_MASK               (0x00000003U)
 /*
- Reserved value */
+Reserved value */
 #define VHA_CR_SLC_CTRL_ENUM_HASH_MODE_RESERVED           (0x00000000U)
 /*
- Addresses interleaved between Cache Bank using a combined Set & Bank hash of the upper address bits */
+Addresses interleaved between Cache Bank using a combined Set & Bank hash of the upper address bits */
 #define VHA_CR_SLC_CTRL_ENUM_HASH_MODE_PVR_V3_HASHING     (0x00000001U)
 /*
- Addresses are interleaved between Cache Banks on a Cacheline boundary */
+Addresses are interleaved between Cache Banks on a Cacheline boundary */
 #define VHA_CR_SLC_CTRL_ENUM_HASH_MODE_LINEAR             (0x00000002U)
 /*
- Addresses interleaved between Cache Banks using an XOR hash of the address bits below the 4KB page granularity */
+Addresses interleaved between Cache Banks using an XOR hash of the address bits below the 4KB page granularity */
 #define VHA_CR_SLC_CTRL_ENUM_HASH_MODE_IN_PAGE_HASH       (0x00000003U)
 
 
@@ -2315,16 +2315,16 @@
 
 #define VHA_CR_ACE_PRIORITY_MAPPING_CTRL_ENUM_PRIORITIES_MASK (0x00000003U)
 /*
- Low */
+Low */
 #define VHA_CR_ACE_PRIORITY_MAPPING_CTRL_ENUM_PRIORITIES_LOW (0x00000000U)
 /*
- Medium */
+Medium */
 #define VHA_CR_ACE_PRIORITY_MAPPING_CTRL_ENUM_PRIORITIES_MEDIUM (0x00000001U)
 /*
- High */
+High */
 #define VHA_CR_ACE_PRIORITY_MAPPING_CTRL_ENUM_PRIORITIES_HIGH (0x00000002U)
 /*
- Critical */
+Critical */
 #define VHA_CR_ACE_PRIORITY_MAPPING_CTRL_ENUM_PRIORITIES_CRITICAL (0x00000003U)
 
 
@@ -2423,71 +2423,71 @@
 
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_MASK            (0x0000000FU)
 /*
- Device Non-bufferable */
+Device Non-bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_DEVICE_NON_BUFFERABLE (0x00000000U)
 /*
- Device Bufferable */
+Device Bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_DEVICE_BUFFERABLE (0x00000001U)
 /*
- Normal Non-cacheable Non-bufferable */
+Normal Non-cacheable Non-bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_NORMAL_NC_NON_BUFFERABLE (0x00000002U)
 /*
- Normal Non-cacheable Bufferable */
+Normal Non-cacheable Bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_NORMAL_NC_BUFFERABLE (0x00000003U)
 /*
- Write-through No-allocate */
+Write-through No-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_WRITE_THROUGH_NO_ALLOCATE (0x00000006U)
 /*
- Write-through Write-allocate */
+Write-through Write-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_WRITE_THROUGH_WRITE_ALLOCATE (0x0000000eU)
 /*
- Write-back No-allocate */
+Write-back No-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_WRITE_BACK_NO_ALLOCATE (0x00000007U)
 /*
- Write-back Write-allocate */
+Write-back Write-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_WR_CACHEABLE_WRITE_BACK_WRITE_ALLOCATE (0x0000000fU)
 
 
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_MASK            (0x0000000FU)
 /*
- Device Non-bufferable */
+Device Non-bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_DEVICE_NON_BUFFERABLE (0x00000000U)
 /*
- Device Bufferable */
+Device Bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_DEVICE_BUFFERABLE (0x00000001U)
 /*
- Normal Non-cacheable Non-bufferable */
+Normal Non-cacheable Non-bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_NORMAL_NC_NON_BUFFERABLE (0x00000002U)
 /*
- Normal Non-cacheable Bufferable */
+Normal Non-cacheable Bufferable */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_NORMAL_NC_BUFFERABLE (0x00000003U)
 /*
- Write-through No-allocate */
+Write-through No-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_WRITE_THROUGH_NO_ALLOCATE (0x0000000aU)
 /*
- Write-through Read-allocate */
+Write-through Read-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_WRITE_THROUGH_READ_ALLOCATE (0x0000000eU)
 /*
- Write-back No-allocate */
+Write-back No-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_WRITE_BACK_NO_ALLOCATE (0x0000000bU)
 /*
- Write-back Read-allocate */
+Write-back Read-allocate */
 #define VHA_CR_ACE_CTRL_ENUM_RD_CACHEABLE_WRITE_BACK_READ_ALLOCATE (0x0000000fU)
 
 
 /*
- Non-Shareable */
+Non-Shareable */
 #define VHA_CR_ACE_CTRL_ENUM_NCOH_DOMAIN_NON_SHAREABLE    (0x00000000U)
 /*
- System */
+System */
 #define VHA_CR_ACE_CTRL_ENUM_NCOH_DOMAIN_SYSTEM           (0x00000001U)
 
 
 /*
- Inner-Shareable */
+Inner-Shareable */
 #define VHA_CR_ACE_CTRL_ENUM_COH_DOMAIN_INNER_SHAREABLE   (0x00000000U)
 /*
- Outer-Shareable */
+Outer-Shareable */
 #define VHA_CR_ACE_CTRL_ENUM_COH_DOMAIN_OUTER_SHAREABLE   (0x00000001U)
 
 
@@ -2590,10 +2590,10 @@ The SoC supports full ACE or 2-Way Coherency*/
 
 #define VHA_CR_L1_GLB_CTRL_ENUM_HASH_MODE_MASK            (0x00000003U)
 /*
- Addresses interleaved between Cache Banks using a weaved XOR hash of address bits */
+Addresses interleaved between Cache Banks using a weaved XOR hash of address bits */
 #define VHA_CR_L1_GLB_CTRL_ENUM_HASH_MODE_WEAVED_HASH     (0x00000000U)
 /*
- Addresses interleaved between Cache Bank using a combined Set & Bank hash of the upper address bits */
+Addresses interleaved between Cache Bank using a combined Set & Bank hash of the upper address bits */
 #define VHA_CR_L1_GLB_CTRL_ENUM_HASH_MODE_PVR_V3_HASHING  (0x00000001U)
 
 
@@ -2654,43 +2654,43 @@ The SoC supports full ACE or 2-Way Coherency*/
 
 #define VHA_CR_CNN_DEBUG_CTRL_MASK                        (0x00000003U)
 /*
- Debug is switched off */
+Debug is switched off */
 #define VHA_CR_CNN_DEBUG_CTRL_DISABLE                     (0x00000000U)
 /*
- Debug is output at the end of each stream */
+Debug is output at the end of each stream */
 #define VHA_CR_CNN_DEBUG_CTRL_STREAM                      (0x00000001U)
 /*
- Debug is output at the end of each layer */
+Debug is output at the end of each layer */
 #define VHA_CR_CNN_DEBUG_CTRL_LAYER                       (0x00000002U)
 /*
- Debug is output at the end of each pass */
+Debug is output at the end of each pass */
 #define VHA_CR_CNN_DEBUG_CTRL_PASS                        (0x00000003U)
 
 
 #define VHA_CR_CNN_PRELOAD_CTRL_MASK                      (0x00000007U)
 /*
- Preloads are switched off */
+Preloads are switched off */
 #define VHA_CR_CNN_PRELOAD_CTRL_DISABLE                   (0x00000000U)
 /*
- Preloads are triggered 64 requests after the previous 32k boundary */
+Preloads are triggered 64 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_64                      (0x00000001U)
 /*
- Preloads are triggered 128 requests after the previous 32k boundary */
+Preloads are triggered 128 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_128                     (0x00000002U)
 /*
- Preloads are triggered 192 requests after the previous 32k boundary */
+Preloads are triggered 192 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_192                     (0x00000003U)
 /*
- Preloads are triggered 256 requests after the previous 32k boundary */
+Preloads are triggered 256 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_256                     (0x00000004U)
 /*
- Preloads are triggered 320 requests after the previous 32k boundary */
+Preloads are triggered 320 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_320                     (0x00000005U)
 /*
- Preloads are triggered 384 requests after the previous 32k boundary */
+Preloads are triggered 384 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_384                     (0x00000006U)
 /*
- Preloads are triggered 448 requests after the previous 32k boundary */
+Preloads are triggered 448 requests after the previous 32k boundary */
 #define VHA_CR_CNN_PRELOAD_CTRL_N_448                     (0x00000007U)
 
 
@@ -2721,10 +2721,10 @@ The SoC supports full ACE or 2-Way Coherency*/
 
 
 /*
- Memory buffer will be used for MODEL only (CBUF, CMD , DEBUG, PERF) */
+Memory buffer will be used for MODEL only (CBUF, CMD , DEBUG, PERF) */
 #define VHA_CR_ALT_ADDR_BUF_TYPE_MODEL_ONLY               (0x00000000U)
 /*
- Memory buffer will be used for IO Only( OUTPACK , IBUF , ABUF, EWO ) or Both MODEL and IO */
+Memory buffer will be used for IO Only( OUTPACK , IBUF , ABUF, EWO ) or Both MODEL and IO */
 #define VHA_CR_ALT_ADDR_BUF_TYPE_IO_OR_SHARED             (0x00000001U)
 
 
@@ -2746,16 +2746,16 @@ The SoC supports full ACE or 2-Way Coherency*/
 
 #define VHA_CR_OS0_CNN_STATUS_STATE_MASK                  (0x00000003U)
 /*
- No requests are pending for this host*/
+No requests are pending for this host*/
 #define VHA_CR_OS0_CNN_STATUS_STATE_IDLE                  (0x00000000U)
 /*
- A command stream from this host is being processed*/
+A command stream from this host is being processed*/
 #define VHA_CR_OS0_CNN_STATUS_STATE_RUN                   (0x00000001U)
 /*
- The command stream from this host has been suspended due to higher priority request from another host*/
+The command stream from this host has been suspended due to higher priority request from another host*/
 #define VHA_CR_OS0_CNN_STATUS_STATE_SUSPEND               (0x00000002U)
 /*
- A command stream from this host is pending but not been started */
+A command stream from this host is pending but not been started */
 #define VHA_CR_OS0_CNN_STATUS_STATE_PENDING               (0x00000003U)
 
 
@@ -3439,16 +3439,16 @@ The SoC supports full ACE or 2-Way Coherency*/
 
 #define VHA_CR_OS1_CNN_STATUS_STATE_MASK                  (0x00000003U)
 /*
- No requests are pending for this host*/
+No requests are pending for this host*/
 #define VHA_CR_OS1_CNN_STATUS_STATE_IDLE                  (0x00000000U)
 /*
- A command stream from this host is being processed*/
+A command stream from this host is being processed*/
 #define VHA_CR_OS1_CNN_STATUS_STATE_RUN                   (0x00000001U)
 /*
- The command stream from this host has been suspended due to higher priority request from another host*/
+The command stream from this host has been suspended due to higher priority request from another host*/
 #define VHA_CR_OS1_CNN_STATUS_STATE_SUSPEND               (0x00000002U)
 /*
- A command stream from this host is pending but not been started */
+A command stream from this host is pending but not been started */
 #define VHA_CR_OS1_CNN_STATUS_STATE_PENDING               (0x00000003U)
 
 
@@ -4132,16 +4132,16 @@ The SoC supports full ACE or 2-Way Coherency*/
 
 #define VHA_CR_OS2_CNN_STATUS_STATE_MASK                  (0x00000003U)
 /*
- No requests are pending for this host*/
+No requests are pending for this host*/
 #define VHA_CR_OS2_CNN_STATUS_STATE_IDLE                  (0x00000000U)
 /*
- A command stream from this host is being processed*/
+A command stream from this host is being processed*/
 #define VHA_CR_OS2_CNN_STATUS_STATE_RUN                   (0x00000001U)
 /*
- The command stream from this host has been suspended due to higher priority request from another host*/
+The command stream from this host has been suspended due to higher priority request from another host*/
 #define VHA_CR_OS2_CNN_STATUS_STATE_SUSPEND               (0x00000002U)
 /*
- A command stream from this host is pending but not been started */
+A command stream from this host is pending but not been started */
 #define VHA_CR_OS2_CNN_STATUS_STATE_PENDING               (0x00000003U)
 
 

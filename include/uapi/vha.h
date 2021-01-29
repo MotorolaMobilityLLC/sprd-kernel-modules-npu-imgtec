@@ -62,6 +62,13 @@ extern "C" {
 
 #define VHA_OCM_MAX_NUM_PAGES 128
 #define VHA_CORE_MAX_ALT_ADDRS 16
+#define VHA_MAX_CORES 8
+
+// represents OCM types,
+#define VHA_LOCAL_OCM  0  /* Local OCM */
+#define VHA_SHARED_OCM 1  /* Shared OCM */
+#define VHA_OCM_TYPE_MAX 2
+
 
 /* device properties */
 struct vha_core_props {
@@ -77,9 +84,10 @@ struct vha_core_props {
 		} supported;
 		uint8_t features;
 	};
-	uint8_t  num_dummy_devs;
-	uint8_t  num_cnn_devs;
-	uint32_t ocm_size_bytes;
+	bool     dummy_dev;
+	uint8_t  num_cnn_core_devs;
+	uint32_t locm_size_bytes;
+	uint32_t socm_size_bytes;
 
 } __attribute__((aligned(8)));
 
@@ -89,9 +97,10 @@ struct vha_cnn_props {
 
 /* command sent to device */
 enum vha_cmd_type {
-	VHA_CMD_INVALID       = 0x000,
-	VHA_CMD_CNN_SUBMIT    = 0x101,
-	VHA_CMD_CNN_PDUMP_MSG,
+	VHA_CMD_INVALID          = 0x000,
+	VHA_CMD_CNN_SUBMIT       = 0x101,
+	VHA_CMD_CNN_SUBMIT_MULTI,
+	VHA_CMD_CNN_PDUMP_MSG
 };
 /* optional flags for commands */
 #define VHA_CMDFLAG_NOTIFY	0x0001 /* send response when cmd complete */
@@ -107,16 +116,15 @@ enum vha_cmd_type {
  *    followed by other parameters.
  */
 struct vha_user_cmd {
-	uint32_t cmd_id;	/* arbitrary id for cmd */
-	uint16_t cmd_type;	/* enum vha_cmd_type */
-	uint16_t flags;		/* VHA_CMDFLAG_xxx */
-	uint16_t padding;	/* padding to keep data 32bit aligned */
-	uint8_t  num_bufs;	/* total number of buffers */
-	uint8_t  num_inbufs;	/* number of input buffers */
-	uint32_t data[0];	/* 0-N words: input bufids
-				 * followed by other bufids
-				 * followed by other parameters
-				 */
+	uint32_t cmd_id;     /* arbitrary id for cmd */
+	uint16_t cmd_type;   /* enum vha_cmd_type */
+	uint16_t flags;      /* VHA_CMDFLAG_xxx */
+	uint16_t padding;    /* padding to keep data 32bit aligned */
+	uint8_t  num_bufs;   /* total number of buffers */
+	uint8_t  num_inbufs; /* number of input buffers */
+	uint32_t data[0];    /* 0-N words: input bufids
+	                      * followed by other bufids
+	                      * followed by other parameters */
 };
 
 /* Structure defining hardware issues */
@@ -149,11 +157,36 @@ struct vha_user_cnn_submit_cmd {
 			outbufs buffers */
 	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];	/* register to be used for
 			inbufs and outbufs */
-	uint32_t onchipram_map_id;
+	uint32_t onchipram_map_id; /* OCM mapping id - hot pages */
+	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX]; /* OCM linear mapping buffers */
 	uint32_t estimated_cycles; /* estimated number of cycles
 			for this command */
-	uint64_t expected_ip_capabilities; /* expected BVNC */
+	uint64_t expected_ip_capab; /* expected BVNC */
 	uint64_t hw_brns; /* BRNSs bit map */
+} __attribute__((aligned(8)));
+
+/*
+ * CNN_SUBMIT_MULTI message written from user to VHA.
+ * 3 input buffers: cmdstream(s), input image, coefficients
+ * 1 output buffer
+ * 1 internal buffer (optional)
+ * offsets into the input and output buffers
+ * and a register map: this tells the driver which alt-register-N
+ * will contain the address of which buffer.
+ */
+struct vha_user_cnn_submit_multi_cmd {
+	struct vha_user_cmd msg;
+	uint32_t cmdbuf[VHA_MAX_CORES];              /* bufid of cmdstream buffer */
+	uint32_t bufs[VHA_CORE_MAX_ALT_ADDRS];       /* bufid of IN, COEFF, OUT, INTERNAL,CRC,DBG,WB buffers */
+	uint32_t bufoffsets[VHA_CORE_MAX_ALT_ADDRS]; /* offsets into inbufs and outbufs buffers */
+	uint32_t bufsizes[VHA_CORE_MAX_ALT_ADDRS];   /* sizes of the inbufs and outbufs buffers */
+	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];     /* register to be used for inbufs and outbufs */
+	uint8_t  num_cores;                          /* number of cores required for this workload */
+	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX];   /* OCM linear mapping buffers */
+	uint32_t shared_circ_buf_offs;               /* circular buffer offset in the shared memory */
+	uint32_t estimated_cycles;                   /* estimated number of cycles for this command */
+	uint64_t expected_ip_capab;                  /* expected BVNC */
+	uint64_t hw_brns;                            /* BRNSs bit map */
 } __attribute__((aligned(8)));
 
 /*
@@ -302,16 +335,16 @@ struct vha_sync_data {
 	};
 	int sync_fd; /* [OUT] output sync_fd/sync_fd for merged input sync_fds */
 } __attribute__((aligned(8)));
-/* parameters to vha clock control */
-struct vha_clk_ctrl_data {
-	uint32_t fg_enable; /* enable(1)/disable(0) clock */
-}__attribute__((aligned(8)));
 
 struct vha_cancel_data {
 	uint32_t cmd_id;      /* [IN] masked ID of commands to be cancelled */
 	uint32_t cmd_id_mask; /* [IN] mask for command IDs to be cancelled */
 } __attribute__((aligned(8)));
 
+/* parameters to vha clock control */
+struct vha_clk_ctrl_data {
+	uint32_t fg_enable; /* enable(1)/disable(0) clock */
+}__attribute__((aligned(8)));
 
 #define VHA_IOC_MAGIC  'q'
 

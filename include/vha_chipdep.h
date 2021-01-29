@@ -19,21 +19,10 @@
 #include <linux/regmap.h>
 #include <img_mem_man.h>
 
-int vha_powerdomain_init(struct device *dev);
-int vha_powerdomain_setup(void);
-int vha_powerdomain_unsetup(void);
-int vha_clockdomain_init(struct device *dev);
-int vha_clock_init(struct device *dev);
-int vha_clockdomain_select(struct device *dev);
-int vha_clockdomain_setup(void);
-int vha_clockdomain_unsetup(void);
-int vha_apll_rate_set(struct device *dev);
+int vha_chip_init(struct device *dev);
+int vha_chip_deinit(struct device *dev);
+int vha_chip_runtime_resume(struct device *dev);
+int vha_chip_runtime_suspend(struct device *dev);
 u64 vha_get_chip_dmamask(void);
-struct regmap *vha_get_ai_apb_regs(struct device *dev);
-
-/* qos for powervr */
-int vha_restore_qos(struct device *dev);
-int vha_ai_parse_qos_dt(struct device *dev);
-int vha_set_qos(struct device *dev);
 
 #endif /* _VHA_CHIPDEP_H */

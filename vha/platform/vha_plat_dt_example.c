@@ -54,8 +54,6 @@
 #include "vha_plat_dt.h"
 #include "vha_chipdep.h"
 
-#include <hwdefs/nn_sys_cr.h>
-
 const struct of_device_id vha_plat_dt_of_ids[] = {
 	{ .compatible = VHA_PLAT_DT_OF_ID },
 	{ }
@@ -93,28 +91,8 @@ void vha_plat_write64(void *addr, uint64_t val)
 	writeq(val, (volatile void __iomem *)addr);
 }
 
-#ifdef CFG_SYS_VAGUS
-static void dt_plat_handle_sys(void __iomem *sys_addr, struct vha_sys_data *sys_data)
-{
-	/* This is a placeholder for getting NN_SYS specific data that core driver requires
-	 * and setting any NN_SYS configuration registers
-	 * Note: It may require enabling power domain.
-	 */
-
-	sys_data->ocm_size_kb = vha_plat_read64(sys_addr + NN_SYS_CR_CORE_IP_CONFIG) &~
-			~NN_SYS_CR_CORE_IP_CONFIG_NN_SYS_OCM_RAM_SIZE_4KB_CLRMSK;
-
-	/* Set system level OCM configuration */
-	vha_plat_write64(sys_addr + NN_SYS_CR_NOC_LOWER_ADDR1, 0x0);
-	vha_plat_write64(sys_addr + NN_SYS_CR_NOC_UPPER_ADDR1, sys_data->ocm_size_kb * 1024);
-}
-#endif
-
-static struct vha_sys_data dt_plat_sys_data;
-
 int vha_plat_dt_hw_init(struct platform_device *pdev,
-			struct heap_config **heap_configs, int *num_heaps,
-			void __iomem *sys_addr, struct vha_sys_data **sys_data)
+			struct heap_config **heap_configs, int *num_heaps)
 {
 	struct device *dev = &pdev->dev;
 	int ret;
@@ -138,7 +116,7 @@ int vha_plat_dt_hw_init(struct platform_device *pdev,
 		/* If alternative mask not defined in
 		 * DT -> "dma-mask" property, use the default one (32bit) */
 		dma_mask = vha_get_chip_dmamask();
-		dev_info(dev, "0417:set dma_mask as 0x%llx\n", dma_mask);
+		dev_info(dev, "set dma_mask as 0x%llx\n", dma_mask);
 	}
 	ret = dma_set_mask(dev, dma_mask);
 	if (ret) {
@@ -151,12 +129,6 @@ int vha_plat_dt_hw_init(struct platform_device *pdev,
 
 	*heap_configs = example_heap_configs;
 	*num_heaps = sizeof(example_heap_configs)/sizeof(struct heap_config);
-
-#ifdef CFG_SYS_VAGUS
-	dev_info(dev, "Handling NN_SYS\n");
-	dt_plat_handle_sys(sys_addr, &dt_plat_sys_data);
-#endif
-	*sys_data = &dt_plat_sys_data;
 
 	return 0;
 }

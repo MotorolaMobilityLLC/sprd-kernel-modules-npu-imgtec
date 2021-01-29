@@ -1,5 +1,5 @@
 /*************************************************************************/ /*!
-@Title          Hardware definition file nn_sys_cr_gyrus.h
+@Title          Hardware definition file nn_sys_cr_vagus.h
 @Copyright      Copyright (c) Imagination Technologies Ltd. All Rights Reserved
 */ /**************************************************************************/
 
@@ -9,10 +9,10 @@
  */
 
 
-#ifndef _NN_SYS_CR_GYRUS_H_
-#define _NN_SYS_CR_GYRUS_H_
+#ifndef _NN_SYS_CR_VAGUS_H_
+#define _NN_SYS_CR_VAGUS_H_
 
-#define NN_SYS_CR_GYRUS_REVISION 1
+#define NN_SYS_CR_VAGUS_REVISION 1
 
 /*
     Register NN_SYS_CR_PRODUCT_ID
@@ -54,6 +54,15 @@
 #define NN_SYS_CR_CORE_IP_CHANGELIST_MASKFULL             (IMG_UINT64_C(0x00000000FFFFFFFF))
 #define NN_SYS_CR_CORE_IP_CHANGELIST_VALUE_SHIFT          (0U)
 #define NN_SYS_CR_CORE_IP_CHANGELIST_VALUE_CLRMSK         (IMG_UINT64_C(0XFFFFFFFF00000000))
+
+
+/*
+    Register NN_SYS_CR_CORE_IP_CONFIG
+*/
+#define NN_SYS_CR_CORE_IP_CONFIG                          (0x0038U)
+#define NN_SYS_CR_CORE_IP_CONFIG_MASKFULL                 (IMG_UINT64_C(0x0000000000000FFF))
+#define NN_SYS_CR_CORE_IP_CONFIG_NN_SYS_OCM_RAM_SIZE_4KB_SHIFT (0U)
+#define NN_SYS_CR_CORE_IP_CONFIG_NN_SYS_OCM_RAM_SIZE_4KB_CLRMSK (0XFFFFF000U)
 
 
 #define NN_SYS_CR_CLK_CTRL_MODE_MASK                      (0x00000003U)
@@ -347,9 +356,9 @@ Critical */
 #define NN_SYS_CR_SOCIF_BUS_SECURE_ENABLE_EN              (0X00000001U)
 
 
-#endif /* _NN_SYS_CR_GYRUS_H_ */
+#endif /* _NN_SYS_CR_VAGUS_H_ */
 
 /*****************************************************************************
- End of file (nn_sys_cr_gyrus.h)
+ End of file (nn_sys_cr_vagus.h)
 *****************************************************************************/
 

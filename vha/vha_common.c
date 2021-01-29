@@ -47,13 +47,15 @@
 #include <linux/jiffies.h>
 #include <linux/list.h>
 #include <linux/delay.h>
-#include <linux/irq.h>
+
+#include <linux/pm_runtime.h>
 #include <linux/debugfs.h>
 
 #include <uapi/vha.h>
 #include "vha_common.h"
 #include "vha_plat.h"
-#include "vha_regs.h"
+#include <vha_regs.h>
+#include <linux/sprd_npu_cooling.h>
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 #include <linux/dma-fence.h>
@@ -120,12 +122,6 @@ module_param(onchipmem_size, uint, 0444);
 MODULE_PARM_DESC(onchipmem_size,
 	"Size of on-chip memory in bytes");
 
-/* bringup test: force MMU fault with MMU base register */
-static bool test_mmu_base_pf;
-module_param(test_mmu_base_pf, bool, 0444);
-MODULE_PARM_DESC(test_mmu_base_pf,
-	"Bringup test: force MMU page fault on first access");
-
 /* bringup test: do not map into the device after the Nth buffer */
 static int32_t test_mmu_no_map_count = -1;
 module_param(test_mmu_no_map_count, int, 0444);
@@ -138,6 +134,11 @@ module_param(parity_disable, bool, 0444);
 MODULE_PARM_DESC(parity_disable,
 		"if Y, the core parity feature will be disabled, if it is supported");
 #endif
+
+static bool test_without_bvnc_check;
+module_param(test_without_bvnc_check, bool, 0444);
+MODULE_PARM_DESC(test_without_bvnc_check,
+		"When set BVNC check is ignored, allowing to kick the hw");
 
 /* Fault inject parameter is only applicable when
  * kernel fault injection feature is enabled
@@ -176,74 +177,14 @@ struct vha_heap {
 	struct list_head list;	/* Entry in <struct vha_drv:heaps> */
 };
 
-/* Helper structure for error definition */
-struct vha_biterr {
-	int e;
-	uint32_t b;
-	const char* s;
-};
-#define ERR_EVENT_DESC(b) VHA_CR_OS(VHA_EVENT_STATUS_VHA_##b##_EN), __stringify(b)
-
 static void cmd_worker(struct work_struct *work);
-static bool vha_is_busy(struct vha_dev *vha);
 static void vha_sched_apm(struct vha_dev *vha, uint32_t delay_ms);
-
 
 static const size_t mmu_page_size_kb_lut[] =
 		{ 4096, 16384, 65536, 262144, 1048576, 2097152};
 
-static void mmu_flush(const struct device *dev,
-		struct vha_dev *vha, int ctx_id)
-{
-	uint64_t inval = VHA_CR_OS(MMU_CTRL_INVAL_PC_EN) |
-				VHA_CR_OS(MMU_CTRL_INVAL_PD_EN) |
-				VHA_CR_OS(MMU_CTRL_INVAL_PT_EN);
-
-	/* No need to handle mmu cache, when core is already offline */
-	if (vha->state == VHA_STATE_OFF)
-		return;
-
-#if defined(HW_AX3)
-	IOPOLL64_PDUMP(0, 20, 150, (uint64_t)VHA_CR_OS(MMU_CTRL_INVAL_STATUS_PENDING_EN),
-				VHA_CR_OS(MMU_CTRL_INVAL_STATUS));
-#endif
-
-	if (unlikely(ctx_id == VHA_INVALID_ID))
-		inval |= VHA_CR_OS(MMU_CTRL_INVAL_ALL_CONTEXTS_EN);
-	else {
-		inval |= ctx_id << VHA_CR_OS(MMU_CTRL_INVAL_CONTEXT_SHIFT);
-	}
-	dev_dbg(dev, "%s: ctx_id:%d (0x%llx)\n", __func__, ctx_id, inval);
-
-	img_pdump_printf("-- MMU invalidate TLB caches\n");
-	IOWRITE64_PDUMP(inval, VHA_CR_OS(MMU_CTRL_INVAL));
-}
-
-/* this function is called from img_mmu, to handle cache issues */
-static void mmu_callback(enum img_mmu_callback_type callback_type,
-			int buf_id, void *data)
-{
-	struct vha_session *session = data;
-	struct vha_dev *vha = session->vha;
-	int ctx_id;
-
-	if (!vha)
-		return;
-
-	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++)
-		mmu_flush(vha->dev, vha, session->mmu_ctxs[ctx_id].hw_id);
-#if defined(VHA_MMU_MIRRORED_CTX_SUPPORT) && defined(HW_AX3)
-	{
-		/* Need to flush auxilary hw context */
-		int hw_id = session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id +
-				VHA_MMU_AUX_HW_CTX_SHIFT;
-		mmu_flush(vha->dev, vha, hw_id);
-	}
-#endif
-}
-
 /* Calculate current timespan for the given timestamp */
-static bool get_timespan_us(struct timespec *from, struct timespec *to, uint64_t *result)
+bool get_timespan_us(struct timespec *from, struct timespec *to, uint64_t *result)
 {
 	long long total = 0;
 
@@ -312,19 +253,20 @@ static int vha_init(struct vha_dev *vha,
 		}
 	}
 
-	if (vha->core_props.ocm_size_bytes && onchipmem_phys_start == ~0)
+	if (vha->core_props.locm_size_bytes && onchipmem_phys_start == ~0)
 		dev_warn(dev, "%s: Onchip memory physical address not set!\n",
 						__func__);
 
 	/* OCM heap type is automatically appended */
-	if (vha->core_props.ocm_size_bytes && onchipmem_phys_start != ~0) {
+	if (vha->core_props.locm_size_bytes && onchipmem_phys_start != ~0) {
 		struct heap_config heap_cfg;
 		struct vha_heap *heap;
 
 		memset(&heap_cfg, 0, sizeof(heap_cfg));
 		heap_cfg.type = IMG_MEM_HEAP_TYPE_OCM;
 		heap_cfg.options.ocm.phys = onchipmem_phys_start;
-		heap_cfg.options.ocm.size = vha->core_props.ocm_size_bytes;
+		heap_cfg.options.ocm.size = vha->core_props.locm_size_bytes;
+		heap_cfg.options.ocm.hattr = IMG_MEM_HEAP_ATTR_LOCAL;
 
 		dev_dbg(dev, "%s: adding heap of type %d\n",
 				__func__, heap_cfg.type);
@@ -344,6 +286,37 @@ static int vha_init(struct vha_dev *vha,
 		}
 		list_add(&heap->list, &drv.heaps);
 	}
+#ifdef CONFIG_HW_MULTICORE
+	if (vha->core_props.socm_size_bytes && onchipmem_phys_start != ~0) {
+			struct heap_config heap_cfg;
+			struct vha_heap *heap;
+
+			memset(&heap_cfg, 0, sizeof(heap_cfg));
+			heap_cfg.type = IMG_MEM_HEAP_TYPE_OCM;
+			heap_cfg.options.ocm.phys = onchipmem_phys_start +
+					vha->core_props.locm_size_bytes + IMG_MEM_VA_GUARD_GAP;
+			heap_cfg.options.ocm.size = vha->core_props.socm_size_bytes;
+			heap_cfg.options.ocm.hattr = IMG_MEM_HEAP_ATTR_SHARED;
+
+			dev_dbg(dev, "%s: adding heap of type %d\n",
+					__func__, heap_cfg.type);
+
+			heap = kzalloc(sizeof(struct vha_heap), GFP_KERNEL);
+			if (!heap) {
+				ret = -ENOMEM;
+				goto heap_add_failed;
+			}
+
+			ret = img_mem_add_heap(&heap_cfg, &heap->id);
+			if (ret < 0) {
+				dev_err(dev, "%s: failed to init heap (type %d)!\n",
+					__func__, heap_configs[i].type);
+				kfree(heap);
+				goto heap_add_failed;
+			}
+			list_add(&heap->list, &drv.heaps);
+		}
+#endif
 
 	/* Do not proceed if internal heap not defined */
 	if (drv.internal_heap_id < 0) {
@@ -361,6 +334,16 @@ static int vha_init(struct vha_dev *vha,
 			__func__, ret);
 		goto create_mem_context_failed;
 	}
+
+#ifdef CONFIG_HW_MULTICORE
+	vha->hw_sched_status.num_cores_free = vha->core_props.num_cnn_core_devs;
+	vha->hw_sched_status.num_wms_free   = vha->core_props.num_cnn_core_devs;
+	vha->hw_sched_status.free_core_mask =
+				VHA_GET_CORE_MASK(vha->core_props.num_cnn_core_devs);
+	vha->hw_sched_status.free_wm_mask =
+				VHA_GET_WM_MASK(vha->core_props.num_cnn_core_devs);
+	vha->full_core_mask = vha->hw_sched_status.free_core_mask;
+#endif
 
 	drv.initialised = 1;
 
@@ -413,53 +396,67 @@ int vha_deinit(void)
 	return 0;
 }
 
-static void vha_dev_ready(struct vha_dev *vha)
+
+/* printk helper for converting core_id to BVNC */
+#define core_id_quad(core_id) \
+		(core_id >> 48), (core_id >> 32) & 0xffff, (core_id >> 16) & 0xffff, (core_id & 0xffff)
+
+/*
+ * Returns: true if hardware has required capabilities, false otherwise.
+ * Implementation is a simple check of expected BVNC against hw CORE_ID
+ */
+bool vha_dev_check_hw_capab(struct vha_dev* vha, uint64_t expected_hw_capab)
 {
+	uint64_t __maybe_unused hw = vha->core_props.core_id
+		& VHA_CR_CORE_ID_BVNC_CLRMSK;
+	uint64_t __maybe_unused mbs = expected_hw_capab
+		& VHA_CR_CORE_ID_BVNC_CLRMSK;
+
+	if (!test_without_bvnc_check) {
+		img_pdump_printf(
+						"IF SKIP_COREID_CHECK\n"
+						"COM Skip COREID Check\n"
+						"ELSE SKIP_COREID_CHECK\n"
+			"COM CHECKING CORE_ID: expecting BVNC:%llu.%llu.%llu.%llu\n",
+			core_id_quad(expected_hw_capab));
+		IOPOLL64_PDUMP(expected_hw_capab, 1, 1,
+					VHA_CR_CORE_ID_BVNC_CLRMSK,
+					VHA_CR_CORE_ID);
+				img_pdump_printf(
+						"FI SKIP_COREID_CHECK\n");
+	}
+
+	if ((expected_hw_capab >> 48) != HW_SERIES) {
+		dev_err(vha->dev,
+			"%s: network was compiled for incorrect hardware series: expected %llu / found %u\n",
+			__func__,
+			(expected_hw_capab >> 48), HW_SERIES);
+		return false;
+	}
+
 #ifndef CONFIG_VHA_DUMMY
-	if (!vha->is_ready)
-		return;
+	if (hw != mbs) {
+		dev_warn(vha->dev,
+			"%s: network was compiled for an incorrect hardware variant (BVNC): "
+			"found %llu.%llu.%llu.%llu, expected %llu.%llu.%llu.%llu\n",
+			__func__,
+			core_id_quad(vha->core_props.core_id),
+			core_id_quad(expected_hw_capab));
+		/* Conditionally allow the hw to be kicked */
+		if (test_without_bvnc_check)
+			dev_warn(vha->dev, "%s: trying to kick the hw ... ", __func__);
+		else {
+			dev_err(vha->dev, "%s: can't kick the hardware!", __func__);
+			return false;
+		}
+	}
 #endif
-	dev_dbg(vha->dev, "%s\n", __func__);
-
-	vha_dev_wait(vha);
-
-	/* Finally enable ALL events */
-	img_pdump_printf("-- Enable ALL events\n");
-	IOWRITE64_PDUMP(VHA_EVNTS_DEFAULT, VHA_CR_OS(VHA_EVENT_ENABLE));
-	img_pdump_printf("-- Clear ALL events\n");
-	IOWRITE64_PDUMP(VHA_EVNTS_DEFAULT, VHA_CR_OS(VHA_EVENT_CLEAR));
-#ifdef HW_AX2
-	img_pdump_printf("-- Clear CNN status\n");
-	IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_STATUS));
-#endif
-	img_pdump_printf("-- Clear MMU fault status\n");
-	IOWRITE64_PDUMP(0, VHA_CR_OS(MMU_FAULT_STATUS1));
-	img_pdump_printf("-- Clear SLC debug status\n");
-	IOWRITE64_PDUMP(0, VHA_CR_SLC_STATUS_DEBUG);
-	img_pdump_printf("-- Reset PERF counters\n");
-	IOWRITE64_PDUMP(0, VHA_CR_PERF_RESET_FULL);
+	return true;
 }
-
-#if _OSID_ == 0 /* For HW_AX2 this is always true */
-static void vha_dev_reset(struct vha_dev *vha)
-{
-	/* Perform reset procedure */
-	img_pdump_printf("-- Set RESET bits\n");
-	IOWRITE64_PDUMP(VHA_RESET_DEFAULT, VHA_CR_RESET_CTRL);
-	/* poll for reset deassertion
-	 * count=16, delay=256cycles
-	 */
-	img_pdump_printf("-- Wait for RESET deassertion\n");
-	IOPOLL64_PDUMP(0, 16, 256, VHA_CR_RESET_CTRL_MASKFULL,
-					VHA_CR_RESET_CTRL);
-}
-#endif
 
 /* start the device */
-static int vha_dev_start(struct vha_dev *vha)
+int vha_dev_start(struct vha_dev *vha)
 {
-	uint64_t __maybe_unused sys_clks = 0;
-	uint64_t __maybe_unused main_clks = 0;
 	int ret = 0;
 
 	/* Cancel APM request if new inference comes */
@@ -471,23 +468,17 @@ static int vha_dev_start(struct vha_dev *vha)
 	dev_dbg(vha->dev, "%s\n", __func__);
 
 /* Assuming OS0 is the privileged one */
-#if _OSID_ == 0 /* For HW_AX2 this is always true */
+#if _OSID_ == 0 /* For HW_AX2 & HW_AX3 MULTICORE this is always true */
 	/////////////// POWER ON //////////////////////////
 	img_pdump_printf("-- POWER_ON_BEGIN\n");
 	/* Prepare device ...  */
 	vha_dev_prepare(vha);
-	/* Reset core */
+	/* Enable device clocks */
+	vha_dev_enable_clocks(vha);
+	/* Reset device */
 	vha_dev_reset(vha);
-
-	/* Always AUTO gating  when needed */
-	sys_clks = VHA_SYS_CLOCKS_DEFAULT(AUTO);
-	main_clks = VHA_MAIN_CLOCKS_DEFAULT(AUTO);
-	/* Enable sys clocks ! */
-	img_pdump_printf("-- Enable SYS clocks\n");
-	IOWRITE64_PDUMP(sys_clks, VHA_CR_SYS_CLK_CTRL0);
-	/* Enable main clocks ! */
-	img_pdump_printf("-- Enable MAIN clocks\n");
-	IOWRITE64_PDUMP(main_clks, VHA_CR_CLK_CTRL0);
+	/* Enable device clocks */
+	vha_dev_enable_clocks(vha);
 	img_pdump_printf("-- POWER_ON_END\n");
 	/* Call device specific setup */
 	vha_dev_setup(vha);
@@ -503,7 +494,7 @@ static int vha_dev_start(struct vha_dev *vha)
 }
 
 /* stop the device */
-static int vha_dev_stop(struct vha_dev *vha, bool reset)
+int vha_dev_stop(struct vha_dev *vha, bool reset)
 {
 	int ret = 0;
 
@@ -515,43 +506,23 @@ static int vha_dev_stop(struct vha_dev *vha, bool reset)
 
 	dev_dbg(vha->dev, "%s\n", __func__);
 	/* Disable events at first */
-	img_pdump_printf("-- Disable CNN events\n");
-	IOWRITE64_PDUMP(0, VHA_CR_OS(VHA_EVENT_ENABLE));
-	/* Clear the START bit !
-	 * Note: It is stated that writing 0 to this bit has no effect,
-	 * however in error cases, some hw blocks may start
-	 * to process previous requests after turning on the clocks
-	 * which was previously disabled */
-	IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_CONTROL));
-
-	/* Disable core events */
-	img_pdump_printf("-- Disable CORE events\n");
-	IOWRITE64_PDUMP(0, VHA_CR_OS(VHA_EVENT_ENABLE));
+	vha_dev_disable_events(vha);
 
 	vha->is_ready = false;
 /* Assuming OS0 is the privileged one */
-#if _OSID_ == 0 /* For HW_AX2 this is always true */
+#if _OSID_ == 0 /* For HW_AX2 & HW_AX3 MULTICORE this is always true */
 	/////////////// POWER_OFF //////////////////////////
 	img_pdump_printf("-- POWER_OFF_BEGIN\n");
 	/* Reset core in case of error or pending inference */
 	if (reset)
 		vha_dev_reset(vha);
 
-	/* If auto gating was turned on, wait for clocks idle state */
-	img_pdump_printf("-- Wait for clocks IDLE state\n");
-	IOPOLL64_PDUMP(0, 100, 1000,
-			VHA_CR_CLK_STATUS0_MASKFULL,
-			VHA_CR_CLK_STATUS0);
-	/* Wait for MMU,CCM,RDI,XBAR  IDLE state */
-	img_pdump_printf("-- Wait for memory bus interface IDLE state\n");
-	IOPOLL64_PDUMP(0xFFFF, 100, 1000, VHA_CR_SLC_IDLE_MASKFULL,
-			VHA_CR_SLC_IDLE);
+	/* Disable device clocks */
+	vha_dev_disable_clocks(vha);
 
-	/* Finally disable clocks */
-	img_pdump_printf("-- Disable MAIN clocks\n");
-	IOWRITE64_PDUMP(0, VHA_CR_CLK_CTRL0); /* main */
-	img_pdump_printf("-- Disable SYS clocks\n");
-	IOWRITE64_PDUMP(0, VHA_CR_SYS_CLK_CTRL0); /* sys */
+	/* Execute any outstanding routines to flush the device */
+	vha_dev_flush(vha);
+
 	img_pdump_printf("-- POWER_OFF_END\n");
 #endif
 
@@ -579,64 +550,14 @@ static int vha_dev_stop(struct vha_dev *vha, bool reset)
 	vha->active_mmu_ctx = VHA_INVALID_ID;
 
 	spin_lock_irq(&vha->irq_lock);
+#ifdef CONFIG_HW_MULTICORE
+	memset(&vha->irq_status, 0, sizeof(vha->irq_status));
+#else
 	vha->irq_status = 0;
+#endif
 	vha->irq_count = 0;
 	vha->stream_count = 0;
 	spin_unlock_irq(&vha->irq_lock);
-
-	return ret;
-}
-
-/* Top half */
-irqreturn_t vha_handle_irq(struct device *dev)
-{
-	struct vha_dev *vha = dev_get_drvdata(dev);
-	int ret = IRQ_HANDLED;
-	uint64_t status;
-
-	if (!vha)
-		return IRQ_NONE;
-
-	status = IOREAD64(vha->reg_base, VHA_CR_OS(VHA_EVENT_STATUS));
-	/* On fpga platform it is possible to get
-	 * a spurious interrupt when the hw died
-	 * Do not proceed, just throw a warning */
-	if (status == VHA_DEAD_HW || status == ~0) {
-		WARN_ONCE(1, "Hardware is dead!");
-		return IRQ_NONE;
-	}
-
-	if (status & VHA_EVNTS_DEFAULT) {
-		uint8_t count;
-		/* clear the interrupt:
-		 * best not to write pdump in interrupts */
-		IOWRITE64(vha->reg_base, VHA_CR_OS(VHA_EVENT_CLEAR),
-			status & VHA_EVNTS_DEFAULT);
-
-		/* Read the stream count as single IRQ may be raised for multiple kicks */
-		count = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_STATUS)) &
-					~VHA_CR_OS0_CNN_STATUS_STREAM_COUNT_CLRMSK;
-
-		spin_lock(&vha->irq_lock);
-		/* store the status to be processed later */
-		vha->irq_status |= status;
-		if (vha->low_latency == VHA_LL_SELF_KICK)
-			/* Two separate IRQs may be raised for multiple kicks */
-			vha->irq_count += count - vha->stream_count;
-		else
-			/* Only single IRQ may be raised otherwise ... */
-			vha->irq_count = count - vha->stream_count;
-		vha->stream_count = count;
-		/* Record hw processing end timestamps */
-		vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
-		getnstimeofday(&vha->stats.hw_proc_end);
-		spin_unlock(&vha->irq_lock);
-
-		ret = IRQ_WAKE_THREAD;
-	} else
-		return IRQ_NONE;
-
-	dev_dbg(dev, "IRQ 0x%08llx\n", status);
 
 	return ret;
 }
@@ -656,90 +577,6 @@ void vha_cmd_notify(struct vha_cmd *cmd)
 	/* we are done with this cmd, let's free it */
 	list_del(&cmd->list);
 	kfree(cmd);
-}
-
-static bool vha_rollback_cnn_cmds(struct vha_dev *vha)
-{
-	bool processing = false;
-	/* Not processed commands are still on the pending list
-	 * of each session, so just mark the hw pending lists as empty */
-	if (vha->pendcmd[VHA_CNN_CMD].cmd) {
-		vha->pendcmd[VHA_CNN_CMD].cmd->in_hw = false;
-		vha->pendcmd[VHA_CNN_CMD].cmd->queued = false;
-		vha->pendcmd[VHA_CNN_CMD].cmd = NULL;
-		processing = true;
-	}
-	/* low_latency ...*/
-	if (vha->queuedcmd[VHA_CNN_CMD].cmd) {
-		vha->queuedcmd[VHA_CNN_CMD].cmd->in_hw = false;
-		vha->queuedcmd[VHA_CNN_CMD].cmd->queued = false;
-		vha->queuedcmd[VHA_CNN_CMD].cmd = NULL;
-	}
-	dev_dbg(vha->dev, "%s: (%d)\n", __func__, processing);
-
-	return processing;
-}
-
-/*
- * handles the command (of given cmd_idx) already processed by the hw,
- * errors from VHA_CR_VHA_EVENT_STATUS (only for relevant cmd) should be
- * passed as err
- */
-static bool vha_handle_cmd(struct vha_dev *vha, int cmd_idx, int status)
-{
-	struct vha_cmd *cmd = NULL;
-
-	if (cmd_idx >= VHA_CMD_MAX)
-		return false;
-
-	cmd = vha->pendcmd[cmd_idx].cmd;
-	if (unlikely(!cmd)) {
-		dev_dbg(vha->dev, "No command. Probably it has been aborted\n");
-		return false;
-	}
-
-	{
-		uint64_t proc_time = 0;
-		struct timespec *from = &cmd->hw_proc_start;
-		struct timespec *to = &vha->stats.hw_proc_end;
-
-		if (timespec_compare(&vha->stats.hw_proc_end_prev, &cmd->hw_proc_start) >= 0)
-			from = &vha->stats.hw_proc_end_prev;
-
-		if (get_timespan_us(from, to, &proc_time)) {
-			vha->stats.last_proc_us = proc_time;
-		} else {
-			vha->stats.last_proc_us = 0;
-		}
-		/* Update cnn stats */
-		vha_cnn_update_stats(vha);
-	}
-
-	if (cmd_idx == VHA_CNN_CMD)
-		vha_cnn_cmd_completed(cmd, status);
-
-	if (status) {
-		/* Rollback any queued command ... */
-		vha_rollback_cnn_cmds(vha);
-		/* Notify immediately current command */
-		vha_cmd_notify(cmd);
-
-		return false;
-	}
-
-	if (vha->queuedcmd[cmd_idx].cmd)
-		vha->pendcmd[cmd_idx].cmd = vha->queuedcmd[cmd_idx].cmd;
-	else
-		vha->pendcmd[cmd_idx].cmd = NULL;
-
-	vha->queuedcmd[cmd_idx].cmd = NULL;
-	dev_dbg(vha->dev,
-			"%s: %p -> new pending %p\n",
-			__func__, cmd, vha->pendcmd[cmd_idx].cmd);
-
-	vha_cmd_notify(cmd);
-
-	return true;
 }
 
 static void vha_measure_core_freq(struct vha_dev *vha)
@@ -766,7 +603,7 @@ static void vha_measure_core_freq(struct vha_dev *vha)
 		__func__);
 }
 
-static bool vha_check_calibration(struct vha_dev *vha)
+bool vha_check_calibration(struct vha_dev *vha)
 {
 	if (vha->stats.last_proc_us) {
 		/* Core may have been kicked to
@@ -781,354 +618,6 @@ static bool vha_check_calibration(struct vha_dev *vha)
 	}
 
 	return false;
-}
-
-static void do_mmu_ctx_setup(struct vha_dev *vha,
-			uint8_t hw_id, int pc_bufid, uint32_t pc_baddr)
-{
-	img_pdump_printf("-- Setup MMU context:%d\n", hw_id);
-	IOWRITE64_PDUMP(hw_id, VHA_CR_OS(MMU_CBASE_MAPPING_CONTEXT));
-
-	if (!test_mmu_base_pf) {
-		IOWRITE64(vha->reg_base, VHA_CR_OS(MMU_CBASE_MAPPING), pc_baddr);
-
-		/* This is physical address so we need use MEM_OS0:BLOCK tag
-		 * when pdump'ing. */
-		img_pdump_printf("-- Setup MMU base address\n"
-				"WRW "_PMEM_":$0 "_PMEM_":BLOCK_%d:0 -- 'PC'\n"
-				"SHR "_PMEM_":$0 "_PMEM_":$0 %d\n"
-				"WRW64 :REG:%#x "_PMEM_":$0\n", pc_bufid,
-				IMG_MMU_PC_ADDR_SHIFT,
-				VHA_CR_OS(MMU_CBASE_MAPPING));
-		dev_dbg(vha->dev, "%s: setting hardware ctx id:%u\n", __func__, hw_id);
-	} else
-		dev_info(vha->dev, "Bringup test: force MMU base page fault\n");
-}
-
-void vha_mmu_setup(struct vha_session *session)
-{
-	struct vha_dev *vha = session->vha;
-	int ctx_id;
-
-	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++)
-		dev_dbg(vha->dev,
-				"%s: mode:%d session ctxid:%x active ctxid:%x\n",
-				__func__, vha->mmu_mode,
-				session->mmu_ctxs[ctx_id].id,
-				vha->active_mmu_ctx);
-
-
-	if (!vha->mmu_mode) {
-		img_pdump_printf("-- MMU bypass ON\n");
-		IOWRITE64_PDUMP(VHA_CR_OS(MMU_CTRL_BYPASS_EN),
-			VHA_CR_OS(MMU_CTRL));
-		return;
-	}
-
-	/* Using model context to track active context */
-	if (session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].id == vha->active_mmu_ctx)
-		return;
-
-	img_pdump_printf("-- MMU_SETUP_BEGIN\n");
-
-	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++) {
-		do_mmu_ctx_setup(vha, session->mmu_ctxs[ctx_id].hw_id,
-				session->mmu_ctxs[ctx_id].pc_bufid,
-				session->mmu_ctxs[ctx_id].pc_baddr);
-		/* If there are multiple sessions using the same mmu hardware context
-		 * we need to flush caches for the old context (id is the same).
-		 * This will happen when number of processes is > VHA_MMU_MAX_HW_CTXS */
-		if (vha->mmu_ctxs[session->mmu_ctxs[ctx_id].hw_id] > 1)
-			mmu_flush(vha->dev, vha, session->mmu_ctxs[ctx_id].hw_id);
-	}
-#if defined(VHA_MMU_MIRRORED_CTX_SUPPORT) && defined(HW_AX3)
-	{
-		/* Need to program auxilary hw context to
-		 * point the same page tables as base context */
-		int hw_id = session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id +
-				VHA_MMU_AUX_HW_CTX_SHIFT;
-		do_mmu_ctx_setup(vha, hw_id,
-				session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].pc_bufid,
-				session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].pc_baddr);
-		if (vha->mmu_ctxs[session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id] > 1)
-			mmu_flush(vha->dev, vha, hw_id);
-	}
-#endif
-
-	/* Using model context to track context change */
-	vha->active_mmu_ctx = session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].id;
-	dev_dbg(vha->dev, "%s: update ctx id active:%x pc:%#x\n",
-			__func__, vha->active_mmu_ctx,
-			session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].pc_baddr <<
-			VHA_CR_OS(MMU_CBASE_MAPPING_BASE_ADDR_ALIGNSHIFT));
-
-	img_pdump_printf("-- MMU_SETUP_END\n");
-}
-
-static void vha_mmu_status(struct vha_dev *vha)
-{
-	const char levels[][5] = {"PT", "PD", "PC", "BASE"};
-
-	uint64_t status1 = IOREAD64(vha->reg_base,
-		VHA_CR_OS(MMU_FAULT_STATUS1));
-	uint64_t status2 = IOREAD64(vha->reg_base,
-		VHA_CR_OS(MMU_FAULT_STATUS2));
-
-	uint64_t addr = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, ADDRESS, status1);
-	uint8_t level = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, LEVEL, status1);
-	uint8_t req_id = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, REQ_ID, status1);
-	uint8_t ctx = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, CONTEXT, status1);
-	uint8_t rnw = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, RNW, status1);
-	uint8_t type = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, TYPE, status1);
-	uint8_t fault = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS1, FAULT, status1);
-
-	uint8_t bif_id = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS2, BIF_ID, status2);
-	uint8_t tlb_entry = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS2, TLB_ENTRY, status2);
-	uint8_t slc_bank = VHA_CR_GETBITS_OS(MMU_FAULT_STATUS2, BANK, status2);
-	uint64_t mapping = 0;
-
-	/* Select context and read current pc */
-	IOWRITE64(vha->reg_base, VHA_CR_OS(MMU_CBASE_MAPPING_CONTEXT), ctx);
-	mapping = IOREAD64(vha->reg_base, VHA_CR_OS(MMU_CBASE_MAPPING));
-
-	/* false alarm ? */
-	if (!fault)
-		return;
-
-	dev_dbg(vha->dev, "%s: MMU FAULT: s1:%llx s2:%llx\n",
-			__func__, status1, status2);
-
-	dev_warn(vha->dev, "%s: MMU fault while %s @ 0x%llx\n",
-			__func__, (rnw) ? "reading" : "writing", addr << 4);
-	dev_warn(vha->dev, "%s: level:%s Requestor:%x Context:%x Type:%s\n",
-			__func__, levels[level], req_id, ctx,
-			(type == 0) ? "VALID" :
-			(type == 2) ? "READ-ONLY" :
-			"UNKNOWN");
-	dev_warn(vha->dev, "%s: bif_id:%x tlb_entry:%x slc_bank:%x\n",
-			__func__, bif_id, tlb_entry, slc_bank);
-	dev_warn(vha->dev, "%s: current mapping@context%d:%#llx\n",
-			__func__, ctx,
-			mapping <<
-			VHA_CR_OS(MMU_CBASE_MAPPING_BASE_ADDR_ALIGNSHIFT));
-}
-
-static void vha_do_queued_cmd(struct vha_dev *vha, int cmd_idx)
-{
-	struct vha_cmd *cmd, *pend;
-
-	cmd = vha->queuedcmd[cmd_idx].cmd;
-
-	dev_dbg(vha->dev,
-			"%s: queued %p pending %p\n",
-			__func__, cmd, vha->pendcmd[cmd_idx].cmd);
-
-	if (!cmd || (cmd &&
-				((vha->low_latency == VHA_LL_DISABLED ||
-				vha->low_latency == VHA_LL_SELF_KICK) ||
-						!cmd->queued))) {
-		dev_dbg(vha->dev, "%s: skipping!\n", __func__);
-		return;
-	}
-
-	/* store actual pending command as it will be modified */
-	pend = vha->pendcmd[cmd_idx].cmd;
-
-	/* at this point we should be able to process the cmd */
-	vha_do_cnn_cmd(cmd);
-
-	/* restore pending */
-	vha->pendcmd[cmd_idx].cmd = pend;
-}
-
-static int vha_report_failure(struct vha_dev *vha, uint64_t status,
-		const struct vha_biterr bits[], int bits_size)
-{
-	int error = 0;
-	int i;
-	int cmdid = -1;
-
-	if (vha->pendcmd[VHA_CNN_CMD].cmd)
-		cmdid = vha->pendcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id;
-
-	if (vha_observers.error)
-		vha_observers.error(vha->id, cmdid, status);
-
-	/* event status in human readable form */
-	for (i = 0; i < bits_size; i++) {
-		if (status & bits[i].b) {
-			dev_err(vha->dev,
-				" event status: %s\n",
-				bits[i].s);
-			/* convert from register bits into POSIX errno
-			* if multiple errors, then arbitrary errno choice */
-			error = bits[i].e;
-		}
-	}
-
-	return error;
-}
-
-/* if vha event register reports CNN events, so handle them */
-static int vha_handle_cnn_event(struct vha_dev *vha, uint64_t event_status)
-{
-	int err = 0;
-
-	if (vha_check_calibration(vha))
-		return 0;
-
-	if (event_status & VHA_CNN_ERR_EVNTS) {
-		static const struct vha_biterr err_bits[] = {
-			{-ETIMEDOUT, ERR_EVENT_DESC(CNN0_MEM_WDT)},
-#ifdef HW_AX2
-			{-ETIMEDOUT, ERR_EVENT_DESC(CNN0_WDT)},
-#endif
-			{-EIO,       ERR_EVENT_DESC(CNN0_ERROR)}
-		};
-
-		err = vha_report_failure(vha,
-				event_status, err_bits, ARRAY_SIZE(err_bits));
-
-		vha_cnn_dump_status(vha);
-	}
-
-	/* Poke the hw if there were already
-	 * command queued in the hw */
-	if (!err)
-		vha_do_queued_cmd(vha, VHA_CNN_CMD);
-	/* Handle actual command */
-	if (vha_handle_cmd(vha, VHA_CNN_CMD, err) == false)
-		err = -ENOENT;
-
-	return err;
-}
-
-/* Bottom half */
-irqreturn_t vha_handle_thread_irq(struct device *dev)
-{
-	struct vha_dev *vha = dev_get_drvdata(dev);
-	irqreturn_t ret = IRQ_HANDLED;
-	uint64_t status;
-	uint8_t count, c = 0;
-	int err = 0;
-
-	if (!vha)
-		return IRQ_NONE;
-
-	mutex_lock(&vha->lock);
-
-	spin_lock_irq(&vha->irq_lock);
-	status = vha->irq_status;
-	vha->irq_status = 0;
-	count = vha->irq_count;
-	vha->irq_count = 0;
-	if (!count) {
-		uint64_t proc_time = 0;
-
-		if (get_timespan_us(&vha->stats.hw_proc_start, &vha->stats.hw_proc_end,
-					&proc_time)) {
-			vha->stats.last_proc_us = proc_time;
-		} else {
-			vha->stats.last_proc_us = 0;
-		}
-	}
-	spin_unlock_irq(&vha->irq_lock);
-	/* Command may have been aborted before this handler is executed */
-	if (!status) {
-		mutex_unlock(&vha->lock);
-		return ret;
-	}
-
-	dev_dbg(dev, "%s: status:%llx count:%d\n",
-			__func__, status, count);
-
-	do {
-		if (status & VHA_CORE_EVNTS) {
-			static const struct vha_biterr err_bits[] = {
-				{-EIO,       ERR_EVENT_DESC(AXI_ERROR)},
-				{-EFAULT,    ERR_EVENT_DESC(MMU_PAGE_FAULT)},
-#ifdef HW_AX3
-#ifdef VHA_SCF
-				{-EIO,       ERR_EVENT_DESC(MMU_PARITY_ERROR)},
-				{-EIO,       ERR_EVENT_DESC(PARITY_ERROR)},
-				{-EIO,       ERR_EVENT_DESC(LOCKSTEP_ERROR)},
-#endif
-				{-ETIMEDOUT, ERR_EVENT_DESC(HL_WDT)},
-				{-EIO,       ERR_EVENT_DESC(ERROR)}
-#endif
-			};
-
-#ifdef HW_AX3
-			if (vha->is_ready)
-				if (vha_check_calibration(vha))
-					break;
-
-			if (status & VHA_EVENT_TYPE(READY)
-					&& !vha->is_ready) {
-				vha->is_ready = true;
-				vha_dev_ready(vha);
-				if (vha->do_calibration) {
-					vha_cnn_gen_wdt(vha);
-					break;
-				} else
-					vha_chk_cmd_queues(vha, true);
-			}
-#endif
-
-			err = vha_report_failure(vha, status,
-					err_bits, ARRAY_SIZE(err_bits));
-			if (err) {
-				dev_err(vha->dev, "NNA hw failure: %llx\n", status);
-				dev_err(vha->dev, "   CLK_STATUS0:%llx ",
-					IOREAD64(vha->reg_base, VHA_CR_CLK_STATUS0));
-				dev_err(vha->dev, " VHA_EVENT_STATUS:%llx ", status);
-			}
-
-			if (status & VHA_EVENT_TYPE(MMU_PAGE_FAULT))
-				/* dump mmu status */
-				vha_mmu_status(vha);
-		}
-
-		/* If no core level error process cnn events */
-		if (!err && status & VHA_CNN_EVNTS)
-			err = vha_handle_cnn_event(vha, status);
-#ifdef HW_AX3
-		else if (status == VHA_EVENT_TYPE(ERROR)) {
-			/* Resubmit command next time if no CNN error detected
-			 * and only ERROR bit is set.
-			 * That means other OS caused the error */
-			vha_rollback_cnn_cmds(vha);
-		}
-#endif
-		else if (err) { /* Core level error */
-			if (vha_handle_cmd(vha, VHA_CNN_CMD, err) == false)
-				err = -ENOENT;
-		}
-
-		c++;
-	} while (c < count && !err);
-
-	if (err) {
-		vha->stats.total_failures += count;
-		vha_dev_stop(vha, true);
-		/* Check queues ... */
-		vha_chk_cmd_queues(vha, true);
-	} else {
-		/* Run in BH context! */
-		vha_chk_cmd_queues(vha, false);
-	}
-	vha->stats.cnn_kicks_completed += count;
-	mutex_unlock(&vha->lock);
-
-	return ret;
-}
-
-static void vha_try_stop(struct vha_dev *vha)
-{
-	if (!vha->do_calibration &&
-			(vha->pendcmd[VHA_CNN_CMD].cmd == NULL &&
-			vha->queuedcmd[VHA_CNN_CMD].cmd == NULL))
-		vha_dev_stop(vha, false);
 }
 
 /*
@@ -1188,7 +677,7 @@ int vha_add_session(struct vha_session *session)
 	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++) {
 		ret = img_mmu_ctx_create(vha->dev, &mmu_config,
 					session->mem_ctx, vha->int_heap_id,
-					mmu_callback, session,
+					vha_mmu_callback, session,
 					&session->mmu_ctxs[ctx_id].ctx);
 		if (ret < 0) {
 			dev_err(vha->dev, "%s: failed to create sw mmu context%d!\n",
@@ -1218,19 +707,22 @@ int vha_add_session(struct vha_session *session)
 		}
 	}
 
-	if (vha->core_props.ocm_size_bytes && onchipmem_phys_start != ~0) {
+#ifndef CONFIG_HW_MULTICORE
+	if (vha->core_props.locm_size_bytes && onchipmem_phys_start != ~0) {
 		/* OCM data is considered as IO (or shared)*/
 		ret = img_mmu_init_cache(session->mmu_ctxs[VHA_MMU_REQ_IO_CTXID].ctx,
-				onchipmem_phys_start, vha->core_props.ocm_size_bytes);
+				onchipmem_phys_start, vha->core_props.locm_size_bytes);
 		if (ret < 0) {
 			dev_err(vha->dev, "%s: failed to create init cache!\n",
 					__func__);
 			goto out_free_mmu_ctx;
 		}
+		vha_dev_ocm_configure(vha, onchipmem_phys_start);
 	}
+#endif
 
 	/* enable CRC and DEBUG registers */
-	ret = vha_dbg_enable_hwbufs(session);
+	ret = vha_dbg_create_hwbufs(session);
 	if (ret)
 		goto out_free_mmu_ctx;
 
@@ -1300,46 +792,17 @@ void vha_rm_session(struct vha_session *session)
 	struct vha_rsp *cur_rsp, *tmp_rsp;
 	struct vha_buffer *cur_buf, *tmp_buf;
 	bool reschedule = false;
-	bool pend_removed = false;
-	bool queued_removed = false;
 	int ctx_id;
 
 	mutex_lock(&vha->lock);
 
+	img_pdump_printf("-- FREE_END\n");
+	session->freeing = false;
+
 	img_pdump_printf("-- CLOSE_BEGIN\n");
 
-	/* Check if pend/queued commands will be removed. */
-	if (vha->pendcmd[VHA_CNN_CMD].cmd &&
-			vha->pendcmd[VHA_CNN_CMD].cmd->session == session) {
-		dev_warn(vha->dev,
-				"Removing a session while cnn cmd is still pending\n");
-		pend_removed = true;
-#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
-		cancel_delayed_work(&vha->dummy_dwork);
-#endif
-	}
-	if (vha->queuedcmd[VHA_CNN_CMD].cmd &&
-			vha->queuedcmd[VHA_CNN_CMD].cmd->session == session) {
-		dev_warn(vha->dev,
-				"Removing a session while cnn cmd is still queued\n");
-		queued_removed = true;
-	}
-
-	/* Update session scheduling. */
-	if (vha->queuedcmd[VHA_CNN_CMD].cmd &&
-			(pend_removed && !queued_removed)) {
-		if (vha->queuedcmd[VHA_CNN_CMD].cmd->session !=
-					list_entry(&vha->sched_sessions, struct vha_session, sched_list))
-			while(list_first_entry(&vha->sched_sessions, struct vha_session,
-											sched_list) != vha->queuedcmd[VHA_CNN_CMD].cmd->session)
-				list_rotate_left(&vha->sched_sessions);
-	}
-
-	/* Remove pend/queued commands if needed. */
-	if (pend_removed || queued_removed) {
-		vha_rollback_cnn_cmds(vha);
-		reschedule = true;
-	}
+	/* Remove pend/queued session commands. */
+	reschedule = vha_rm_session_cmds(session);
 
 	/* Remove session related commands. */
 	list_for_each_entry_safe(cur_cmd, tmp_cmd, &session->cmds, list) {
@@ -1359,7 +822,8 @@ void vha_rm_session(struct vha_session *session)
 	}
 
 	/* Disable CRC and DEBUG capture. */
-	vha_dbg_disable_hwbufs(session);
+	vha_dbg_stop_hwbufs(session);
+	vha_dbg_destroy_hwbufs(session);
 
 	list_for_each_entry_safe(cur_buf, tmp_buf, &session->bufs, list) {
 		dev_warn(vha->dev,
@@ -1424,139 +888,11 @@ void vha_rm_session(struct vha_session *session)
 		vha_chk_cmd_queues(vha, true);
 }
 
-static int vha_get_core_props(struct vha_dev *vha, struct vha_sys_data *sys_data)
-{
-	struct vha_core_props *props = &vha->core_props;
-	int ret = 0;
-	uint64_t ip_config;
-
-	memset(props, 0, sizeof(*props));
-
-#ifdef CONFIG_VHA_DUMMY
-	/* Note: dummy dev always reads zeroes from registers */
-	props->product_id  = 0x8070605040302010ULL;
-	props->core_id  = (long)HW_SERIES << (int)VHA_CR_CORE_ID_BRANCH_ID_SHIFT;
-	props->core_id += 0x010203040506ULL;   // provide a dummy core id
-	props->num_dummy_devs  = 1;
-#else
-	props->product_id  = IOREAD64(vha->reg_base, VHA_CR_PRODUCT_ID);
-	props->core_id  = IOREAD64(vha->reg_base, VHA_CR_CORE_ID);
-#endif
-	/*
-	 * New mmu version 3 and onwards operates on 40bit physical & virtual addresses
-	 */
-	props->mmu_width = 40;
-
-	/* HW from 1.1 onwards */
-	ip_config = IOREAD64(vha->reg_base, VHA_CR_CORE_IP_CONFIG);
-#ifdef HW_AX3
-	props->mmu_ver = VHA_CR_GETBITS(CORE_IP_CONFIG, MMU_VERSION, ip_config);
-#endif
-	/* Mirage uses MMU version 3 hardware */
-	if (!props->mmu_ver)
-		props->mmu_ver = 3;
-			;
-	if (VHA_CR_GETBITS(CORE_IP_CONFIG, CNN_SUPPORTED, ip_config))
-		props->num_cnn_devs = 1;
-	if (VHA_CR_GETBITS(CORE_IP_CONFIG, RTM_SUPPORTED, ip_config))
-		props->supported.rtm = 1;
-#ifdef HW_AX3
-	if (VHA_CR_GETBITS(CORE_IP_CONFIG, PARITY_REGISTERS, ip_config))
-		props->supported.parity = 1;
-
-#if defined(CONFIG_VHA_DUMMY) && defined(VHA_SCF)
-	/* Force parity for pdump generation */
-	props->supported.parity = 1;
-#endif
-#endif
-
-	if ((props->num_dummy_devs == 0 && props->num_cnn_devs == 0)
-		|| VHA_CR_GETBITS(CORE_ID, BRANCH_ID, props->core_id) != HW_SERIES) {
-		ret = -EINVAL;
-		dev_err(vha->dev, "%s: Wrong core configuration detected. "
-			"Expected BVNC %d.x.x.x, got %llu.x.x.x. "
-			"Maybe kernel module was built with wrong params.\n",
-			__func__, HW_SERIES,
-			VHA_CR_GETBITS(CORE_ID, BRANCH_ID, props->core_id));
-	}
-
-	props->soc_axi  = IOREAD64(vha->reg_base, VHA_CR_SOC_AXI);
-
-	dev_info(vha->dev, "%s: Product id: %#llx\n",
-			__func__, props->product_id);
-	dev_info(vha->dev, "%s: Core id: %#llx\n",
-			__func__, props->core_id);
-	dev_info(vha->dev, "%s: MMU version:%d (%dbit)\n",
-			__func__, props->mmu_ver, props->mmu_width);
-	dev_dbg(vha->dev, "%s: supported: %#x\n",
-			__func__, props->features);
-	dev_dbg(vha->dev, "%s: soc_axi: %#llx\n",
-			__func__, props->soc_axi);
-	{
-		uint64_t tmp = IOREAD64(vha->reg_base,
-				VHA_CR_CORE_IP_INTEGRATOR_ID);
-		dev_dbg(vha->dev, "%s: ip integrator id: %#llx\n",
-				__func__, tmp);
-		tmp = IOREAD64(vha->reg_base, VHA_CR_CORE_IP_CHANGELIST);
-		dev_dbg(vha->dev, "%s: ip change list: %llu\n", __func__, tmp);
-	}
-
-	if (sys_data && sys_data->ocm_size_kb) {
-		vha->core_props.ocm_size_bytes = sys_data->ocm_size_kb * 1024;
-		/* User may wanted to limit OCM ... */
-		if (onchipmem_size) {
-			if(onchipmem_size < vha->core_props.ocm_size_bytes) {
-				dev_warn(vha->dev, "%s:Limiting onchip memory to %u bytes (available:%u)\n",
-						__func__, onchipmem_size, vha->core_props.ocm_size_bytes);
-				vha->core_props.ocm_size_bytes = onchipmem_size;
-			} else {
-				dev_err(vha->dev, "%s: User defined onchip memory size exceeded (%u > %u))\n",
-						__func__, onchipmem_size, vha->core_props.ocm_size_bytes);
-			}
-		}
-	} else {
-		vha->core_props.ocm_size_bytes = onchipmem_size;
-	}
-
-	dev_info(vha->dev, "%s: Total onchip memory: %u [kB]\n",
-			__func__, vha->core_props.ocm_size_bytes / 1024);
-
-	dev_info(vha->dev, "%s: Devices: DUMMY:%u CNN:%u\n",
-			__func__, props->num_dummy_devs, props->num_cnn_devs);
-
-	return ret;
-}
-
 static int vha_alloc_common(struct vha_dev *vha)
 {
 #if 0
-	/* Allocate so-called fault access page to be accessed
-	 * in case of invalid MMU entry */
 	img_pdump_printf("-- INIT_BEGIN\n");
-	if (vha->mmu_mode) {
-		uint64_t addr;
-		int ret = img_mem_alloc(vha->dev, drv.mem_ctx,
-			default_mem_heap, 4096, IMG_MEM_ATTR_WRITECOMBINE,
-			&vha->fp_bufid);
-		if (ret) {
-			dev_err(vha->dev, "%s: failed to allocate fault access page!\n",
-					__func__);
-			return ret;
-		}
 
-		dev_dbg(vha->dev, "%s: fault access page allocated id:%d!\n",
-					__func__, vha->fp_bufid);
-		addr = img_mem_get_single_page(drv.mem_ctx, vha->fp_bufid, 0);
-		/* Get the address that dev expects */
-		addr = img_mem_get_dev_addr(drv.mem_ctx, vha->fp_bufid, addr);
-
-		IOWRITE64(vha->reg_base, VHA_CR_MMU_FAULT_ACCESS, addr);
-		/* This is physical address so we need use MEM_OS0:BLOCK tag
-		 * when pdump'ing. */
-		img_pdump_printf("-- Setup fault access page register\n"
-			"WRW64 :REG:%#x "_PMEM_":BLOCK_%d:0 -- 'FAP'\n",
-			VHA_CR_MMU_FAULT_ACCESS, vha->fp_bufid);
-	}
 	img_pdump_printf("-- INIT_END\n");
 #endif
 	return 0;
@@ -1623,32 +959,9 @@ static void vha_apm_worker(struct work_struct *work)
 	mutex_unlock(&vha->lock);
 }
 
-#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
-/* Simulating hw execution time by scheduling this delayed work. */
-static void vha_dummy_worker(struct work_struct *work)
-{
-	struct vha_dev *vha = container_of(work, struct vha_dev, dummy_dwork.work);
-
-	mutex_lock(&vha->lock);
-
-	if (vha->pendcmd[VHA_CNN_CMD].cmd) {
-		/* Record hw processing end timestamps */
-		vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
-		getnstimeofday(&vha->stats.hw_proc_end);
-		/* Handle current pending command */
-		vha_handle_cnn_event(vha, VHA_CNN_CMPLT_EVNT);
-		/* Schedule following commands */
-		vha_chk_cmd_queues(vha, true);
-	}
-
-	mutex_unlock(&vha->lock);
-}
-#endif
-
 int vha_add_dev(struct device *dev,
 		const struct heap_config heap_configs[], const int heaps,
-		void *plat_data, struct vha_sys_data *sys_data,
-		void __iomem *reg_base, uint32_t reg_size)
+		void *plat_data, void __iomem *reg_base, uint32_t reg_size)
 {
 	struct vha_dev *vha;
 	int ret;
@@ -1678,7 +991,7 @@ int vha_add_dev(struct device *dev,
 	vha->active_mmu_ctx = VHA_INVALID_ID;
 
 	/* Read HW properties */
-	ret = vha_get_core_props(vha, sys_data);
+	ret = vha_dev_get_props(vha, onchipmem_size);
 	if (ret) {
 		dev_err(dev, "%s: could not get vha properties at %p\n",
 			__func__, (__force void *)vha->reg_base);
@@ -1704,7 +1017,19 @@ int vha_add_dev(struct device *dev,
 
 #ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
 	/* Initialise hw processing time simulation worker */
+#ifdef CONFIG_HW_MULTICORE
+	{
+		uint32_t i;
+		for (i = 0; i < vha->core_props.num_cnn_core_devs; i ++) {
+			INIT_DELAYED_WORK(&vha->dummy_dworks[i].dummy_dwork,
+								vha_dummy_worker);
+			vha->dummy_dworks[i].wm_id = i;
+			vha->dummy_dworks[i].vha = vha;
+		}
+	}
+#else
 	INIT_DELAYED_WORK(&vha->dummy_dwork, vha_dummy_worker);
+#endif
 #endif
 
 	dev_set_drvdata(dev, vha);
@@ -1755,6 +1080,10 @@ int vha_add_dev(struct device *dev,
 #endif
 
 	INIT_DELAYED_WORK(&vha->apm_dwork, vha_apm_worker);
+#ifdef VHA_DEVFREQ
+	ret = vha_devfreq_init(vha);
+#endif
+
 
 	return ret;
 out_alloc_common:
@@ -1793,7 +1122,18 @@ void vha_rm_dev(struct device *dev)
 	flush_scheduled_work();
 	cancel_delayed_work_sync(&vha->apm_dwork);
 #ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
+#ifdef CONFIG_HW_MULTICORE
+	{
+		uint32_t i;
+		for (i = 0; i < vha->core_props.num_cnn_core_devs; i++)
+			cancel_delayed_work_sync(&vha->dummy_dworks[i].dummy_dwork);
+	}
+#else
 	cancel_delayed_work_sync(&vha->dummy_dwork);
+#endif
+#endif
+#ifdef VHA_DEVFREQ
+	npu_cooling_device_unregister();
 #endif
 	vha_free_common(vha);
 
@@ -1829,8 +1169,8 @@ void vha_dev_calibrate(struct device *dev, uint32_t cycles)
 		dev_info(dev, "%s: Starting core frequency measurement (%d)...",
 				__func__, cycles);
 		vha_dev_start(vha);
-#ifdef HW_AX2
-		vha_cnn_gen_wdt(vha);
+#if (defined(HW_AX2) || defined(CONFIG_HW_MULTICORE))
+		vha_cnn_start_calib(vha);
 #endif
 	}
 	mutex_unlock(&vha->lock);
@@ -1932,7 +1272,7 @@ int vha_map_buffer(struct vha_session *session,
 	struct vha_dev *vha = session->vha;
 	uint32_t flags = IMG_MMU_PTE_FLAG_NONE;
 	struct vha_buffer *buf = NULL;
-	int ret;
+	int ret = 0;
 
 	ret = mutex_lock_interruptible(&vha->lock);
 	if (ret)
@@ -1972,6 +1312,20 @@ int vha_map_buffer(struct vha_session *session,
 	}
 
 	buf = vha_find_bufid(session, buf_id);
+
+#ifdef CONFIG_HW_MULTICORE
+	if (buf->attr & IMG_MEM_ATTR_OCM) {
+		uint64_t *phys = img_mem_get_page_array(session->mem_ctx,
+								buf_id);
+		/* Virtual == physical */
+		buf->devvirt = phys[0];
+		dev_dbg(vha->dev,
+				"%s: buf %s (%u), is OCM buffer, no MMU mapping needed!\n",
+				__func__, buf->name, buf_id);
+
+		goto out_unlock;
+	}
+#endif
 
 	/* force MMU fault after N buffer map operations */
 	if (test_mmu_no_map_count != 0) {
@@ -2014,7 +1368,7 @@ int vha_unmap_buffer(struct vha_session *session,
 {
 	struct vha_dev *vha = session->vha;
 	struct vha_buffer *buf = NULL;
-	int ret;
+	int ret = 0;
 	int ctx_id;
 
 	ret = mutex_lock_interruptible(&vha->lock);
@@ -2022,6 +1376,16 @@ int vha_unmap_buffer(struct vha_session *session,
 		return ret;
 
 	buf = vha_find_bufid(session, buf_id);
+
+#ifdef CONFIG_HW_MULTICORE
+	if (buf->attr & IMG_MEM_ATTR_OCM) {
+		dev_dbg(vha->dev,
+				"%s: buf %s (%u) is OCM buffer, no MMU unmapping needed!\n",
+				__func__, buf->name, buf_id);
+		buf->devvirt = ~0ULL;
+		goto out_unlock;
+	}
+#endif
 
 	if (buf->req_type == VHA_REQ_MODEL)
 		ctx_id = VHA_MMU_REQ_MODEL_CTXID;
@@ -2228,49 +1592,6 @@ static bool vha_is_waiting_on_input_buffs(struct vha_session *session,
 }
 
 
-static bool vha_is_busy(struct vha_dev *vha)
-{
-#ifndef CONFIG_VHA_DUMMY
-	if (!vha->is_ready)
-		return true;
-#endif
-
-	if (vha->low_latency != VHA_LL_DISABLED) {
-		return vha->pendcmd[VHA_CNN_CMD].cmd != NULL ||
-				vha->queuedcmd[VHA_CNN_CMD].cmd != NULL;
-	}
-	return vha->pendcmd[VHA_CNN_CMD].cmd != NULL;
-}
-
-/* returns true if the cmd queue is full */
-static bool vha_is_queue_full(struct vha_dev *vha, struct vha_cmd *cmd)
-{
-	if (vha->low_latency != VHA_LL_DISABLED) {
-#ifdef HW_AX3
-		if ((vha->low_latency == VHA_LL_SELF_KICK)
-				/* if current command we are trying to queue belongs to a different session than pending one */
-				&& (vha->pendcmd[VHA_CNN_CMD].cmd != NULL && cmd != NULL &&
-						vha->pendcmd[VHA_CNN_CMD].cmd->session != cmd->session)
-				/* if session of the command we are trying to queue, shares the hw mmu ctx with the session of pending cmd */
-				&& (cmd->session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id ==
-						vha->pendcmd[VHA_CNN_CMD].cmd->session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id)
-				/* Sanity if hw mmu ctx is really shared at this point */
-				&& (vha->mmu_ctxs[cmd->session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id] > 1)
-				) {
-#else
-		if (vha->low_latency == VHA_LL_SELF_KICK) {
-			dev_warn(vha->dev, "%s: LL=2 not supported!\n", __func__);
-#endif
-			/* skip low latency mode */
-			return vha->pendcmd[VHA_CNN_CMD].cmd != NULL;
-		}
-
-		return vha->pendcmd[VHA_CNN_CMD].cmd != NULL &&
-					vha->queuedcmd[VHA_CNN_CMD].cmd != NULL;
-	}
-	return vha->pendcmd[VHA_CNN_CMD].cmd != NULL;
-}
-
 /* process the cmd if everything is ready */
 static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 {
@@ -2290,7 +1611,13 @@ static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 #endif
 
 	/* check hw availability (if needed) */
+#ifdef CONFIG_HW_MULTICORE
+	/* Attempt to schedule command on available cores. */
+	if (vha_dev_schedule_cmd(session->vha, cmd) != 0)
+#else
+	/* Check if the core's queue is full. */
 	if (vha_is_queue_full(session->vha, cmd))
+#endif
 		return CMD_HW_BUSY;
 
 	if (cmd->user_cmd.cmd_type == VHA_CMD_CNN_SUBMIT &&
@@ -2318,20 +1645,30 @@ static void cmd_worker(struct work_struct *work)
 	mutex_lock(&vha->lock);
 
 	if (vha->do_calibration) {
-		/* Postpone any worker tasks */
+		/* Postpone any worker tasks. */
 		dev_dbg(vha->dev, "%s Postpone worker task!\n", __func__);
 		goto exit;
 	}
 
+#ifdef CONFIG_HW_MULTICORE
+	if (vha_dev_schedule_cmd(vha, NULL) != 0) {
+		/* Postpone worker task if nothing can be scheduled. */
+		dev_dbg(vha->dev, "%s Nothing can be scheduled at the moment. "
+				"Postpone worker task!\n", __func__);
+		goto exit;
+	}
+#else
 	if (vha_is_queue_full(vha, NULL)) {
-		/* Postpone worker task if command queue is full */
+		/* Postpone worker task if command queue is full. */
 		dev_dbg(vha->dev, "%s Queue full. Postpone worker task!\n", __func__);
 		goto exit;
 	}
+#endif
 
 	do {
 		list_for_each_entry(session, &vha->sched_sessions, sched_list) {
 			list_for_each_entry_safe(cmd, tmp, &session->cmds, list) {
+
 				/* Reset previous state. */
 				queued = false;
 				in_hw = false;
@@ -2345,11 +1682,13 @@ static void cmd_worker(struct work_struct *work)
 					queued = cmd->queued;
 					in_hw = cmd->in_hw;
 				}
+
 				/* Attempt to schedule command for execution. */
 				cmd_status = vha_do_cmd(cmd);
 				if (cmd_status == CMD_NOTIFIED) {
 					continue;
 				}
+
 				/* For hw commands... */
 				if (CMD_EXEC_ON_HW(cmd)) {
 					/* For low latency processing... */
@@ -3009,7 +2348,6 @@ int vha_add_cmd(struct vha_session *session, struct vha_cmd *cmd)
 	return 0;
 }
 
-
 int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 		uint32_t cmd_id_mask)
 {
@@ -3018,43 +2356,11 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 	struct vha_rsp *cur_rsp, *tmp_rsp;
 	bool reschedule = false;
 	bool respond = false;
-	bool pend_removed = false;
-	bool queued_removed = false;
 
 	mutex_lock(&vha->lock);
 
-	/* Check if pend/queued commands will be removed. */
-	if (vha->pendcmd[VHA_CNN_CMD].cmd &&
-			(vha->pendcmd[VHA_CNN_CMD].cmd->session == session) &&
-			(vha->pendcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id & cmd_id_mask)
-																																	== cmd_id) {
-		pend_removed = true;
-#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
-		cancel_delayed_work(&vha->dummy_dwork);
-#endif
-	}
-	if (vha->queuedcmd[VHA_CNN_CMD].cmd &&
-			(vha->queuedcmd[VHA_CNN_CMD].cmd->session == session) &&
-			(vha->queuedcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id & cmd_id_mask)
-																																	== cmd_id) {
-		queued_removed = true;
-	}
-
-	/* Update session scheduling. */
-	if (vha->queuedcmd[VHA_CNN_CMD].cmd &&
-			(pend_removed && !queued_removed)) {
-		if (vha->queuedcmd[VHA_CNN_CMD].cmd->session !=
-					list_entry(&vha->sched_sessions, struct vha_session, sched_list))
-			while(list_first_entry(&vha->sched_sessions, struct vha_session,
-											sched_list) != vha->queuedcmd[VHA_CNN_CMD].cmd->session)
-				list_rotate_left(&vha->sched_sessions);
-	}
-
-	/* Remove pend/queued commands if needed. */
-	if (pend_removed || queued_removed) {
-		vha_rollback_cnn_cmds(vha);
-		reschedule = true;
-	}
+	/* Remove pend/queued session commands that match the cmd_id. */
+	reschedule = vha_rm_session_cmds_masked(session, cmd_id, cmd_id_mask);
 
 	/* Remove session related commands matching command id template. */
 	list_for_each_entry_safe(cur_cmd, tmp_cmd, &session->cmds, list) {
@@ -3145,7 +2451,7 @@ int vha_suspend_dev(struct device *dev)
 	mutex_lock(&vha->lock);
 	dev_dbg(dev, "%s: taking a nap!\n", __func__);
 
-	processing = vha_rollback_cnn_cmds(vha);
+	processing = vha_rollback_cmds(vha);
 	/* Forcing hardware disable */
 	vha_dev_stop(vha, processing);
 

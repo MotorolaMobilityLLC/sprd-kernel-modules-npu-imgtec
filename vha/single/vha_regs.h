@@ -38,33 +38,23 @@
  * "MIT_COPYING".
  *
  *****************************************************************************/
+#include "../vha_io.h"
 
 #if defined(HW_AX2)
 #include <hwdefs/vha_cr_mirage.h>
 #elif defined(HW_AX3)
-#include <hwdefs/vha_cr.h>
+#include <hwdefs/vha_cr_aura.h>
 #else
 #error "No HW layout defined"
 #endif
 
-/* value missing from vha_cr.h: value obtained from email from SS */
-#define VHA_CR_CNN_DEBUG_STATUS_CNN_DEBUG_OFFSET_ALIGNSHIFT 32
-
-#define IMG_UINT64_C(v) v##ULL
-
-#define VHA_DEAD_HW (0xdead1000dead1ULL)
-
-#ifndef OSID
-#define _OSID_ 0
-#else
-#define _OSID_ OSID
+#if defined(CFG_SYS_VAGUS)
+#include <hwdefs/vagus_system.h>
+#elif defined(CFG_SYS_AURA)
+#include <hwdefs/aura_system.h>
+#elif defined(CFG_SYS_MIRAGE)
+#include <hwdefs/mirage_system.h>
 #endif
-
-#define _CONCAT(x, y, z) x ## y ## z
-#define OSID_TOKEN(group, osid, reg) _CONCAT(group, osid, reg)
-
-#define VHA_CR_OS(reg_name) \
-	OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg_name)
 
 /* HW Series AURA or MIRAGE */
 #if defined(HW_AX2)
@@ -191,150 +181,9 @@
 			VHA_RESET_EN(SOFT_RESET) \
 			) & VHA_CR_RESET_CTRL_MASKFULL)
 
-#define ADDR_CAST __force void *
+/* NN_SYS register macros */
+#define NN_SYS_CR_BASE \
+		(_REG_NNSYS_START)
 
-/* IO access macros */
-#define IOREAD64(b, o) vha_plat_read64((ADDR_CAST)b + (o))
-#define IOWRITE64(b, o, v) vha_plat_write64((ADDR_CAST)b + (o), v)
-
-/* write value to register and log into pdump file */
-#define IOWRITE64_PDUMP(v, r) do {				\
-		uint64_t _val_ = v;					\
-		vha_plat_write64((ADDR_CAST)vha->reg_base + r, _val_);	\
-		img_pdump_printf("WRW64 :REG:%#x %#llx\n",	\
-				 (r), _val_);		\
-	} while (0)
-
-/* poll c-times for the exact register value(v) masked with m,
- * using d-cycles delay between polls and log into pdump file */
-#define IOPOLL64_PDUMP(v, c, d, m, r) do {				\
-		uint64_t _req_ = v & m;					\
-		uint64_t _val_ = ~_req_;						\
-		int _count_ = c;						\
-		while (--_count_ >= 0 && _val_ != _req_) {			\
-			_val_ = vha_plat_read64(	\
-					(ADDR_CAST)vha->reg_base + ((r))) & m;\
-			if ((_val_ != _req_)) {				\
-				if (vha->freq_khz > 0) {		\
-					ndelay(d*1000000/vha->freq_khz); \
-				} else					\
-					udelay(100);			\
-			}						\
-		}							\
-		WARN_ON(_val_ != _req_ && !vha->core_props.num_dummy_devs);	\
-		img_pdump_printf("POL64 :REG:%#x %#llx %#llx 0 %d %d\n", \
-				(r), _req_, m, c, d);			\
-	} while (0)
-
-/* write phys address of buffer to register, and log into pdump */
-#define IOWRITE_PDUMP_PHYS(buf, offset, reg) do {			\
-		uint64_t __maybe_unused _addr_ = vha_buf_addr(session, buf);	\
-		vha_plat_write64(	\
-				(ADDR_CAST)session->vha->reg_base + reg,\
-				_addr_ + offset);	\
-		img_pdump_printf(					\
-			"WRW64 :REG:%#x "_PMEM_":BLOCK_%d:%#x -- '%s%s'\n",	\
-			reg, buf->id, offset, buf->name,		\
-				buf->pcache.valid ? "_cached" : "");	\
-	} while (0)
-
-/* write virt address of buffer to register, and log into pdump */
-#define IOWRITE_PDUMP_VIRT(buf, offset, reg) \
-		IOWRITE64_PDUMP(buf->devvirt + offset, reg)
-
-/* write address of buffer to register and log into pdump file */
-#define IOWRITE_PDUMP_BUFADDR(session, buf, offset, reg) do {		\
-		if (session->vha->mmu_mode)				\
-			IOWRITE_PDUMP_VIRT(buf, offset, reg);		\
-		else							\
-			IOWRITE_PDUMP_PHYS(buf, offset, reg);		\
-	} while (0)
-
-
-
-/* extract bitfield from a register value */
-static inline
-uint64_t _get_bits(uint64_t val, uint32_t shift, uint64_t mask)
-{
-	return (val & mask) >> shift;
-}
-/* set bitfield in a register value */
-static inline
-uint64_t _set_bits(uint64_t val, uint32_t shift, uint64_t mask)
-{
-	uint64_t v = val << shift;
-
-	return v & mask;
-}
-
-/* utility macros for manipulating fields within registers */
-/* apply bitmask */
-#define VHA_CR_BITMASK(reg, field)			\
-	(~VHA_CR_##reg##_##field##_CLRMSK)
-/* get field from register */
-#define VHA_CR_GETBITS(reg, field, val)			\
-	_get_bits(val,					\
-		 VHA_CR_##reg##_##field##_SHIFT,	\
-		 VHA_CR_BITMASK(reg, field))
-/* get value of a field in a register, taking alignment into account */
-#define VHA_CR_ALIGN_GETBITS(reg, field, val)		\
-	(VHA_CR_GETBITS(reg, field, val)		\
-	 << VHA_CR_##reg##_##field##_ALIGNSHIFT)
-
-/* apply bitmask - OS dependent */
-#define VHA_CR_BITMASK_OS(reg, field)			\
-	~OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _CLRMSK)
-/* get field from register - OS dependent */
-#define VHA_CR_GETBITS_OS(reg, field, val)			\
-	_get_bits(val,					\
-		 OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT), \
-		 VHA_CR_BITMASK_OS(reg, field))
-/* get value of a field in a register, taking alignment into account - OS */
-#define VHA_CR_ALIGN_GETBITS_OS(reg, field, val)		\
-	(VHA_CR_GETBITS_OS(reg, field, val)		\
-	 << OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _ALIGNSHIFT)) \
-
-/* max value of a field */
-#define VHA_CR_MAX(reg, field)				\
-	VHA_CR_GETBITS(reg, field, ~0ULL)
-/* max value of an field taking alignment into account */
-#define VHA_CR_ALIGN_MAX(reg, field)			\
-	(VHA_CR_MAX(reg, field)				\
-	 << VHA_CR_##reg##_##field##_SHIFT)
-
-/* max value of a field - OS dependent */
-#define VHA_CR_MAX_OS(reg, field)				\
-	VHA_CR_GETBITS_OS(reg, field, ~0ULL)
-/* max value of an field taking alignment into account - OS dependent */
-#define VHA_CR_ALIGN_MAX_OS(reg, field)			\
-	(VHA_CR_MAX_OS(reg, field)				\
-	 << OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT)) \
-
-/* set value of a field within a register */
-#define VHA_CR_SETBITS(reg, field, val)			\
-	_set_bits(val,					\
-		 VHA_CR_##reg##_##field##_SHIFT,	\
-		 VHA_CR_BITMASK(reg, field))
-/* set value of a field within a register reducing value by alignment */
-#define VHA_CR_ALIGN_SETBITS(reg, field, val)		\
-	VHA_CR_SETBITS(					\
-		reg, field, (val)			\
-	 >> VHA_CR_##reg##_##field##_ALIGNSHIFT)
-
-/* set value of a field within a register - OS dependent */
-#define VHA_CR_SETBITS_OS(reg, field, val)			\
-	_set_bits(val,					\
-		 OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT), \
-		 VHA_CR_BITMASK_OS(reg, field))
-/* set value of a field within a register reducing value by alignment - OS */
-#define VHA_CR_ALIGN_SETBITS_OS(reg, field, val)		\
-	VHA_CR_SETBITS_OS(			\
-		reg, field, (val)		\
-	 >> OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _ALIGNSHIFT)) \
-
-/* clear bits of a field within a register */
-#define VHA_CR_CLEARBITS(val, reg, field)			\
-	(val &= ~VHA_CR_BITMASK(reg, field))
-/* clear bits of a field within a register - OS dependent */
-#define VHA_CR_CLEARBITS_OS(val, reg, field)			\
-	(val &= ~VHA_CR_BITMASK_OS(reg, field))
+#define NN_SYS_CR(reg) \
+		(_REG_NNSYS_START + NN_SYS_CR_##reg)

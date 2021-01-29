@@ -22,11 +22,16 @@ KO_MODULE_SRC += \
 # Build Options
 #
 subdir-ccflags-y         += -I$(KO_MODULE_PATH)/../include
+subdir-ccflags-y         += -I$(KO_MODULE_PATH)/chipdep/n6pro
 ccflags-y                += -I$(KO_MODULE_PATH)/platform
 subdir-ccflags-y         += -I$(KO_MODULE_PATH)
-ccflags-y                += -DCFG_SYS_MIRAGE
-ccflags-y		 += -DHW_AX2
+subdir-ccflags-y         += -I$(KO_MODULE_PATH)/single
+ccflags-y                += -DCFG_SYS_AURA
+ccflags-y                += -DHW_AX3
 ccflags-y                += -DDEFAULT_SYMBOL_NAMESPACE=VHA_CORE
+ccflags-y                += -DVHA_MMU_MIRRORED_CTX_SUPPORT
+ccflags-y                += -DOSID=0
+#ccflags-y                += -DVHA_DEVFREQ
 
 #
 # Final Objects

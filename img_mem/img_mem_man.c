@@ -273,7 +273,9 @@ int img_mem_get_heap_info(int heap_id, uint8_t *type, uint32_t *attrs)
 		*attrs |= IMG_MEM_HEAP_ATTR_INTERNAL;
 	if (heap->type == IMG_MEM_HEAP_TYPE_OCM)
 		*attrs = IMG_MEM_HEAP_ATTR_SEALED;
-	
+
+	/* User attributes */
+	*attrs |= heap->options.ocm.hattr;
 
 	mutex_unlock(&mem_man->mutex);
 
@@ -1213,8 +1215,8 @@ int img_mmu_init_cache(struct mmu_ctx *mmu_ctx,	unsigned long cache_phys_start,
 
 	if (img_pdump_enabled() && cache_size && !mem_man->cache_initialized) {
 		img_pdump_printf("-- Allocating img mem cache buffer size:%u\n", cache_size);
-		img_pdump_printf("CALLOC :OCM:BLOCK_CACHE %#x %#zx 0x0\n",
-			cache_size, IMGMMU_GET_MAX_PAGE_SIZE());
+		img_pdump_printf("CALLOC :OCM:BLOCK_CACHE %#lx %#zx 0x0\n",
+			cache_size + sizeof(uint32_t), IMGMMU_GET_MAX_PAGE_SIZE());
 	}
 	mem_man->cache_initialized = true;
 

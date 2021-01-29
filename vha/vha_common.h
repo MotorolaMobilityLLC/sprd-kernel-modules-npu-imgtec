@@ -54,33 +54,53 @@
 #include <linux/mutex.h>
 #include <linux/wait.h>
 #include <linux/idr.h>
-#include <linux/workqueue.h>
 #include <linux/irq.h>
 #include <linux/spinlock.h>
+#include <linux/devfreq.h>
 
 #include <uapi/vha.h>
 #include <img_mem_man.h>
 #include "vha_plat.h"
 
+#define CMD_IS_CNN(cmd) \
+				(((cmd)->user_cmd.cmd_type == VHA_CMD_CNN_SUBMIT) || \
+				 ((cmd)->user_cmd.cmd_type == VHA_CMD_CNN_SUBMIT_MULTI))
+
 #ifdef CONFIG_VHA_DUMMY
 #  ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
-#    define CMD_EXEC_ON_HW(cmd) ((cmd)->user_cmd.cmd_type == VHA_CMD_CNN_SUBMIT)
+#    define CMD_EXEC_ON_HW(cmd) CMD_IS_CNN(cmd)
 #  else
 #    define CMD_EXEC_ON_HW(cmd) 0
 #  endif
 #  define VHA_IS_DUMMY(vha) 1
 #else
-#  define CMD_EXEC_ON_HW(cmd) ((cmd)->user_cmd.cmd_type == VHA_CMD_CNN_SUBMIT)
+#  define CMD_EXEC_ON_HW(cmd) CMD_IS_CNN(cmd)
 #  define VHA_IS_DUMMY(vha) 0
 #endif
 
+
+#ifdef CONFIG_HW_MULTICORE
+#define VHA_NUM_CORES CONFIG_VHA_NCORES
+
+#if (VHA_NUM_CORES == 0) || (VHA_NUM_CORES > VHA_MAX_CORES)
+#error "Wrong core number configuration!"
+#endif
+
+#define VHA_NUM_WMS          VHA_NUM_CORES
+#define VHA_GET_CORE_MASK(n) (0xff >> (VHA_MAX_CORES - (n)))
+#define VHA_GET_WM_MASK(n)   (0xff >> (VHA_MAX_CORES - (n)))
+#else
+#define VHA_NUM_CORES 1
+#define VHA_NUM_WMS   0
+#endif
+
 #define VHA_CNN_CMD 0
-#define VHA_CMD_MAX 1
+#define VHA_CMD_MAX VHA_NUM_CORES
 
 #define VHA_INVALID_ID -1
 
 /* Max hw contexts supported by MMU */
-#if defined(HW_AX2)
+#if defined(HW_AX2) || defined(CONFIG_HW_MULTICORE)
 #define VHA_MMU_MAX_HW_CTXS 32
 #define VHA_MMU_AUX_HW_CTX_SHIFT 1
 #elif defined(HW_AX3)
@@ -95,7 +115,7 @@
 #define VHA_MMU_MULTI_HW_CTX_SUPPORT
 
 #ifdef VHA_MMU_MULTI_HW_CTX_SUPPORT
-#if defined(HW_AX2)
+#if defined(HW_AX2) || defined(CONFIG_HW_MULTICORE)
 #  define VHA_MMU_GET_CTXID(session) \
 		(((session->mmu_ctxs[0].id-1) + session->vha->mmu_ctx_default) \
 		% VHA_MMU_MAX_HW_CTXS);
@@ -110,13 +130,16 @@
 	(session->vha->mmu_ctx_default % VHA_MMU_MAX_HW_CTXS)
 #endif
 
-/* AX2 uses only single MMU sw/hw context,
+/*
+	AX2 uses only single MMU sw/hw context,
 	AX3 may use dual sw contexts (due to dual hw contexts), first for model,
 	second for IO requestors,
 	when using single sw context, both hw contexts are programmed
 	with the same PC address -> so called "mirrored pages tables" mode
 	Note: MMU mirrored context support/mirrored pages tables
-	mode is enabled by default */
+	mode is enabled by default
+	Multicore AX3 uses only single MMU sw/hw context, but has possibility
+	to use dual hw contexts in the future */
 
 /* Define model requestor context index */
 #define VHA_MMU_REQ_MODEL_CTXID 0
@@ -125,7 +148,7 @@
 #if !defined(VHA_MMU_MIRRORED_CTX_SUPPORT) && defined(HW_AX3)
 #define VHA_MMU_MAX_SW_CTXS 2
 #define VHA_MMU_REQ_IO_CTXID 1
-#else /* VHA_MMU_MIRRORED_SW_SUPPORT || HW_AX2 */
+#else /* VHA_MMU_MIRRORED_SW_SUPPORT || HW_AX2 || CONFIG_HW_MULTICORE */
 #define VHA_MMU_MAX_SW_CTXS 1
 #define VHA_MMU_REQ_IO_CTXID 0
 #endif
@@ -135,6 +158,11 @@
 #define VHA_MAX_ALT_ADDRS 8
 #elif defined(HW_AX3)
 #define VHA_MAX_ALT_ADDRS 16
+#endif
+
+#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
+		/* Dummy hw processing cycles in case none are provided in MBS. */
+#   define VHA_DUMMY_HW_PROCESSING_TIME_CYCLES 40000
 #endif
 
 /* hw command */
@@ -177,12 +205,21 @@ struct vha_stats {
 	/* Temporary vars */
 	/* Hw power on timestamp */
 	struct timespec hw_start;
+#ifdef CONFIG_HW_MULTICORE
+	/* Hw processing start timestamp  */
+	struct timespec hw_proc_start[VHA_NUM_CORES];
+	/* Hw processing end timestamp */
+	struct timespec hw_proc_end[VHA_NUM_CORES];
+	/* Previous Hw processing end timestamp */
+	struct timespec hw_proc_end_prev[VHA_NUM_CORES];
+#else
 	/* Hw processing start timestamp  */
 	struct timespec hw_proc_start;
 	/* Hw processing end timestamp */
 	struct timespec hw_proc_end;
 	/* Previous Hw processing end timestamp */
 	struct timespec hw_proc_end_prev;
+#endif
 };
 
 /* state of the VHA device: power up or down */
@@ -198,6 +235,43 @@ enum vha_ll_mode {
 	VHA_LL_SELF_KICK
 };
 
+#ifdef CONFIG_HW_MULTICORE
+struct vha_mc_irq_status {
+	uint64_t  event_source;
+	uint64_t  sys_events;
+	uint64_t  wm_events[VHA_NUM_WMS];
+	uint64_t  core_events[VHA_NUM_CORES];
+	uint64_t  ic_events[VHA_NUM_CORES];
+};
+struct vha_hw_sched_status {
+	uint8_t   num_cores_free;
+	uint8_t   free_core_mask;
+	uint8_t   num_wms_free;
+	uint8_t   free_wm_mask;
+};
+#endif
+
+#if defined(CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME) && \
+	defined(CONFIG_HW_MULTICORE)
+struct vha_dummy_work {
+	struct delayed_work dummy_dwork;
+	uint8_t  wm_id;
+	struct vha_dev *vha;
+};
+#endif
+
+struct vha_devfreq_metrics {
+	u32 time_busy;
+	u32 time_idle;
+};
+
+struct vha_pm_metrics_state {
+	ktime_t time_period_start;
+	bool vha_active;
+	spinlock_t lock;
+	struct vha_devfreq_metrics value;
+};
+
 /* represents a single VHA core, containing a number of CNN devices */
 struct vha_dev {
 	unsigned int      id;
@@ -206,7 +280,12 @@ struct vha_dev {
 	struct list_head  list;            /* entry in <struct vha_drv:devices> */
 	struct list_head  sessions;        /* list of um sessions: vha_session */
 	struct list_head  sched_sessions;  /* scheduling list of um sessions*/
-	struct vha_core_props  core_props; /* HW properties */
+	struct vha_core_props core_props;  /* HW properties */
+#ifdef CONFIG_HW_MULTICORE
+	uint8_t           full_core_mask;
+	struct vha_hw_sched_status hw_sched_status;
+	uint16_t          wm_cmd_id_count;
+#endif
 	uint32_t          mmu_mode;        /* 0:no-mmu else 40 */
 	uint8_t           mmu_ctx_default; /* 0:VHA_MMU_MAX_HW_CTXS */
 	uint32_t          mmu_page_size;
@@ -214,14 +293,18 @@ struct vha_dev {
 	enum   vha_state  state;           /* the core is up or down */
 	struct delayed_work apm_dwork;     /* APM delayed work */
 	spinlock_t        irq_lock;
+#ifdef CONFIG_HW_MULTICORE
+	struct vha_mc_irq_status irq_status;
+#else
 	uint64_t          irq_status;
+#endif
 	uint8_t           irq_count;
 	uint8_t           stream_count;
 	int               int_heap_id;     /* heap id for internal
 			allocations such as crc/debug data, MMU page tables */
 
-	struct vha_hwcmd  pendcmd[VHA_CMD_MAX];   /* pending command */
-	struct vha_hwcmd  queuedcmd[VHA_CMD_MAX]; /* queued command */
+	struct vha_hwcmd  pendcmd[VHA_NUM_CORES];   /* pending command */
+	struct vha_hwcmd  queuedcmd[VHA_NUM_CORES]; /* queued command */
 
 	int               fp_bufid;	/* fault page buffer id */
 	/* active mmu context (id of ctx) */
@@ -260,24 +343,58 @@ struct vha_dev {
 #endif
 #ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
 	/* Hw processing time simulation delayed work */
+#ifdef CONFIG_HW_MULTICORE
+	struct vha_dummy_work dummy_dworks[VHA_NUM_CORES];
+#else
 	struct delayed_work dummy_dwork;
+#endif
+#endif
+	struct devfreq_dev_profile devfreq_profile;
+	struct devfreq *devfreq;
+	struct vha_devfreq_metrics last_devfreq_metrics;
+	struct vha_pm_metrics_state cur_state;
+	bool devfreq_init;
+#ifdef VHA_COOLING_DEVICE
+	bool cooling_device;
 #endif
 };
 
+#ifdef VHA_DEVFREQ
+void vha_devfreq_suspend(struct device *dev);
+void vha_devfreq_resume(struct device *dev);
+int vha_devfreq_init(struct vha_dev *vha);
+void vha_devfreq_term(struct vha_dev *vha);
+void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtimestamp);
+void vha_devfreq_force_freq(struct vha_dev *vha, unsigned long freq);
+#endif
+
+#ifdef CONFIG_HW_MULTICORE
+struct vha_hw_sched_info {
+	uint8_t  wm_id;
+	uint8_t  core_mask;
+};
+#endif
+
 /* contains a user command message */
 struct vha_cmd {
-	struct list_head    list;           /* entry into list vha_session.cmds     */
-	struct vha_session *session;        /* session this command belongs to      */
-	struct vha_rsp     *rsp;            /* command response                     */
-	bool                in_hw;          /* currently being processed by hw      */
-	bool                queued;         /* currently waiting to processed by hw */
-	bool                inbufs_ready;   /* all input buffers are ready          */
-	uint32_t            stream_size;    /* actual size of command stream        */
-	size_t              size;           /* actual size of user_cmd, in bytes    */
-	struct timespec     hw_proc_start;  /* Hw processing start timestamp        */
+	struct list_head    list;            /* entry into list vha_session.cmds     */
+	struct vha_session *session;         /* session this command belongs to      */
+	struct vha_rsp     *rsp;             /* command response                     */
+	bool                in_hw;           /* currently being processed by hw      */
+	bool                queued;          /* currently waiting to processed by hw */
+	bool                inbufs_ready;    /* all input buffers are ready          */
+#ifndef CONFIG_HW_MULTICORE
+	uint32_t            stream_size;     /* actual size of command stream        */
+#endif
+	size_t              size;            /* actual size of user_cmd, in bytes    */
+	struct timespec     hw_proc_start;   /* Hw processing start timestamp        */
 #ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
-	uint32_t            dummy_exec_time;/* Estimated exec time for dummy driver */
-	bool                dummy_kicked;   /* Dummy execution kicked               */
+	uint32_t            dummy_exec_time; /* Estimated exec time for dummy driver */
+	bool                dummy_kicked;    /* Dummy execution kicked               */
+#endif
+#ifdef CONFIG_HW_MULTICORE
+	struct vha_hw_sched_info hw_sched_info;
+	uint16_t            wm_cmd_id;
 #endif
 	struct vha_user_cmd user_cmd;
 };
@@ -297,8 +414,16 @@ struct vha_rsp {
 
 struct cnn_dbg {
 	struct vha_buffer *cnn_crc_buf;
+	uint32_t           cnn_crc_mode;
+	uint32_t           cnn_crc_size_kB;
+#ifdef HW_AX3
+	uint32_t           cnn_crc_mask;
+#endif
 	struct vha_buffer *cnn_dbg_buf;
+	uint32_t           cnn_dbg_modes[2];
+	uint32_t           cnn_dbg_size_kB;
 	int                cnn_dbg_flush; /* mode for flushing debug bufs */
+	bool               cnn_dbg_pdump_enable;
 };
 
 struct mmu_context {
@@ -324,6 +449,7 @@ struct vha_session {
 	struct mem_ctx    *mem_ctx;
 
 	bool               oom;        /* out of memory */
+	bool               freeing;
 
 	/* Mmu hw contexts */
 	struct mmu_context mmu_ctxs[VHA_MMU_MAX_SW_CTXS];
@@ -410,6 +536,28 @@ enum do_cmd_status {
 	CMD_NOTIFIED     /* command is notified to user space */
 };
 
+/* Helper structure for error definition */
+struct vha_biterr {
+	int e;
+	uint32_t b;
+	const char* s;
+};
+
+/* Helper structure for debugfs */
+struct vha_reg {
+	char *name;
+	unsigned offset;
+	uint64_t mask;
+};
+
+struct vha_regset {
+	const struct vha_reg *regs;
+	int nregs;
+	void __iomem *base;
+};
+
+bool get_timespan_us(struct timespec *from, struct timespec *to, uint64_t *result);
+
 int vha_deinit(void);
 uint64_t vha_buf_addr(struct vha_session *session, struct vha_buffer *buf);
 int vha_map_buffer(struct vha_session *session,
@@ -422,17 +570,18 @@ int vha_map_to_onchip(struct vha_session *session,
 irqreturn_t vha_handle_irq(struct device *dev);
 irqreturn_t vha_handle_thread_irq(struct device *dev);
 
+#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
+void vha_dummy_worker(struct work_struct *work);
+#endif
+
 int vha_suspend_dev(struct device *dev);
 int vha_resume_dev(struct device *dev);
 
 void vha_rm_dev(struct device *dev);
 int vha_add_dev(struct device *dev,
 		const struct heap_config heap_configs[], const int heaps,
-		void *plat_data, struct vha_sys_data *sys_data,
-		void __iomem *reg_base, uint32_t reg_size);
+		void *plat_data, void __iomem *reg_base, uint32_t reg_size);
 void vha_dev_calibrate(struct device *dev, uint32_t cycles);
-irqreturn_t vha_handle_irq(struct device *dev);
-irqreturn_t vha_handle_thread_irq(struct device *dev);
 
 int vha_add_cmd(struct vha_session *session, struct vha_cmd *cmd);
 int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
@@ -459,6 +608,11 @@ struct vha_buffer *vha_find_bufvaddr(const struct vha_session *session,
 void vha_chk_cmd_queues(struct vha_dev *vha, bool threaded);
 int vha_add_session(struct vha_session *session);
 void vha_rm_session(struct vha_session *session);
+bool vha_rm_session_cmds(struct vha_session *session);
+bool vha_rm_session_cmds_masked(struct vha_session *session, uint32_t cmd_id,
+		uint32_t cmd_id_mask);
+bool vha_is_busy(struct vha_dev *vha);
+bool vha_is_queue_full(struct vha_dev *vha, struct vha_cmd *cmd);
 void vha_early_init(void);
 bool vha_ext_cache_sync(struct vha_dev *vha);
 
@@ -474,36 +628,84 @@ int vha_api_add_dev(struct device *dev, struct vha_dev *vha, unsigned int id);
 int vha_api_rm_dev(struct device *dev, struct vha_dev *vha);
 
 void vha_mmu_setup(struct vha_session *session);
+#ifdef CONFIG_HW_MULTICORE
+void vha_mmu_status(struct vha_dev *vha, uint8_t core_mask);
+#else
+void vha_mmu_status(struct vha_dev *vha);
+#endif
+void vha_mmu_callback(enum img_mmu_callback_type callback_type,
+			int buf_id, void *data);
 
 enum do_cmd_status vha_do_cnn_cmd(struct vha_cmd *cmd);
 void vha_cmd_notify(struct vha_cmd *cmd);
+
+bool vha_check_calibration(struct vha_dev *vha);
 
 void vha_dev_hwwdt_setup(struct vha_dev *vha, uint64_t cycles, uint64_t mode);
 int vha_dev_hwwdt_calculate(struct vha_dev *vha, struct vha_cmd *cmd,
 		uint64_t *cycles, uint64_t *mode);
 void vha_dev_prepare(struct vha_dev *dev);
+void vha_dev_flush(struct vha_dev *dev);
 void vha_dev_setup(struct vha_dev *dev);
 void vha_dev_wait(struct vha_dev *dev);
+#ifndef CONFIG_HW_MULTICORE
 uint32_t vha_dev_kick_prepare(struct vha_dev *vha,
 		struct vha_cmd *cmd, int ctx_id);
+#endif
 void vha_dev_mh_setup(struct vha_dev *vha, int ctx_id);
+void vha_dev_ready(struct vha_dev *vha);
+void vha_dev_reset(struct vha_dev *vha);
+void vha_dev_enable_clocks(struct vha_dev *vha);
+void vha_dev_disable_clocks(struct vha_dev *vha);
+void vha_dev_disable_events(struct vha_dev *vha);
+int vha_dev_get_props(struct vha_dev *vha, uint32_t ocm_size);
+void vha_dev_ocm_configure(struct vha_dev *vha, unsigned long ocm_phys_start);
 
-void vha_cnn_gen_wdt(struct vha_dev *vha);
+#ifdef CONFIG_HW_MULTICORE
+int vha_dev_schedule_cmd(struct vha_dev *vha, struct vha_cmd *cmd);
+void vha_dev_free_cmd_res(struct vha_dev *vha, struct vha_cmd *cmd);
+#endif
+
+bool vha_dev_check_hw_capab(struct vha_dev* vha,
+		uint64_t expected_hw_capab);
+
+int vha_dev_start(struct vha_dev *vha);
+int vha_dev_stop(struct vha_dev *vha, bool reset);
+
+bool vha_rollback_cmds(struct vha_dev *vha);
+void vha_try_stop(struct vha_dev *vha);
+
+void vha_cnn_start_calib(struct vha_dev *vha);
 void vha_cnn_update_stats(struct vha_dev *vha);
 void vha_cnn_dump_status(struct vha_dev *vha);
 void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status);
 
+#ifdef CONFIG_HW_MULTICORE
+uint8_t vha_wm_get_cores(struct vha_dev *vha, uint8_t wm_id);
+void vha_wm_assign_cores(struct vha_dev *vha, uint8_t wm_id, uint8_t core_mask);
+void vha_wm_release_cores(struct vha_dev *vha, uint8_t core_mask);
+void vha_wm_reset(struct vha_dev *vha, uint8_t wm_id);
+void vha_wm_hwwdt_calculate(struct vha_dev *vha, struct vha_cmd *cmd,
+		uint64_t *wl_cycles, uint64_t *core_cycles);
+void vha_wm_hwwdt_setup(struct vha_dev *vha, uint8_t wm_id,
+		uint64_t wl_cycles, uint64_t core_cycles);
+void vha_wm_intmem_setup(struct vha_dev *vha, uint8_t wm_id);
+#endif
+
 void vha_dbg_init(struct vha_dev *vha);
 void vha_dbg_deinit(struct vha_dev *vha);
 struct dentry* vha_dbg_get_sysfs(struct vha_dev *vha);
-int vha_dbg_enable_hwbufs(struct vha_session *session);
+int vha_dbg_create_hwbufs(struct vha_session *session);
 void vha_dbg_prepare_hwbufs(struct vha_session *session);
 void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint);
-void vha_dbg_disable_hwbufs(struct vha_session *session);
+void vha_dbg_stop_hwbufs(struct vha_session *session);
+void vha_dbg_destroy_hwbufs(struct vha_session *session);
 int vha_dbg_alloc_hwbuf(struct vha_session *session, size_t size,
 		struct vha_buffer **buffer, const char *name, bool map);
 void vha_dbg_hwbuf_cleanup(struct vha_session *session,
 		struct vha_buffer *buf);
+
+uint64_t vha_dbg_rtm_read(struct vha_dev *vha, uint64_t addr);
 
 int vha_pdump_init(struct vha_dev *vha);
 void vha_pdump_deinit(void);
