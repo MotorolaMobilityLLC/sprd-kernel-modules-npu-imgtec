@@ -176,11 +176,15 @@ static void dt_plat_poll_interrupt(unsigned long ctx)
 	struct poll_timer *poll_timer = (struct poll_timer *)ctx;
 #endif
 	struct platform_device *ofdev = poll_timer->pdev;
+	int ret;
 
 	if (!poll_timer->enabled)
 		return;
 
-	if (vha_handle_irq(&ofdev->dev) == IRQ_WAKE_THREAD)
+	preempt_disable();
+	ret = vha_handle_irq(&ofdev->dev);
+	preempt_enable();
+	if (ret == IRQ_WAKE_THREAD)
 		vha_handle_thread_irq(&ofdev->dev);
 
 	/* retrigger */
@@ -194,8 +198,7 @@ static int vddai_enable(struct device *dev)
 	int err = 0;
 	if (!vddai) {
 		vddai = regulator_get(dev, "vddai");
-		if (IS_ERR_OR_NULL(vddai))
-		{
+		if (IS_ERR_OR_NULL(vddai)) {
 			err = PTR_ERR(vddai);
 			return err;
 		}
@@ -215,8 +218,6 @@ static void vddai_disable(struct device *dev)
 
 static int vha_plat_probe(struct platform_device *ofdev)
 {
-	struct heap_config *heap_configs;
-	int num_heaps;
 	int ret;
 	struct resource res;
 	void __iomem *reg_addr;
@@ -263,14 +264,15 @@ static int vha_plat_probe(struct platform_device *ofdev)
 	pm_runtime_enable(&ofdev->dev);
 	pm_runtime_get_sync(&ofdev->dev);
 
-	ret = vha_plat_dt_hw_init(ofdev, &heap_configs, &num_heaps);
+	ret = vha_plat_dt_hw_init(ofdev);
 	if (ret) {
 		dev_err(&ofdev->dev, "failed to init platform-specific hw!\n");
 		goto out_add_dev;
 	}
 
-	ret = vha_add_dev(&ofdev->dev, heap_configs, num_heaps,
-			  NULL /* plat priv data */, reg_addr, core_size);
+	/* no 'per device' memory heaps used */
+	ret = vha_add_dev(&ofdev->dev, NULL, 0,
+				NULL /* plat priv data */, reg_addr, core_size);
 	if (ret) {
 		dev_err(&ofdev->dev, "failed to intialize driver core!\n");
 		goto out_add_dev;
@@ -297,7 +299,11 @@ static int vha_plat_probe(struct platform_device *ofdev)
 	}
 
 	/* Try to calibrate the core if needed */
-	vha_dev_calibrate(&ofdev->dev, FREQ_MEASURE_CYCLES);
+	ret = vha_dev_calibrate(&ofdev->dev, FREQ_MEASURE_CYCLES);
+	if (ret) {
+		dev_err(&ofdev->dev, "%s: Failed to start clock calibration!\n", __func__);
+		goto out_irq;
+	}
 
 	pm_runtime_put(&ofdev->dev);
 
@@ -380,6 +386,15 @@ static struct platform_driver vha_plat_drv = {
 int vha_plat_init(void)
 {
 	int ret = 0;
+	struct heap_config *heap_configs;
+	int num_heaps;
+
+	vha_plat_dt_get_heaps(&heap_configs, &num_heaps);
+	ret = vha_init_plat_heaps(heap_configs, num_heaps);
+	if (ret) {
+		pr_err("failed to initialize global heaps\n");
+		return -ENOMEM;
+	}
 
 	ret = platform_driver_register(&vha_plat_drv);
 	if (ret) {

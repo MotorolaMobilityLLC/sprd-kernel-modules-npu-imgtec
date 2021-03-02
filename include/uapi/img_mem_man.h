@@ -104,11 +104,12 @@ enum img_mem_heap_attrs {
 
 /* Virtual memory space for buffers allocated
  * in the kernel - OCM & device debug buffers */
-#define IMG_MEM_VA_HEAP1_BASE 0x4000000ULL
-#define IMG_MEM_VA_HEAP1_SIZE 0x40000000ULL
+#define IMG_MEM_VA_HEAP1_BASE 0x8000000ULL
+#define IMG_MEM_VA_HEAP1_SIZE (0x40000000ULL - IMG_MEM_VA_GUARD_GAP)
 
 /* Virtual memory space for buffers allocated in the user space */
-#define IMG_MEM_VA_HEAP2_BASE (IMG_MEM_VA_HEAP1_BASE + IMG_MEM_VA_HEAP1_SIZE)
+#define IMG_MEM_VA_HEAP2_BASE ( \
+		IMG_MEM_VA_HEAP1_BASE + IMG_MEM_VA_HEAP1_SIZE + IMG_MEM_VA_GUARD_GAP)
 #define IMG_MEM_VA_HEAP2_SIZE 0x3C0000000ULL
 
 #endif /* IMG_MEM_MAN_UAPI_H */

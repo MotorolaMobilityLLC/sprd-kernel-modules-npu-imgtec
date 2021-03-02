@@ -104,35 +104,124 @@
 #define IOREAD64_CR_PDUMP(r) 	\
 		IOREAD64_PDUMP_REGIO(0, VHA_CR_##r, "REG")
 
-/* poll c-times for the exact register value(v) masked with m,
- * using d-cycles delay between polls and log into pdump file
- * using specified reg namespace */
-#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s) do {				\
-		uint64_t _req_ = v & m;					\
-		uint64_t _val_ = ~_req_;						\
-		int _count_ = c;						\
-		while (--_count_ >= 0 && _val_ != _req_) {			\
-			_val_ = vha_plat_read64(	\
-					(ADDR_CAST)vha->reg_base + ((o + r))) & m;\
-			if ((_val_ != _req_)) {				\
-				if (vha->freq_khz > 0) {		\
-					ndelay(d*1000000/vha->freq_khz); \
-				} else					\
-					udelay(100);			\
-			}						\
-		}							\
-		WARN_ON(_val_ != _req_ && !vha->core_props.dummy_dev);	\
-		img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
-				s, (r), _req_, m, c, d);			\
-	} while (0)
+#ifdef CONFIG_FUNCTION_ERROR_INJECTION
+int __IOPOLL64_RET(int ret);
+#else
+#define __IOPOLL64_RET(ret) ret
+#endif
 
 /* poll c-times for the exact register value(v) masked with m,
  * using d-cycles delay between polls and log into pdump file
  * using specified reg namespace */
-#define IOPOLL64_PDUMP(v, c, d, m, r) 	\
+#ifdef CONFIG_VHA_DUMMY
+#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s) \
+	({   img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
+					s, (r), v & m, m, c, d); \
+			__IOPOLL64_RET(0); \
+	})
+/* Question: shall we generate pdump script to calculate parity in runtime? */
+#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s) \
+	IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s)
+
+#else /* CONFIG_VHA_DUMMY */
+
+#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s) \
+	({ int _ret_ = -EIO;						\
+		do {													\
+			uint64_t _req_ = v & m;			\
+			uint64_t _val_ = ~_req_;		\
+			int _count_ = (c < 1 ? 1 : c);	\
+			while (--_count_ >= 0) {		\
+				_val_ = vha_plat_read64(	\
+						(ADDR_CAST)vha->reg_base + ((o + r))) & m;	\
+				if (_val_ == _req_) {			\
+					_ret_ = 0;							\
+					break;									\
+				}													\
+				if (vha->freq_khz > 0) {	\
+					ndelay(d*1000000/vha->freq_khz); \
+				} else										\
+					udelay(100);						\
+			}							\
+			WARN_ON(_val_ != _req_ && !vha->core_props.dummy_dev);	\
+				img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
+					s, (r), _req_, m, c, d);			\
+		} while (0); \
+		__IOPOLL64_RET(_ret_); \
+	})
+
+#ifdef VHA_SCF
+
+#define _PARITY_CHECKS 4
+
+#define _PARITY_CHECK_VAL(val) \
+	if((_parity_ok = !img_mem_calc_parity(val))) { \
+		_parity_count=_PARITY_CHECKS; \
+	} else { \
+		if(--_parity_count==0) { \
+			_ret_ = -EIO; \
+			break; \
+		} \
+	}
+
+/* poll c-times for the exact register value(v) masked with m,
+ * using d-cycles delay between polls and log into pdump file
+ * using specified reg namespace
+ * return error if parity calculated from 4 consecutive reads
+ * is wrong
+ * */
+#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s) \
+	({ int _ret_ = -EIO;              \
+		if (vha->core_props.supported.parity && !vha->parity_disable) { \
+			do {                          \
+				bool _parity_ok = false;    \
+				int _parity_count=_PARITY_CHECKS; \
+				uint64_t _req_ = (v) & (m); \
+				uint64_t _val_ = ~_req_;    \
+				int _count_ = (c) < _PARITY_CHECKS ? _PARITY_CHECKS : (c); \
+				while (_count_-- > 0) {    \
+					_val_ = vha_plat_read64(  \
+							(ADDR_CAST)vha->reg_base + ((o + r))); \
+					_PARITY_CHECK_VAL(_val_); \
+					_val_ &= m;               \
+					if (_parity_ok && _val_ == _req_) { \
+						_ret_ = 0;              \
+						break;                  \
+					}                         \
+					if (vha->freq_khz > 0) {  \
+						ndelay(d*1000000/vha->freq_khz); \
+					} else                    \
+						udelay(100);            \
+				}                           \
+				WARN_ON(!_parity_ok);       \
+				WARN_ON(_val_ != _req_);    \
+				img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
+						s, (r), _req_, m, c, d);      \
+			} while (0); \
+		} else { \
+			_ret_ = IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s); \
+		} \
+		__IOPOLL64_RET(_ret_); \
+	})
+
+#else /* VHA_SCF */
+#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s) \
+	IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s)
+#endif /* VHA_SCF */
+#endif /* CONFIG_VHA_DUMMY */
+
+/* poll c-times for the exact register value(v) masked with m,
+ * using d-cycles delay between polls and log into pdump file
+ * using specified reg namespace */
+#define IOPOLL64_PDUMP(v, c, d, m, r)   \
 	IOPOLL64_PDUMP_REGIO(v, c, d, m, 0, r, "REG")
-#define IOPOLL64_CR_PDUMP(v, c, d, m, r) 	\
+#define IOPOLL64_CR_PDUMP(v, c, d, m, r)  \
 	IOPOLL64_PDUMP_REGIO(v, c, d, m, 0, VHA_CR_##r, "REG")
+
+#define IOPOLL64_PDUMP_PARITY(v, c, d, m, r)   \
+	IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, 0, r, "REG")
+#define IOPOLL64_CR_PDUMP_PARITY(v, c, d, m, r)  \
+	IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, 0, VHA_CR_##r, "REG")
 
 /* write phys address of buffer to register, and log into pdump */
 #define IOWRITE_PDUMP_PHYS(buf, offset, reg) do {			\
@@ -154,10 +243,34 @@
 #define IOWRITE_PDUMP_BUFADDR(session, buf, offset, reg) do {		\
 		if (session->vha->mmu_mode)				\
 			IOWRITE_PDUMP_VIRT(buf, offset, reg);		\
-		else							\
-			IOWRITE_PDUMP_PHYS(buf, offset, reg);		\
+		else if (buf->attr & IMG_MEM_ATTR_OCM) {		\
+				IOWRITE_PDUMP_VIRT(buf, offset, reg);	\
+		} else {					\
+			IOWRITE_PDUMP_PHYS(buf, offset, reg);	\
+		}						\
 	} while (0)
 
+
+/* write phys address of buffer to register, and log into pdump */
+#define SET_PHYS(buf, offset, addr) do {			\
+		uint64_t _addr_ = vha_buf_addr(session, buf);	\
+		*addr = _addr_ + offset;	\
+	} while (0)
+
+/* write virt address of buffer to register, and log into pdump */
+#define SET_VIRT(buf, offset, addr) do {			\
+		*addr = buf->devvirt + offset;					\
+	} while (0)
+
+#define SET_BUFADDR(session, buf, offset, addr) do {		\
+		if (session->vha->mmu_mode)								\
+			SET_VIRT(buf, offset, addr);					\
+		else if (buf->attr & IMG_MEM_ATTR_OCM) {				\
+			SET_VIRT(buf, offset, addr);				\
+		} else {											\
+			SET_PHYS(buf, offset, addr);				\
+		}													\
+	} while (0)
 
 
 /* extract bitfield from a register value */

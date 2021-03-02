@@ -31,7 +31,7 @@ ccflags-y                += -DHW_AX3
 ccflags-y                += -DDEFAULT_SYMBOL_NAMESPACE=VHA_CORE
 ccflags-y                += -DVHA_MMU_MIRRORED_CTX_SUPPORT
 ccflags-y                += -DOSID=0
-#ccflags-y                += -DVHA_DEVFREQ
+ccflags-y                += -DVHA_DEVFREQ
 
 #
 # Final Objects

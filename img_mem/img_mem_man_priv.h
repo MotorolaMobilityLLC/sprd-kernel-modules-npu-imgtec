@@ -84,7 +84,7 @@ struct mmu_ctx {
 	struct imgmmu_cat *mmu_cat;
 	struct list_head mappings; /* contains <struct mmu_ctx_mapping> */
 	struct list_head mem_ctx_entry; /* Entry in <mem_ctx:mmu_ctxs> */
-	void (*callback_fn)(enum img_mmu_callback_type type, int buf_id,
+	int (*callback_fn)(enum img_mmu_callback_type type, int buf_id,
 					void *data);
 	void *callback_data;
 	unsigned long cache_phys_start;
@@ -97,6 +97,13 @@ struct buffer_fence {
 	spinlock_t lock;
 };
 #endif
+
+/* Pdump cache info */
+struct buffer_pcache {
+	unsigned int last_offset;
+	struct scatterlist *last_sgl;
+	int last_idx;
+};
 
 /* buffer : valid in the context of a mem_ctx */
 struct buffer {
@@ -113,6 +120,7 @@ struct buffer {
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 	struct buffer_fence *fence;
 #endif
+	struct buffer_pcache pcache;
 };
 
 /* vaa_entry : represents single entry in mmu_vaa */
@@ -150,6 +158,7 @@ struct heap_ops {
 						uint64_t **addrs);
 	void (*sync_cpu_to_dev)(struct heap *heap, struct buffer *buffer);
 	void (*sync_dev_to_cpu)(struct heap *heap, struct buffer *buffer);
+	int (*set_offset)(struct heap *heap, size_t offs);
 	void (*destroy)(struct heap *heap);
 };
 

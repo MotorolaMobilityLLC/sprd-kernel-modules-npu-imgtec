@@ -56,7 +56,7 @@
 #include "vha_common.h"
 
 static uint32_t pdump_sizes_kB[PDUMP_MAX];
-module_param_array(pdump_sizes_kB, uint, NULL, 0444);
+module_param_array(pdump_sizes_kB, int, NULL, 0444);
 MODULE_PARM_DESC(pdump_sizes_kB, "sizes of buffers reserved for pdump TXT,PRM,RES,DBG,CRC");
 
 static bool no_pdump_cache = true;
@@ -68,28 +68,19 @@ module_param(pdump_chunk_size_kB, uint, 0444);
 MODULE_PARM_DESC(pdump_chunk_size_kB, "maximum size of pdump chunk to be stored at once");
 
 static const char *pdump_filenames[PDUMP_MAX] = {
-	"pdump.txt", "pdump.prm", "pdump.res", "pdump.dbg", "pdump.crc",
+	"pdump.txt", "pdump.prm", "pdump.res", "pdump.dbg", "pdump.crc", "pdump.crc_cmb",
 };
-
-/*
- * VHA PDUMPs.
- * Uses img_pdump buffers to collect pdump information.
- * They are mapped into debugfs: /sys/kernel/debug/vha0/pdump.*
- */
-
-/* point to the various pdump buffers */
-static struct pdump_buf *pbufs[PDUMP_MAX];
 
 /* read one of the pdump buffers */
 static ssize_t pdump_read(struct file *file, char __user *user_buf,
-			  size_t count, loff_t *ppos)
+				size_t count, loff_t *ppos)
 {
 	struct pdump_buf *pbuf = file->private_data;
 
 	if (pbuf->len == pbuf->size)
 		memcpy(pbuf->ptr+pbuf->size-8, "\n<oflo!>", 8);
 	return simple_read_from_buffer(user_buf, count, ppos,
-				       pbuf->ptr, pbuf->len);
+							 pbuf->ptr, pbuf->len);
 }
 
 /*
@@ -97,13 +88,14 @@ static ssize_t pdump_read(struct file *file, char __user *user_buf,
  * it will clear out the contents of all the pdump buffers
  */
 static ssize_t reset_write(struct file *file, const char __user *buf,
-				   size_t count, loff_t *ppos)
+					 size_t count, loff_t *ppos)
 {
 	int i;
+	struct pdump_descr *pbuf = file->private_data;
 
 	for (i = 0; i < PDUMP_MAX; i++) {
-		if (pbufs[i])
-			pbufs[i]->len = 0;
+		if (pbuf->pbufs[i].ptr)
+			pbuf->pbufs[i].len = 0;
 	}
 
 	return count;
@@ -118,7 +110,7 @@ static const struct file_operations reset_fops = {
 	.open = simple_open,
 };
 
-int vha_pdump_init(struct vha_dev *vha)
+int vha_pdump_init(struct vha_dev *vha, struct pdump_descr* pdump)
 {
 	int i;
 
@@ -126,22 +118,35 @@ int vha_pdump_init(struct vha_dev *vha)
 	if (pdump_sizes_kB[PDUMP_TXT] == 0)
 		return -EINVAL;
 
+	if (!vha->core_props.dummy_dev) {
+		dev_err(vha->dev, "%s: PDUMPing not supported with real hardware!\n",
+				__func__);
+		return -EPERM;
+	}
+
 	/* and map the buffers into debugfs */
 	for (i = 0; i < PDUMP_MAX; i++) {
 		struct pdump_buf *pbuf = NULL;
 
 		if (pdump_sizes_kB[i]) {
-			pbuf = img_pdump_create(i, pdump_sizes_kB[i]*1024);
-			pbufs[i] = pbuf;
+			if (pdump_sizes_kB[i] == UINT_MAX) {
+				pbuf = img_pdump_create(pdump, i, 0);
+				if (pbuf)
+					pbuf->drop_data = true;
+			} else {
+				pbuf = img_pdump_create(pdump, i, pdump_sizes_kB[i]*1024);
+				if (pbuf)
+					pbuf->drop_data = false;
+			}
 		}
 
-		if (pbufs[PDUMP_TXT] == NULL)
+		if (pdump->pbufs[PDUMP_TXT].ptr == NULL)
 			return -ENOMEM;
 
 		if (pbuf && pbuf->ptr) {
 			if (!debugfs_create_file(pdump_filenames[i],
-					    0444, vha_dbg_get_sysfs(vha),
-					    pbuf, &pdump_fops))
+							0444, vha_dbg_get_sysfs(vha),
+							pbuf, &pdump_fops))
 				dev_warn(vha->dev,
 						"%s: failed to create sysfs entry for pdump buf!\n",
 						__func__);
@@ -157,20 +162,20 @@ int vha_pdump_init(struct vha_dev *vha)
 	 * are just debug files.
 	 */
 	if (!debugfs_create_file("pdump_reset", 0222,
-			vha_dbg_get_sysfs(vha), vha, &reset_fops))
+			vha_dbg_get_sysfs(vha), pdump, &reset_fops))
 			dev_warn(vha->dev,
 					"%s: failed to create sysfs entry for pdump reset!\n",
 					__func__);
 	return 0;
 }
 
-void vha_pdump_deinit(void)
+void vha_pdump_deinit(struct pdump_descr* pdump)
 {
-	img_pdump_destroy();
+	img_pdump_destroy(pdump);
 }
 
 static void *get_buf_kptr(struct vha_session *session,
-			  struct vha_buffer *buf)
+				struct vha_buffer *buf)
 {
 	int ret;
 
@@ -188,7 +193,7 @@ static void *get_buf_kptr(struct vha_session *session,
 }
 
 static void put_buf_kptr(struct vha_session *session,
-			  struct vha_buffer *buf)
+				struct vha_buffer *buf)
 {
 	int ret;
 
@@ -205,9 +210,13 @@ static void put_buf_kptr(struct vha_session *session,
 
 /* create pdump commands for LOAD Buffer */
 void vha_pdump_ldb_buf(struct vha_session *session, uint32_t pdump_num,
-		       struct vha_buffer *buf, uint32_t offset, uint32_t size, bool cache)
+					 struct vha_buffer *buf, uint32_t offset, uint32_t size, bool cache)
 {
-	if (pbufs[pdump_num] == NULL || pbufs[pdump_num]->ptr == NULL)
+	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(session->vha->dev);
+	struct vha_dev* vha = session->vha;
+
+	if (pdump_num >= PDUMP_MAX ||
+		 pdump->pbufs[PDUMP_TXT].ptr == NULL)
 		return;
 
 	if (buf->attr & IMG_MEM_ATTR_NOMAP)
@@ -224,9 +233,14 @@ void vha_pdump_ldb_buf(struct vha_session *session, uint32_t pdump_num,
 			(buf->pcache.valid &&
 				(buf->pcache.offset != offset ||
 				 buf->pcache.size != size))) {
+
+		buf->pcache.valid = cache;
+		buf->pcache.size = size;
+		buf->pcache.offset = offset;
+
 		img_pdump_printf("LDB "_PMEM_":BLOCK_%d:%#x %#x %#zx %s -- %s\n",
 				 buf->id, offset, size,
-				 pbufs[pdump_num]->len,
+				 pdump->pbufs[pdump_num].len,
 				 pdump_filenames[pdump_num],
 				 buf->name);
 		{
@@ -237,10 +251,9 @@ void vha_pdump_ldb_buf(struct vha_session *session, uint32_t pdump_num,
 					max_chunk : size;
 				pr_debug("vha_pdump_ldb_buf chunk %d!\n",
 						chunk_size);
-				if (img_pdump_write(pdump_num,
-						    ptr, chunk_size) < 0) {
-					img_pdump_printf(
-						"COM \"ERROR:pdump oflo, writing %#xB from %s to %s!\"\n",
+				if (img_pdump_write(pdump, pdump_num,
+								ptr, chunk_size) < 0) {
+					img_pdump_printf("COM \"ERROR:pdump oflo, writing %#xB from %s to %s!\"\n",
 						size, buf->name,
 						pdump_filenames[pdump_num]);
 					break;
@@ -250,25 +263,25 @@ void vha_pdump_ldb_buf(struct vha_session *session, uint32_t pdump_num,
 				schedule();
 			}
 		}
-
-		buf->pcache.valid = cache;
-
-		buf->pcache.size = size;
-		buf->pcache.offset = offset;
 	} else {
-		img_pdump_printf("-- LDB_CACHED %s\n", buf->name);
+			img_pdump_printf("-- LDB_CACHED %s\n", buf->name);
 	}
 	put_buf_kptr(session, buf);
 }
 
 /* create pdump commands for SAVE Buffer */
 void vha_pdump_sab_buf(struct vha_session *session, uint32_t pdump_num,
-		       struct vha_buffer *buf, uint32_t offset, uint32_t size)
+					 struct vha_buffer *buf, uint32_t offset, uint32_t size)
 {
-	struct pdump_buf *pbuf = pbufs[pdump_num];
+	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(session->vha->dev);
+	struct vha_dev* vha = session->vha;
+	struct pdump_buf* pbuf;
 
-	if (pbuf == NULL)
+	if (pdump_num >= PDUMP_MAX ||
+		 pdump->pbufs[PDUMP_TXT].ptr == NULL)
 		return;
+
+	pbuf = &pdump->pbufs[pdump_num];
 
 	if (buf->attr & IMG_MEM_ATTR_NOMAP)
 		return;
@@ -276,23 +289,26 @@ void vha_pdump_sab_buf(struct vha_session *session, uint32_t pdump_num,
 	if (get_buf_kptr(session, buf) == NULL)
 		return;
 
-	/* Invalidate buffer cache just for sanity */
-	img_mem_sync_device_to_cpu(session->mem_ctx, buf->id);
-
 	img_pdump_printf("SAB "_PMEM_":BLOCK_%d:%#x %#x %#zx %s -- %s\n",
 			 buf->id, offset, size,
 			 pbuf->len, pdump_filenames[pdump_num],
 			 buf->name);
-	{
-		/* write the binary data to the pdump blob file */
+
+	if (pbuf->drop_data) {
+		pbuf->len += size;
+	} else {
 		void *ptr = buf->kptr + offset;
 		int max_chunk = pdump_chunk_size_kB * 1024;
+
+		/* Invalidate buffer cache just for sanity */
+		img_mem_sync_device_to_cpu(session->mem_ctx, buf->id);
+
+		/* write the binary data to the pdump blob file */
 		while (size) {
 			int chunk_size = size > max_chunk ? max_chunk : size;
 			pr_debug("vha_pdump_sab_buf chunk %d!\n", chunk_size);
-			if (img_pdump_write(pdump_num, ptr, chunk_size) < 0) {
-				img_pdump_printf(
-					"COM \"ERROR:pdump oflo, writing %#xB from %s to %s!\"\n",
+			if (img_pdump_write(pdump, pdump_num, ptr, chunk_size) < 0) {
+				img_pdump_printf("COM \"ERROR:pdump oflo, writing %#xB from %s to %s!\"\n",
 					size, buf->name,
 					pdump_filenames[pdump_num]);
 				break;

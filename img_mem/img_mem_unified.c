@@ -896,6 +896,7 @@ static struct heap_ops unified_heap_ops = {
 	.get_page_array = NULL,
 	.sync_cpu_to_dev = unified_sync_cpu_to_dev,
 	.sync_dev_to_cpu = unified_sync_dev_to_cpu,
+	.set_offset = NULL,
 	.destroy = unified_heap_destroy,
 };
 

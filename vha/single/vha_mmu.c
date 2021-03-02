@@ -46,12 +46,6 @@
 #include "vha_plat.h"
 #include <vha_regs.h>
 
-/* bringup test: force MMU fault with MMU base register */
-static bool test_mmu_base_pf;
-module_param(test_mmu_base_pf, bool, 0444);
-MODULE_PARM_DESC(test_mmu_base_pf,
-	"Bringup test: force MMU page fault on first access");
-
 static void mmu_flush(const struct device *dev,
 		struct vha_dev *vha, int ctx_id)
 {
@@ -89,15 +83,15 @@ static void mmu_flush(const struct device *dev,
 }
 
 /* this function is called from img_mmu, to handle cache issues */
-void vha_mmu_callback(enum img_mmu_callback_type callback_type,
+int vha_mmu_callback(enum img_mmu_callback_type callback_type,
 			int buf_id, void *data)
 {
 	struct vha_session *session = data;
 	struct vha_dev *vha = session->vha;
 	int ctx_id;
-
+	int ret = 0;
 	if (!vha)
-		return;
+		return 0;
 
 	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++)
 		mmu_flush(vha->dev, vha, session->mmu_ctxs[ctx_id].hw_id);
@@ -109,6 +103,7 @@ void vha_mmu_callback(enum img_mmu_callback_type callback_type,
 		mmu_flush(vha->dev, vha, hw_id);
 	}
 #endif
+	return ret;
 }
 
 static void do_mmu_ctx_setup(struct vha_dev *vha,
@@ -117,7 +112,7 @@ static void do_mmu_ctx_setup(struct vha_dev *vha,
 	img_pdump_printf("-- Setup MMU context:%d\n", hw_id);
 	IOWRITE64_PDUMP(hw_id, VHA_CR_OS(MMU_CBASE_MAPPING_CONTEXT));
 
-	if (!test_mmu_base_pf) {
+	if (!vha->mmu_base_pf_test) {
 		IOWRITE64(vha->reg_base, VHA_CR_OS(MMU_CBASE_MAPPING), pc_baddr);
 
 		/* This is physical address so we need use MEM_OS0:BLOCK tag
@@ -133,7 +128,7 @@ static void do_mmu_ctx_setup(struct vha_dev *vha,
 		dev_info(vha->dev, "Bringup test: force MMU base page fault\n");
 }
 
-void vha_mmu_setup(struct vha_session *session)
+int vha_mmu_setup(struct vha_session *session)
 {
 	struct vha_dev *vha = session->vha;
 	int ctx_id;
@@ -146,18 +141,20 @@ void vha_mmu_setup(struct vha_session *session)
 				vha->active_mmu_ctx);
 
 
-	if (!vha->mmu_mode) {
+	if (vha->mmu_mode == VHA_MMU_DISABLED) {
 		img_pdump_printf("-- MMU bypass ON\n");
 		IOWRITE64_PDUMP(VHA_CR_OS(MMU_CTRL_BYPASS_EN),
 			VHA_CR_OS(MMU_CTRL));
-		return;
+		return 0;
 	}
 
 	/* Using model context to track active context */
 	if (session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].id == vha->active_mmu_ctx)
-		return;
+		return 0;
 
 	img_pdump_printf("-- MMU_SETUP_BEGIN\n");
+	img_pdump_printf("-- MMU bypass OFF\n");
+	IOWRITE64_PDUMP(0, VHA_CR_OS(MMU_CTRL));
 
 	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++) {
 		do_mmu_ctx_setup(vha, session->mmu_ctxs[ctx_id].hw_id,
@@ -191,6 +188,8 @@ void vha_mmu_setup(struct vha_session *session)
 			VHA_CR_OS(MMU_CBASE_MAPPING_BASE_ADDR_ALIGNSHIFT));
 
 	img_pdump_printf("-- MMU_SETUP_END\n");
+
+	return 0;
 }
 
 void vha_mmu_status(struct vha_dev *vha)

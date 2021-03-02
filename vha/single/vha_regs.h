@@ -48,7 +48,9 @@
 #error "No HW layout defined"
 #endif
 
-#if defined(CFG_SYS_VAGUS)
+#if defined(CFG_SYS_MAGNA)
+#include <hwdefs/magna_system.h>
+#elif defined(CFG_SYS_VAGUS)
 #include <hwdefs/vagus_system.h>
 #elif defined(CFG_SYS_AURA)
 #include <hwdefs/aura_system.h>

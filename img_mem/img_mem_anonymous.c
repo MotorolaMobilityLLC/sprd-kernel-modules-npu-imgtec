@@ -315,6 +315,7 @@ static struct heap_ops anonymous_heap_ops = {
 	.get_page_array = NULL,
 	.sync_cpu_to_dev = NULL, 
 	.sync_dev_to_cpu = NULL, 
+	.set_offset = NULL,
 	.destroy = anonymous_heap_destroy,
 };
 

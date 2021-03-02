@@ -241,7 +241,9 @@ static ssize_t vha_write(struct file *file, const char __user *buf,
 
 	cmd->size = size;
 	cmd->session = session;
-
+#ifdef VHA_SCF
+	init_completion(&cmd->conf_done);
+#endif
 	ret = copy_from_user(&cmd->user_cmd, buf, size);
 	if (ret) {
 		dev_err(miscdev->this_device, "%s: copy failed!\n", __func__);
@@ -359,24 +361,29 @@ static long vha_ioctl_get_core_props(struct vha_session *session,
 static long vha_ioctl_query_heaps(struct vha_session *session, void __user *buf)
 {
 	struct vha_heaps_data data;
+	struct vha_dev* vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
 	int ret;
-	int id, i = 0;
+	int i = 0;
+	struct list_head* pos;
+
+	dev_dbg(miscdev->this_device, "%s: session %u\n",
+			__func__, session->id);
 
 	memset(&data, 0, sizeof(data));
 
-	for (id = IMG_MEM_MAN_MIN_HEAP; id <= IMG_MEM_MAN_MAX_HEAP &&
-			i < VHA_MAX_HEAPS ; id++) {
+	list_for_each(pos, &vha->heaps) {
+		struct vha_heap* heap = list_entry(pos, struct vha_heap, list);
 		uint8_t type;
 		uint32_t attrs;
+		struct vha_heap_data *info;
 
-		ret = img_mem_get_heap_info(id, &type, &attrs);
-		if (!ret) {
-			struct vha_heap_data *info = &data.heaps[i++];
-			info->id = id;
-			info->type = type;
-			info->attributes = attrs;
-		} else
-			break;
+		ret = img_mem_get_heap_info(heap->id, &type, &attrs);
+		BUG_ON(ret != 0);
+		info = &data.heaps[i++];
+		info->id = heap->id;
+		info->type = type;
+		info->attributes = attrs;
 	}
 	if (copy_to_user(buf, &data, sizeof(data)))
 		return -EFAULT;
@@ -388,10 +395,14 @@ static long vha_ioctl_alloc(struct vha_session *session, void __user *buf)
 {
 	struct vha_alloc_data data;
 	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
 	int ret;
 
 	if (copy_from_user(&data, buf, sizeof(data)))
 		return -EFAULT;
+
+	dev_dbg(miscdev->this_device, "%s: session %u, size %llu, heap_id %u\n",
+			__func__, session->id, data.size, data.heap_id);
 
 	if (default_mem_heap != IMG_MEM_MAN_HEAP_ID_INVALID)
 		data.heap_id = default_mem_heap;
@@ -437,10 +448,14 @@ static long vha_ioctl_import(struct vha_session *session, void __user *buf)
 {
 	struct vha_import_data data;
 	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
 	int ret;
 
 	if (copy_from_user(&data, buf, sizeof(data)))
 		return -EFAULT;
+
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_hnd 0x%016llx, size %llu, heap_id %u\n",
+			__func__, session->id, data.buf_hnd, data.size, data.heap_id);
 
 	ret = img_mem_import(session->vha->dev, session->mem_ctx, data.heap_id,
 					(size_t)data.size, data.attributes, data.buf_hnd,
@@ -460,173 +475,194 @@ static long vha_ioctl_import(struct vha_session *session, void __user *buf)
 		goto out_free;
 
 	if (copy_to_user(buf, &data, sizeof(struct vha_import_data)))
-			goto out_rm_buf;
+		goto out_rm_buf;
 
-		mutex_unlock(&vha->lock);
+	mutex_unlock(&vha->lock);
 
-		return 0;
+	return 0;
 
-	out_rm_buf:
-		vha_rm_buf(session, data.buf_id);
-	out_free:
-		img_mem_free(session->mem_ctx, data.buf_id);
+out_rm_buf:
+	vha_rm_buf(session, data.buf_id);
+out_free:
+	img_mem_free(session->mem_ctx, data.buf_id);
 
-		mutex_unlock(&vha->lock);
+	mutex_unlock(&vha->lock);
 
+	return -EFAULT;
+}
+
+static long vha_ioctl_export(struct vha_session *session, void __user *buf)
+{
+	struct vha_export_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret;
+
+	if (copy_from_user(&data, buf, sizeof(data)))
+		return -EFAULT;
+
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_id %u, size %llu\n",
+		__func__, session->id, data.buf_id, data.size);
+
+	ret = img_mem_export(session->vha->dev, session->mem_ctx, data.buf_id,
+				(size_t)data.size, data.attributes, &data.buf_hnd);
+	if (ret)
+		return ret;
+
+	if (copy_to_user(buf, &data, sizeof(struct vha_export_data)))
+		return -EFAULT;
+
+	return 0;
+}
+
+static long vha_ioctl_free(struct vha_session *session, void __user *buf)
+{
+	struct vha_free_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret;
+
+	if (copy_from_user(&data, buf, sizeof(data))) {
+		dev_err(miscdev->this_device,
+			"%s: copy_from_user error\n", __func__);
 		return -EFAULT;
 	}
 
-	static long vha_ioctl_export(struct vha_session *session, void __user *buf)
-	{
-		struct vha_export_data data;
-		int ret;
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_id %u\n",
+		__func__, session->id, data.buf_id);
 
-		if (copy_from_user(&data, buf, sizeof(data)))
-			return -EFAULT;
-
-		ret = img_mem_export(session->vha->dev, session->mem_ctx, data.buf_id,
-						(size_t)data.size, data.attributes, &data.buf_hnd);
-		if (ret)
-			return ret;
-
-		if (copy_to_user(buf, &data, sizeof(struct vha_export_data)))
-			return -EFAULT;
-
-		return 0;
-	}
-
-	static long vha_ioctl_free(struct vha_session *session, void __user *buf)
-	{
-		struct vha_free_data data;
-		struct vha_dev *vha = session->vha;
-		struct miscdevice *miscdev = &vha->miscdev;
-		int ret;
-
-		if (copy_from_user(&data, buf, sizeof(data))) {
-			dev_err(miscdev->this_device,
-				"%s: copy_from_user error\n", __func__);
-			return -EFAULT;
-		}
-		ret = mutex_lock_interruptible(&vha->lock);
-		if (ret)
-			return ret;
-		if (!session->freeing) {
-			session->freeing = true;
-			img_pdump_printf("-- FREE_BEGIN\n");
-		}
-		vha_rm_buf(session, data.buf_id);
-
-		img_mem_free(session->mem_ctx, data.buf_id);
-		mutex_unlock(&vha->lock);
-
-		return 0;
-	}
-
-	static long vha_ioctl_map_to_onchip(struct vha_session *session, void __user *buf)
-	{
-		struct vha_map_to_onchip_data data;
-		struct vha_dev *vha = session->vha;
-		struct miscdevice *miscdev = &vha->miscdev;
-		int ret = 0;
-
-		if (copy_from_user(&data, buf, sizeof(data))) {
-			dev_err(miscdev->this_device,
-				"%s: copy_from_user error\n", __func__);
-			return -EFAULT;
-		}
-
-		ret = vha_map_to_onchip(session, data.buf_id, data.virt_addr, data.page_size,
-			data.num_pages, data.page_idxs, &data.map_id);
-
-		if (copy_to_user(buf, &data, sizeof(data))) {
-			dev_err(miscdev->this_device, "%s: copy to user failed!\n",
-				__func__);
-			return -EFAULT;
-		}
-
+	ret = mutex_lock_interruptible(&vha->lock);
+	if (ret)
 		return ret;
+	if (!session->freeing) {
+		session->freeing = true;
+		img_pdump_printf("-- FREE_BEGIN\n");
+	}
+	vha_rm_buf(session, data.buf_id);
+
+	img_mem_free(session->mem_ctx, data.buf_id);
+	mutex_unlock(&vha->lock);
+
+	return 0;
+}
+
+static long vha_ioctl_map_to_onchip(struct vha_session *session, void __user *buf)
+{
+	struct vha_map_to_onchip_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret = 0;
+
+	if (copy_from_user(&data, buf, sizeof(data))) {
+		dev_err(miscdev->this_device,
+			"%s: copy_from_user error\n", __func__);
+		return -EFAULT;
 	}
 
-	static long vha_ioctl_map(struct vha_session *session, void __user *buf)
-	{
-		struct vha_map_data data;
-		struct vha_dev *vha = session->vha;
-		struct miscdevice *miscdev = &vha->miscdev;
-		int ret = 0;
+	dev_dbg(miscdev->this_device, "%s: session %u, virt_addr 0x%016llx, buf_id %u\n",
+		__func__, session->id, data.virt_addr, data.buf_id);
 
-		if (copy_from_user(&data, buf, sizeof(data))) {
-			dev_err(miscdev->this_device,
-				"%s: copy_from_user error\n", __func__);
-			return -EFAULT;
-		}
+	ret = vha_map_to_onchip(session, data.buf_id, data.virt_addr, data.page_size,
+		data.num_pages, data.page_idxs, &data.map_id);
 
-		vha_session_pm_get(session);
-		ret = vha_map_buffer(session, data.buf_id,
-					data.virt_addr, data.flags);
-		vha_session_pm_put(session);
+	if (copy_to_user(buf, &data, sizeof(data))) {
+		dev_err(miscdev->this_device, "%s: copy to user failed!\n",
+			__func__);
+		return -EFAULT;
+	}
 
+	return ret;
+}
+
+static long vha_ioctl_map(struct vha_session *session, void __user *buf)
+{
+	struct vha_map_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret = 0;
+
+	if (copy_from_user(&data, buf, sizeof(data))) {
+		dev_err(miscdev->this_device,
+			"%s: copy_from_user error\n", __func__);
+		return -EFAULT;
+	}
+
+	dev_dbg(miscdev->this_device, "%s: session %u, virt_addr 0x%016llx, buf_id %u, flags 0x%08x\n",
+		__func__, session->id, data.virt_addr, data.buf_id, data.flags);
+
+	vha_session_pm_get(session);
+	ret = vha_map_buffer(session, data.buf_id,
+				data.virt_addr, data.flags);
+	vha_session_pm_put(session);
+
+	return ret;
+}
+
+static long vha_ioctl_unmap(struct vha_session *session, void __user *buf)
+{
+	struct vha_unmap_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret = 0;
+
+	if (copy_from_user(&data, buf, sizeof(data))) {
+		dev_err(miscdev->this_device,
+			"%s: copy_from_user error\n", __func__);
+		return -EFAULT;
+	}
+
+	if (!session->freeing) {
+		session->freeing = true;
+		img_pdump_printf("-- FREE_BEGIN\n");
+	}
+
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_id %u\n",
+		__func__, session->id, data.buf_id);
+
+	vha_session_pm_get(session);
+	ret = vha_unmap_buffer(session, data.buf_id);
+	vha_session_pm_put(session);
+
+	return ret;
+}
+
+static long vha_ioctl_buf_status(struct vha_session *session, void __user *buf)
+{
+	struct vha_buf_status_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret;
+
+	if (copy_from_user(&data, buf, sizeof(data))) {
+		dev_err(miscdev->this_device,
+			"%s: copy_from_user error\n", __func__);
+		return -EFAULT;
+	}
+
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_id %u, status %u, in_sync_fd %d\n",
+		__func__, session->id, data.buf_id, data.status, data.in_sync_fd);
+
+	ret = mutex_lock_interruptible(&vha->lock);
+	if (ret)
 		return ret;
+
+	ret = vha_set_buf_status(session, data.buf_id, data.status, data.in_sync_fd);
+	mutex_unlock(&vha->lock);
+
+	return ret;
+}
+
+static long vha_ioctl_sync(struct vha_session *session, void __user *buf)
+{
+	struct vha_sync_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+	int ret = -EINVAL;
+
+	if (copy_from_user(&data, buf, sizeof(data))) {
+		dev_err(miscdev->this_device, "%s: copy_from_user error\n", __func__);
+		return -EFAULT;
 	}
-
-	static long vha_ioctl_unmap(struct vha_session *session, void __user *buf)
-	{
-		struct vha_unmap_data data;
-		struct vha_dev *vha = session->vha;
-		struct miscdevice *miscdev = &vha->miscdev;
-		int ret = 0;
-
-		if (copy_from_user(&data, buf, sizeof(data))) {
-			dev_err(miscdev->this_device,
-				"%s: copy_from_user error\n", __func__);
-			return -EFAULT;
-		}
-
-		if (!session->freeing) {
-			session->freeing = true;
-			img_pdump_printf("-- FREE_BEGIN\n");
-		}
-
-		vha_session_pm_get(session);
-		ret = vha_unmap_buffer(session, data.buf_id);
-		vha_session_pm_put(session);
-
-		return ret;
-	}
-
-	static long vha_ioctl_buf_status(struct vha_session *session, void __user *buf)
-	{
-		struct vha_buf_status_data data;
-		struct vha_dev *vha = session->vha;
-		struct miscdevice *miscdev = &vha->miscdev;
-		int ret;
-
-		if (copy_from_user(&data, buf, sizeof(data))) {
-			dev_err(miscdev->this_device,
-				"%s: copy_from_user error\n", __func__);
-			return -EFAULT;
-		}
-
-		ret = mutex_lock_interruptible(&vha->lock);
-		if (ret)
-			return ret;
-
-		ret = vha_set_buf_status(session, data.buf_id, data.status, data.in_sync_fd);
-		mutex_unlock(&vha->lock);
-
-		return ret;
-	}
-
-	static long vha_ioctl_sync(struct vha_session *session, void __user *buf)
-	{
-		struct vha_sync_data data;
-		struct vha_dev *vha = session->vha;
-		struct miscdevice *miscdev = &vha->miscdev;
-		int ret = -EINVAL;
-
-		if (copy_from_user(&data, buf, sizeof(data))) {
-			dev_err(miscdev->this_device, "%s: copy_from_user error\n", __func__);
-			return -EFAULT;
-		}
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 	ret = mutex_lock_interruptible(&vha->lock);
@@ -635,31 +671,37 @@ static long vha_ioctl_import(struct vha_session *session, void __user *buf)
 
 	switch (data.op) {
 		case VHA_SYNC_OP_CREATE_OUT:
+			dev_dbg(miscdev->this_device, "%s: session %u, VHA_SYNC_OP_CREATE_OUT buf_id_count: %u\n",
+				__func__, session->id, data.create_data.buf_id_count);
 			if (data.create_data.buf_id_count > VHA_SYNC_MAX_BUF_IDS) {
 				dev_err(miscdev->this_device, "%s: too many buf_ids provided\n",
-								__func__);
+					__func__);
 				ret = -EINVAL;
 			} else
 				ret = vha_create_output_sync(session, data.create_data.buf_id_count,
-																		data.create_data.buf_ids);
+								data.create_data.buf_ids);
 			break;
 		case VHA_SYNC_OP_MERGE_IN:
+			dev_dbg(miscdev->this_device, "%s: session %u, VHA_SYNC_OP_MERGE_IN in_sync_fd_count: %u\n",
+				__func__, session->id, data.merge_data.in_sync_fd_count);
 			if (data.merge_data.in_sync_fd_count > VHA_SYNC_MAX_IN_SYNC_FDS) {
 				dev_err(miscdev->this_device, "%s: too many in_sync_fds provided\n",
-								__func__);
+					__func__);
 				ret = -EINVAL;
 			} else
 				ret = vha_merge_input_syncs(session, data.merge_data.in_sync_fd_count,
-																		data.merge_data.in_sync_fds);
+								data.merge_data.in_sync_fds);
 			break;
 		case VHA_SYNC_OP_RELEASE:
+			dev_dbg(miscdev->this_device, "%s: session %u, VHA_SYNC_OP_RELEASE buf_id_count: %u\n",
+				__func__, session->id, data.release_data.buf_id_count);
 			if (data.release_data.buf_id_count > VHA_SYNC_MAX_BUF_IDS) {
 				dev_err(miscdev->this_device, "%s: too many buf_ids provided\n",
-								__func__);
+					__func__);
 				ret = -EINVAL;
 			} else
 				ret = vha_release_syncs(session, data.release_data.buf_id_count,
-																data.release_data.buf_ids);
+							data.release_data.buf_ids);
 			break;
 		default:
 			break;
@@ -697,6 +739,9 @@ static long vha_ioctl_cancel(struct vha_session *session, void __user *buf)
 			"%s: copy_from_user error\n", __func__);
 		return -EFAULT;
 	}
+
+	dev_dbg(miscdev->this_device, "%s: session %u, cmd_id 0x%08x, cmd_id_mask 0x%08x\n",
+		__func__, session->id, data.cmd_id, data.cmd_id_mask);
 
 	return vha_rm_cmds(session, data.cmd_id, data.cmd_id_mask);
 }
@@ -872,12 +917,14 @@ static int __init vha_api_init(void)
 
 	pr_debug("loading VHA module.\n");
 
-	vha_early_init();
-
-	ret = vha_plat_init();
+	ret = vha_early_init();
 	if (ret)
 		pr_err("failed initialize VHA driver\n");
-
+	else {
+		ret = vha_plat_init();
+		if (ret)
+			pr_err("failed initialize VHA driver\n");
+	}
 	return ret;
 }
 

@@ -50,6 +50,7 @@
 #include <linux/dma-mapping.h>
 
 #include <img_mem_man.h>
+#include <vha_drv_common.h>
 #include <mmu.h>
 #include <heap.h>
 
@@ -57,6 +58,9 @@
 
 /* Maximum number of processes */
 #define MAX_PROC_CTX 1000
+
+/* Minimum page size (4KB) bits. */
+#define MIN_PAGE_SIZE_BITS 12
 
 struct mem_man {
 	struct idr heaps;
@@ -444,10 +448,13 @@ static int _img_mem_alloc(struct device *device, struct mem_ctx *ctx,
 		pr_err("%s: heap %d alloc failed\n", __func__, heap->id);
 		goto heap_alloc_failed;
 	}
-	img_pdump_printf("-- Allocating zeroed buffer id:%d  size:%zu\n",
-			buffer->id, buffer->actual_size);
-	img_pdump_printf("CALLOC "_PMEM_":BLOCK_%d %#zx %#zx 0x0\n",
-			buffer->id, buffer->actual_size, align);
+
+	if (heap->type != IMG_MEM_HEAP_TYPE_OCM) {
+		__img_pdump_printf(device, "-- Allocating zeroed buffer id:%d  size:%zu\n",
+				buffer->id, buffer->actual_size);
+		__img_pdump_printf(device, "CALLOC "_PMEM_":BLOCK_%d %#zx %#zx 0x0\n",
+				buffer->id, buffer->actual_size, align);
+	}
 
 	ctx->mem_usage_curr += buffer->actual_size;
 	if (ctx->mem_usage_curr > ctx->mem_usage_max)
@@ -741,9 +748,11 @@ static void _img_mem_free(struct buffer *buffer)
 
 	idr_remove(&ctx->buffers, buffer->id);
 
-	img_pdump_printf("-- Freeing buffer id:%d  size:%zu\n",
-			buffer->id, buffer->actual_size);
-	img_pdump_printf("FREE "_PMEM_":BLOCK_%d\n", buffer->id);
+	if (heap->type != IMG_MEM_HEAP_TYPE_OCM) {
+		__img_pdump_printf(buffer->device, "-- Freeing buffer id:%d  size:%zu\n",
+				buffer->id, buffer->actual_size);
+		__img_pdump_printf(buffer->device, "FREE "_PMEM_":BLOCK_%d\n", buffer->id);
+	}
 	kfree(buffer);
 }
 
@@ -929,8 +938,8 @@ int img_mem_map_um(struct mem_ctx *ctx, int buf_id, struct vm_area_struct *vma)
 	}
 
 	ret = heap->ops->map_um(heap, buffer, vma);
-	/* Always invalidate the buffer when it is mapped into UM */
-	if (!ret && (vma->vm_flags & VM_READ))
+	/* Always invalidate the buffer when it is mapped into UM for reading */
+	if (!ret && (vma->vm_flags & VM_READ) && !(vma->vm_flags & VM_WRITE))
 		_img_mem_sync_device_to_cpu(buffer, false);
 
 	mutex_unlock(&mem_man->mutex);
@@ -1207,15 +1216,17 @@ int img_mmu_init_cache(struct mmu_ctx *mmu_ctx,	unsigned long cache_phys_start,
 		uint32_t cache_size)
 {
 	struct mem_man *mem_man = &mem_man_data;
+	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(mmu_ctx->device);
 
 	mutex_lock(&mem_man->mutex);
 
 	mmu_ctx->cache_phys_start = cache_phys_start;
 	mmu_ctx->cache_size = cache_size;
 
-	if (img_pdump_enabled() && cache_size && !mem_man->cache_initialized) {
-		img_pdump_printf("-- Allocating img mem cache buffer size:%u\n", cache_size);
-		img_pdump_printf("CALLOC :OCM:BLOCK_CACHE %#lx %#zx 0x0\n",
+
+	if (img_pdump_enabled(pdump) && cache_size && !mem_man->cache_initialized) {
+		__img_pdump_printf(mmu_ctx->device, "-- Allocating img mem cache buffer size:%u\n", cache_size);
+		__img_pdump_printf(mmu_ctx->device, "CALLOC :OCM:BLOCK_CACHE %#lx %#zx 0x0\n",
 			cache_size + sizeof(uint32_t), IMGMMU_GET_MAX_PAGE_SIZE());
 	}
 	mem_man->cache_initialized = true;
@@ -1261,7 +1272,7 @@ int img_mmu_move_pg_to_cache(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx,
 	list_for_each_entry(mapping, &buffer->mappings, buffer_entry) {
 		if (mapping->virt_addr == virt_addr) {
 			if (mapping->cache_offset + imgmmu_get_page_size() <= mmu_ctx->cache_size) {
-				img_pdump_printf("-- Move page to CACHE\n");
+				__img_pdump_printf(buffer->device, "-- Move page to CACHE\n");
 				ret = imgmmu_cat_override_phys_addr(mmu_ctx->mmu_cat,
 					mapping->virt_addr + page_idx * imgmmu_get_page_size(),
 					mmu_ctx->cache_phys_start + mapping->cache_offset);
@@ -1415,7 +1426,7 @@ static int  img_mmu_cache_get_offset(struct mem_ctx *mem_ctx,
 }
 
 /*
- * related to stream MMU context (constains IMGMMU functionality in general)
+ * related to stream MMU context (contains IMGMMU functionality in general)
  */
 
 static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
@@ -1427,7 +1438,8 @@ static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
 	unsigned int buf_offset;
 	int ret;
 
-	idr_for_each_entry(&ctx->buffers, buffer, buf_id) {
+	for (buf_id = *buffer_id;
+			((buffer) = idr_get_next(&ctx->buffers, &buf_id)) != NULL; ++buf_id) {
 		heap = buffer->heap;
 		if (heap->ops && heap->ops->get_sg_table) {
 			struct sg_table *sgt;
@@ -1440,8 +1452,14 @@ static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
 				return -EINVAL;
 			}
 
-			sgl = sgt->sgl;
-			buf_offset = 0;
+			if (buffer->pcache.last_sgl) {
+				sgl = buffer->pcache.last_sgl;
+				buf_offset = buffer->pcache.last_offset;
+			} else {
+				sgl = sgt->sgl;
+				buf_offset = 0;
+			}
+
 			while (sgl) {
 #if 0
 				pr_err("%s: sgl_phys %llx len:%d addr:%llx\n",
@@ -1459,8 +1477,8 @@ static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
 					*buffer_offset = buf_offset;
 					return 0;
 				}
-				buf_offset += sgl->length;
-				sgl = sg_next(sgl);
+				buffer->pcache.last_offset = buf_offset += sgl->length;
+				buffer->pcache.last_sgl = sgl = sg_next(sgl);
 			}
 		} else if (heap->ops && heap->ops->get_page_array) {
 			uint64_t *addrs;
@@ -1473,16 +1491,22 @@ static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
 				return -EINVAL;
 			}
 
-			page_idx = 0;
-			buf_offset = 0;
+			if (buffer->pcache.last_sgl) {
+				page_idx = buffer->pcache.last_idx;
+				buf_offset = buffer->pcache.last_offset;
+			} else {
+				page_idx = 0;
+				buf_offset = 0;
+			}
+
 			while (buf_offset < buffer->actual_size) {
 				if (addrs[page_idx] == addr) {
 					*buffer_id = buffer->id;
 					*buffer_offset = buf_offset;
 					return 0;
 				}
-				page_idx++;
-				buf_offset += PAGE_SIZE;
+				buffer->pcache.last_idx = page_idx++;
+				buffer->pcache.last_offset = buf_offset += PAGE_SIZE;
 			}
 		} else {
 			pr_err("%s: heap %d buffer %d no phys addrs found!\n",
@@ -1511,7 +1535,7 @@ static struct imgmmu_page *_page_alloc(void *arg, unsigned char type)
 	if (!page)
 		return NULL;
 
-	img_pdump_printf("-- Allocating MMU page for %s\n",
+	__img_pdump_printf(mmu_ctx->device, "-- Allocating MMU page for %s\n",
 			type == IMGMMU_PTYPE_PC ? "PC" :
 			type == IMGMMU_PTYPE_PD ? "PD" :
 			type == IMGMMU_PTYPE_PT ? "PT" :
@@ -1566,8 +1590,8 @@ static struct imgmmu_page *_page_alloc(void *arg, unsigned char type)
 		goto free_buffer;
 	}
 
-	pr_debug("%s:%d virt addr %#lx\n", __func__, __LINE__,
-		page->page.cpu_addr);
+	pr_debug("%s:%d virt addr %#lx type:%d\n", __func__, __LINE__,
+		page->page.cpu_addr, type);
 	pr_debug("%s:%d phys addr %#llx\n", __func__, __LINE__,
 		page->page.phys_addr);
 	return &page->page;
@@ -1594,25 +1618,25 @@ static void _page_free(struct imgmmu_page *arg)
 	kfree(page);
 }
 
-static inline void __pdump_apply_parity(uint64_t virt,
+static inline void __pdump_apply_parity(struct device* dev, uint64_t virt,
 		const char *block, unsigned int offset)
 {
 	uint8_t bits;
 	/* XOR 32 bit pair <paddr & vaadr> */
-	img_pdump_printf(
+	__img_pdump_printf(dev,
 			"WRW "_PMEM_":$1 %#llx -- Calculate parity bit\n"
 			"WRW "_PMEM_":$2 %s:%#x\n"
 			"XOR "_PMEM_":$1 "_PMEM_":$1 "_PMEM_":$2\n",
 			virt, block, offset);
 	for (bits = 16; bits >= 1; bits>>=1)
 		/* XOR 'bits' pair of previous result */
-		img_pdump_printf(
+		__img_pdump_printf(dev,
 				"AND "_PMEM_":$2 "_PMEM_":$1 %#x\n"
 				"SHR "_PMEM_":$1 "_PMEM_":$1 %d\n"
 				"XOR "_PMEM_":$1 "_PMEM_":$1 "_PMEM_":$2\n",
 				(1<<bits)-1, bits);
 	/* Apply parity bit */
-	img_pdump_printf(
+	__img_pdump_printf(dev,
 			"SHL "_PMEM_":$1 "_PMEM_":$1 %d\n"
 			"OR  "_PMEM_":$0 "_PMEM_":$0 "_PMEM_":$1 -- Apply parity\n",
 			imgmmu_get_pte_parity_shift());
@@ -1625,7 +1649,9 @@ static void _page_write(struct imgmmu_page *page,
 	uint32_t *mem32 = (uint32_t *)page->cpu_addr;
 	uint64_t *mem64 = (uint64_t *)mem32;
 	struct mmu_page *mmu_page;
-	struct heap *heap;
+	struct heap *heap = NULL;
+	struct buffer *buf = (struct buffer*)priv;
+	struct pdump_descr* pdump;
 	uint32_t entry_shift = 0;
 	uint64_t cache_bits = 0;
 	uint64_t address = entry & IMG_MMU_PHY_ADDR_MASK;
@@ -1638,10 +1664,12 @@ static void _page_write(struct imgmmu_page *page,
 	if (mmu_page->type == IMGMMU_PTYPE_PC ||
 		mmu_page->type == IMGMMU_PTYPE_PD)
 		heap = mmu_page->buffer->heap;
-	else
+	else {
 		/* PT entries are pointing to buffer which may have been allocated
 		 * using different heap than the one used for mmu allocations */
-		heap = (struct heap*)priv;
+		if (buf)
+			heap = buf->heap;
+	}
 
 	mmu_page->bypass_addr_trans = (flags & IMGMMU_BYPASS_ADDR_TRANS ? true : false);
 
@@ -1688,7 +1716,8 @@ static void _page_write(struct imgmmu_page *page,
 		/* This is 64 bit entry */
 		mem64[offset] = cache_bits | paddr | flags;
 		if (flags && mmu_page->use_parity) {
-			uint64_t par_pair = virt | (paddr << sizeof(uint32_t)*8);
+			uint64_t par_pair = (virt >> MIN_PAGE_SIZE_BITS) |
+					((paddr >> MIN_PAGE_SIZE_BITS) << (sizeof(uint32_t)*8));
 			bool par_bit = img_mem_calc_parity(par_pair);
 			if (par_bit)
 				imgmmu_set_pte_parity(&mem64[offset]);
@@ -1698,11 +1727,11 @@ static void _page_write(struct imgmmu_page *page,
 						par_bit ? "odd parity" : "even parity");
 		}
 	}
-
-	if (img_pdump_enabled() && flags) {
+	pdump = vha_pdump_dev_get_drvdata(mmu_page->buffer->device);
+	if (img_pdump_enabled(pdump) && flags) {
 		/* skip when flags are zero, assuming address is invalid */
-		int buffer_id;
-		unsigned int buffer_offset;
+		int buffer_id = 0;
+		unsigned int buffer_offset = 0;
 		int ret;
 
 		if (mmu_page->bypass_addr_trans) {
@@ -1713,31 +1742,34 @@ static void _page_write(struct imgmmu_page *page,
 			} else {
 				/* Cache addresses are only applicable for PT entries */
 				WARN_ON(mmu_page->type != IMGMMU_PTYPE_PT);
-				img_pdump_printf(
+				__img_pdump_printf(mmu_page->buffer->device,
 						"WRW "_PMEM_":$0 :OCM:BLOCK_CACHE:%#x\n"
 						"OR  "_PMEM_":$0 "_PMEM_":$0 %d\n",
 						buffer_offset, flags);
 
 				if (mmu_page->use_parity) {
 					const char block[] = ":OCM:BLOCK_CACHE";
-					__pdump_apply_parity(virt, block, buffer_offset);
+					__pdump_apply_parity(mmu_page->buffer->device, virt, block, buffer_offset);
 				}
 
 				if (cache_bits)
-					img_pdump_printf(
+					__img_pdump_printf(mmu_page->buffer->device,
 						"OR  "_PMEM_":$0 "_PMEM_":$0 %#llx\n",
 						cache_bits);
-				img_pdump_printf(
+				__img_pdump_printf(mmu_page->buffer->device,
 					"WRW64 "_PMEM_":BLOCK_%d:%#zx "_PMEM_":$0 -- PTE\n",
 					mmu_page->buffer->id, offset * sizeof(*mem64));
 			}
 		} else {
+			if (mmu_page->type == IMGMMU_PTYPE_PT && buf)
+				buffer_id = buf->id;
+
 			ret = imgmmu_find_buffer(mmu_page->buffer->mem_ctx, address,
 						&buffer_id, &buffer_offset);
 			if (ret) {
 				pr_info("PDUMP: Can't find %#llx\n", address);
 			} else if (mmu_page->type == IMGMMU_PTYPE_PC) {
-				img_pdump_printf(
+				__img_pdump_printf(mmu_page->buffer->device,
 					"WRW "_PMEM_":$0 "_PMEM_":BLOCK_%d:%#x\n"
 					"SHR "_PMEM_":$0 "_PMEM_":$0 %d\n"
 					"OR  "_PMEM_":$0 "_PMEM_":$0 %d\n"
@@ -1747,7 +1779,7 @@ static void _page_write(struct imgmmu_page *page,
 					mmu_page->buffer->id, offset * sizeof(*mem32));
 			} else {
 				if (mmu_page->type == IMGMMU_PTYPE_PD) {
-					img_pdump_printf(
+					__img_pdump_printf(mmu_page->buffer->device,
 						"WRW "_PMEM_":$0 "_PMEM_":BLOCK_%d:%#x\n"
 						"OR  "_PMEM_":$0 "_PMEM_":$0 %d\n"
 						"WRW64 "_PMEM_":BLOCK_%d:%#zx "_PMEM_":$0 -- PDE\n",
@@ -1762,19 +1794,19 @@ static void _page_write(struct imgmmu_page *page,
 						snprintf(block, sizeof(block), ""_PMEM_":BLOCK_%d",
 								buffer_id);
 
-					img_pdump_printf(
+					__img_pdump_printf(mmu_page->buffer->device,
 						"WRW "_PMEM_":$0 %s:%#x\n"
 						"OR  "_PMEM_":$0 "_PMEM_":$0 %d\n",
 						block, buffer_offset, flags);
 
 					if (mmu_page->use_parity)
-						__pdump_apply_parity(virt, block, buffer_offset);
+						__pdump_apply_parity(mmu_page->buffer->device, virt, block, buffer_offset);
 
 					if (cache_bits)
-						img_pdump_printf(
+						__img_pdump_printf(mmu_page->buffer->device,
 							"OR  "_PMEM_":$0 "_PMEM_":$0 %#llx\n",
 							cache_bits);
-					img_pdump_printf(
+					__img_pdump_printf(mmu_page->buffer->device,
 						"WRW64 "_PMEM_":BLOCK_%d:%#zx "_PMEM_":$0 -- PTE\n",
 						mmu_page->buffer->id, offset * sizeof(*mem64));
 				}
@@ -1824,7 +1856,8 @@ static uint64_t _page_read(struct imgmmu_page *page,
 
 	if (*flags && mmu_page->type == IMGMMU_PTYPE_PT &&
 			mmu_page->use_parity) {
-		uint64_t par_pair = virt | (paddr << sizeof(uint32_t)*8);
+		uint64_t par_pair = (virt >> MIN_PAGE_SIZE_BITS) |
+				(paddr << (sizeof(uint32_t)*8 - (2 * MIN_PAGE_SIZE_BITS)));
 		bool par_bit = img_mem_calc_parity(par_pair);
 
 		if (trace_physical_pages)
@@ -1904,7 +1937,7 @@ static void _update_page(struct imgmmu_page *arg)
 
 int img_mmu_ctx_create(struct device *device, const struct mmu_config *config,
 					struct mem_ctx *mem_ctx, int heap_id,
-					void (*callback_fn)(enum img_mmu_callback_type type,
+					int (*callback_fn)(enum img_mmu_callback_type type,
 						int buf_id, void *data),
 					void *callback_data, struct mmu_ctx **mmu_ctx)
 {
@@ -1946,6 +1979,20 @@ int img_mmu_ctx_create(struct device *device, const struct mmu_config *config,
 		mutex_unlock(&mem_man->mutex);
 		kfree(ctx);
 		return -EINVAL;
+	}
+
+	/* Apply offset when needed */
+	if (ctx->heap->ops->set_offset) {
+		if (ctx->heap->ops->set_offset(ctx->heap, config->bypass_offset)) {
+			pr_err("%s: failed to set offset %zu heap_id (%d)!\n",
+					__func__, config->bypass_offset, heap_id);
+			mutex_unlock(&mem_man->mutex);
+			kfree(ctx);
+			return -EINVAL;
+		}
+		pr_debug("%s adding %lx offset bytes to heap %d type %d (%s)\n",
+				__func__, config->bypass_offset, ctx->heap->id,
+				ctx->heap->type, get_heap_name(ctx->heap->type));
 	}
 
 	info.ctx = ctx;
@@ -2056,7 +2103,7 @@ int img_mmu_map(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx, int buf_id,
 	mapping->virt_addr = virt_addr;
 
 	if (!mmu_ctx->config.bypass_hw)
-		img_pdump_printf("-- Mapping "_PMEM_":BLOCK_%d @ 0x%llx\n",
+		__img_pdump_printf(buffer->device, "-- Mapping "_PMEM_":BLOCK_%d @ 0x%llx\n",
 				buf_id, virt_addr);
 
 	heap = buffer->heap;
@@ -2075,7 +2122,7 @@ int img_mmu_map(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx, int buf_id,
 						mmu_ctx->mmu_cat,
 						sgt->sgl,
 						&heap_alloc,
-						map_flags, heap,
+						map_flags, buffer,
 						&res);
 		else
 			pr_debug("%s imgmmu_cat_map_sg bypass!\n", __func__);
@@ -2094,7 +2141,7 @@ int img_mmu_map(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx, int buf_id,
 						mmu_ctx->mmu_cat,
 						addrs,
 						&heap_alloc,
-						map_flags, heap,
+						map_flags, buffer,
 						&res);
 		else
 			pr_debug("%s imgmmu_cat_map_arr bypass!\n", __func__);
@@ -2113,12 +2160,15 @@ int img_mmu_map(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx, int buf_id,
 	list_add(&mapping->mmu_ctx_entry, &mmu_ctx->mappings);
 	list_add(&mapping->buffer_entry, &mapping->buffer->mappings);
 
-	if (mmu_ctx->callback_fn && !mmu_ctx->config.bypass_hw)
-		mmu_ctx->callback_fn(IMG_MMU_CALLBACK_MAP, buffer->id,
+	if (mmu_ctx->callback_fn && !mmu_ctx->config.bypass_hw) {
+		ret = mmu_ctx->callback_fn(IMG_MMU_CALLBACK_MAP, buffer->id,
 						mmu_ctx->callback_data);
-
+		if (ret) {
+			pr_err("%s: imgmmu map callback failed!\n", __func__);
+		}
+	}
 	mutex_unlock(&mem_man->mutex);
-	return 0;
+	return ret;
 
 error:
 	mutex_unlock(&mem_man->mutex);

@@ -261,13 +261,17 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 	}
 hw_kick:
 	/* Change mmu context */
-	vha_mmu_setup(cmd->session);
-
+	ret = vha_mmu_setup(cmd->session);
+	if (ret) {
+		dev_err(vha->dev,
+			"%s: Error during MMU setup!\n", __func__);
+			goto out_error;
+	}
 	/* Setup memory stuff */
-	vha_dev_mh_setup(vha, session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id);
+	vha_dev_mh_setup(vha, session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id, NULL);
 
 	/* Prepare debug buffer registers */
-	vha_dbg_prepare_hwbufs(session);
+	vha_dbg_prepare_hwbufs(session, 0, NULL);
 
 	/* Setup cnn hw watchdog before kicking the hw */
 	{
@@ -348,6 +352,7 @@ static int do_cmd_cnn_pdump_msg(const struct vha_cmd *cmd)
 {
 	const struct vha_user_cmd *user_cmd = &cmd->user_cmd;
 	struct vha_session *session = cmd->session;
+	struct vha_dev* vha = session->vha;
 	int ret = 0;
 
 	if (user_cmd->num_inbufs != 0 || user_cmd->num_bufs != 0) {
@@ -428,6 +433,7 @@ void vha_cnn_update_stats(struct vha_dev *vha)
 void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 {
 	struct vha_session *session = cmd->session;
+	struct vha_dev* vha = session->vha;
 	struct vha_rsp *rsp = NULL;
 	int i;
 	struct vha_user_cnn_submit_rsp * cnn_submit_rsp = NULL;
@@ -529,7 +535,7 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 
 		/* Try to flush hw debug buffers first
 		 * - this does pdump SAB when proper checkpoint is set */
-		vha_dbg_flush_hwbufs(session, 1);
+		vha_dbg_flush_hwbufs(session, 1, 0);
 
 		/* pdump SAB for each of the output buffers */
 		img_pdump_printf("-- Save outputs\n");

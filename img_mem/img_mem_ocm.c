@@ -146,6 +146,7 @@ static struct heap_ops ocm_heap_ops = {
 	.get_page_array = ocm_heap_get_page_array,
 	.sync_cpu_to_dev = NULL,
 	.sync_dev_to_cpu = NULL,
+	.set_offset = NULL,
 	.destroy = ocm_heap_destroy,
 };
 

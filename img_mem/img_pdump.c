@@ -48,14 +48,7 @@
 #include <stdarg.h>
 
 #include <img_mem_man.h>
-
-static DEFINE_MUTEX(pdump_lock);
-
-/*
- * there are 3 different PDUMP files: TXT, PRM and RES.
- * they are simply buffers in ram.
- */
-static struct pdump_buf pdump_bufs[PDUMP_MAX];
+#include <vha_drv_common.h>
 
 /*
  * create a pdump buffer
@@ -67,9 +60,9 @@ static struct pdump_buf pdump_bufs[PDUMP_MAX];
  * (in other words, no memory will be allocated,
  * but it will still have a 'length')
  */
-struct pdump_buf *img_pdump_create(uint32_t pdump_num, size_t size)
+struct pdump_buf *img_pdump_create(struct pdump_descr* pdump, uint32_t pdump_num, size_t size)
 {
-	struct pdump_buf *pbuf = pdump_bufs + pdump_num;
+	struct pdump_buf *pbuf = &pdump->pbufs[pdump_num];
 
 	if (pdump_num >= PDUMP_MAX) {
 		pr_err("%s: invalid pdump number:%d\n", __func__, pdump_num);
@@ -99,15 +92,15 @@ EXPORT_SYMBOL(img_pdump_create);
 /*
  * append binary data to one of the pdump buffers
  */
-int img_pdump_write(uint32_t pdump_num, const void *ptr, size_t size)
+int img_pdump_write(struct pdump_descr* pdump, uint32_t pdump_num, const void *ptr, size_t size)
 {
-	struct pdump_buf *pbuf = pdump_bufs + pdump_num;
+	struct pdump_buf *pbuf = &pdump->pbufs[pdump_num];
 	int ret = 0;
 
 	if (pdump_num >= PDUMP_MAX || ptr == NULL || pbuf->ptr == NULL)
 		return -EINVAL;
 
-	mutex_lock(&pdump_lock);
+	mutex_lock(&pdump->lock);
 	if (pbuf->len + size > pbuf->size)
 		size = pbuf->size - pbuf->len;
 
@@ -124,7 +117,7 @@ int img_pdump_write(uint32_t pdump_num, const void *ptr, size_t size)
 	pr_debug("%s end!\n", __func__);
 
 unlock:
-	mutex_unlock(&pdump_lock);
+	mutex_unlock(&pdump->lock);
 
 	return ret;
 }
@@ -134,48 +127,51 @@ EXPORT_SYMBOL(img_pdump_write);
  * append a string to the TXT pdump buffer.
  * returns the number of bytes printed or error.
  */
-__printf(1, 2)
-int img_pdump_printf(const char *fmt, ...)
+__printf(2, 3)
+int __img_pdump_printf(struct device* dev, const char *fmt, ...)
 {
-	struct pdump_buf *pbuf = pdump_bufs + PDUMP_TXT;
+	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(dev);
+	struct pdump_buf *pbuf;
 	va_list ap;
 
+	BUG_ON(pdump==NULL);
+	pbuf = &pdump->pbufs[PDUMP_TXT];
 	if (pbuf->ptr == NULL)
 		return -EINVAL;
 
-	mutex_lock(&pdump_lock);
+	mutex_lock(&pdump->lock);
 	va_start(ap, fmt);
 	if (pbuf->len < pbuf->size) {
 #if defined(OSID)
 		/* Prepend OSID to pdump comments */
 		if (fmt[0] == '-' && fmt[1] == '-')
 			pbuf->len += sprintf(pbuf->ptr + pbuf->len,
-					       "-- (OS%d) ", OSID);
+								 "-- (OS%d) ", OSID);
 #endif
 		pbuf->len += vsnprintf(pbuf->ptr + pbuf->len,
-				       pbuf->size - pbuf->len,
-				       fmt, ap);
+							 pbuf->size - pbuf->len,
+							 fmt, ap);
 	}
 	/*
 	 * vsnprintf returns the number of bytes that WOULD have been printed
 	 */
 	pbuf->len = min(pbuf->size, pbuf->len);
 	va_end(ap);
-	mutex_unlock(&pdump_lock);
+	mutex_unlock(&pdump->lock);
 
 	return pbuf->len;
 }
-EXPORT_SYMBOL(img_pdump_printf);
+EXPORT_SYMBOL(__img_pdump_printf);
 
 
-void img_pdump_destroy(void)
+void img_pdump_destroy(struct pdump_descr* pdump)
 {
 	int i;
 
 	for (i = 0; i < PDUMP_MAX; i++) {
-		void *ptr = pdump_bufs[i].ptr;
+		void *ptr = pdump->pbufs[i].ptr;
 
-		pdump_bufs[i].ptr = NULL;
+		pdump->pbufs[i].ptr = NULL;
 		pr_debug("%s %d buffer %p!\n", __func__, i, ptr);
 		vfree(ptr);
 	}
@@ -185,8 +181,9 @@ EXPORT_SYMBOL(img_pdump_destroy);
 /*
  * PDUMP generation is disabled until a PDUMP TXT buffer has been created
  */
-bool img_pdump_enabled(void)
+bool img_pdump_enabled(struct pdump_descr* pdump)
 {
-	return pdump_bufs[PDUMP_TXT].ptr != NULL;
+	return pdump && pdump->pbufs[PDUMP_TXT].ptr != NULL;
 }
 EXPORT_SYMBOL(img_pdump_enabled);
+

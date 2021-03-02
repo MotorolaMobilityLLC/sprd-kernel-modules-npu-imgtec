@@ -189,6 +189,7 @@ static struct heap_ops coherent_heap_ops = {
 	.get_page_array = coherent_heap_get_page_array,
 	.sync_cpu_to_dev = NULL,
 	.sync_dev_to_cpu = NULL,
+	.set_offset = NULL,
 	.destroy = coherent_heap_destroy,
 };
 

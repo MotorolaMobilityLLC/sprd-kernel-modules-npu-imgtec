@@ -82,6 +82,7 @@ enum {
 struct mmu_config {
 	uint32_t addr_width; /* physical */
 	bool bypass_hw; /* MMU bypass mode */
+	size_t bypass_offset; /* Optional offset in physical space for MMU bypass mode */
 	bool use_pte_parity; /* enables parity calculation for PTEs */
 	/* memory attributes to be used when allocating mmu pages */
 	enum img_mem_attr alloc_attr;
@@ -196,7 +197,7 @@ int img_mem_signal_fence(struct mem_ctx *ctx, int buf_id);
 */
 int img_mmu_ctx_create(struct device *device, const struct mmu_config *config,
 					 struct mem_ctx *mem_ctx, int heap_id,
-					 void (*callback_fn)(enum img_mmu_callback_type type,
+					 int (*callback_fn)(enum img_mmu_callback_type type,
 					 int buf_id, void *data),
 					 void *callback_data,
 					 struct mmu_ctx **mmu_ctx);
@@ -239,27 +240,42 @@ bool img_mem_calc_parity(unsigned long long input);
  */
 struct pdump_buf {
 	char   *ptr;
-	size_t  size;		/* allocated size of buffer */
-	size_t  len;		/* how full is the buffer */
+	size_t  size;      /* allocated size of buffer */
+	size_t  len;       /* how full is the buffer */
+	bool    drop_data; /* do not store data in file */
 };
-#define PDUMP_TXT  0		/* eg pdump.txt */
-#define PDUMP_PRM  1		/* eg pdump.prm */
-#define PDUMP_RES  2		/* eg pdump.res */
-#define PDUMP_DBG  3		/* eg pdump.dbg */
-#define PDUMP_CRC  4		/* eg pdump.crc */
-#define PDUMP_MAX  5
+#define PDUMP_TXT      0  /* eg pdump.txt     */
+#define PDUMP_PRM      1  /* eg pdump.prm     */
+#define PDUMP_RES      2  /* eg pdump.res     */
+#define PDUMP_DBG      3  /* eg pdump.dbg     */
+#define PDUMP_CRC      4  /* eg pdump.crc     */
+#define PDUMP_CRC_CMB  5  /* eg pdump.crc_cmb */
+#define PDUMP_MAX      6  
+
+/*
+  * VHA PDUMPs.
+  * Uses img_pdump buffers to collect pdump information.
+  * there are 3 different PDUMP files: TXT, PRM and RES.
+  * they are simply buffers in ram.
+  * They are mapped into debugfs: /sys/kernel/debug/vhaN/pdump.*
+  */
+struct pdump_descr {
+	struct pdump_buf pbufs[PDUMP_MAX];
+	struct mutex     lock;
+};
 
 #ifndef OSID
 #define _PMEM_ ":MEM"
 #else
 #define _PMEM_ ":MEM_OS"__stringify(OSID)
 #endif
-struct pdump_buf *img_pdump_create(uint32_t pdump_num, size_t size);
-int img_pdump_write(uint32_t pdump_num, const void *ptr, size_t size);
-int img_pdump_printf(const char *fmt, ...) __printf(1, 2);
+struct pdump_buf *img_pdump_create(struct pdump_descr* pdump, uint32_t pdump_num, size_t size);
+int img_pdump_write(struct pdump_descr* pdump, uint32_t pdump_num, const void *ptr, size_t size);
+int __img_pdump_printf(struct device* dev, const char *fmt, ...) __printf(2, 3);
+#define img_pdump_printf(fmt, ...) __img_pdump_printf(vha->dev, fmt, ##__VA_ARGS__)
 
-void img_pdump_destroy(void);
-bool img_pdump_enabled(void);
+void img_pdump_destroy(struct pdump_descr* pdump);
+bool img_pdump_enabled(struct pdump_descr* pdump);
 
 #endif /* IMG_MEM_MAN_H */
 

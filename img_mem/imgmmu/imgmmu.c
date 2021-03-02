@@ -318,7 +318,7 @@ static void mmu_pagetab_rollback(struct imgmmu_dir *dir,
 		page_offs--;
 
 		/* it should have been used before */
-		WARN_ON(dir->page_map[dir_offs] != NULL);
+		WARN_ON(dir->page_map[dir_offs] == NULL);
 		dir->config.page_write(
 			dir->page_map[dir_offs]->page,
 			page_offs, 0, MMU_FLAG_INVALID, NULL);
@@ -637,7 +637,7 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 	if (vaddr & (imgmmu_get_page_size()-1))
 		return (uint64_t)-1;
 
-	WARN_ON(cat == NULL);
+	WARN_ONCE(cat == NULL, "No MMU entries");
 	if (cat == NULL || cat->config.page_read == NULL)
 		return (uint64_t)-1;
 
@@ -861,8 +861,8 @@ static struct imgmmu_dirmap *mmu_dir_map(struct imgmmu_dir *dir,
 			return NULL;
 		}
 		if ((curr_phy_addr & (imgmmu_get_page_size()-1)) != 0) {
-			mmu_log_err("current physical address: %llx \
-					is not aligned to MMU page size: %zu!\n",
+			mmu_log_err("current physical address: %llx "
+					"is not aligned to MMU page size: %zu!\n",
 					curr_phy_addr, imgmmu_get_page_size());
 			kfree(map);
 			kfree(pages_to_update);
@@ -1074,7 +1074,8 @@ struct imgmmu_map *imgmmu_cat_map_arr(struct imgmmu_cat *cat,
 			/* Update starting address */
 			virt_mem_range.vaddr += virt_mem_range.size;
 			/* and bytes left ... */
-			virt_mem_range.size = virt_mem->size - virt_mem_range.size;
+			virt_mem_range.size =  (virt_mem->vaddr + virt_mem->size) -
+					virt_mem_range.vaddr;
 
 			list_add(&dir_map->entry, &map->dir_maps);
 		}

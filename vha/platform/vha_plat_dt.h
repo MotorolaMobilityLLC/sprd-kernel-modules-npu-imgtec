@@ -68,8 +68,8 @@
 
 extern const struct of_device_id vha_plat_dt_of_ids[];
 
-int vha_plat_dt_hw_init(struct platform_device *pdev,
-			struct heap_config **heap_configs, int *num_heaps);
+void vha_plat_dt_get_heaps(struct heap_config **heap_configs, int *num_heaps);
+int vha_plat_dt_hw_init(struct platform_device *pdev);
 void vha_plat_dt_hw_destroy(struct platform_device *pdev);
 
 int vha_plat_dt_hw_suspend(struct platform_device *pdev);

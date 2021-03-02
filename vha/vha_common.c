@@ -55,7 +55,6 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include <vha_regs.h>
-#include <linux/sprd_npu_cooling.h>
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 #include <linux/dma-fence.h>
@@ -74,8 +73,8 @@
 #define MIN_ONCHIP_MAP 1
 #define MAX_ONCHIP_MAP 128
 
-static uint32_t mmu_mode = 40;
-module_param(mmu_mode, uint, 0444);
+static uint8_t mmu_mode = VHA_MMU_40BIT;
+module_param(mmu_mode, byte, 0444);
 MODULE_PARM_DESC(mmu_mode,
 	"MMU mode: 0=no-MMU, 1=direct (1:1) mappings or 40=40bit (default)");
 static uint32_t mmu_ctx_default;
@@ -89,7 +88,8 @@ MODULE_PARM_DESC(mmu_page_size,
 static bool no_clock_disable = false;
 module_param(no_clock_disable, bool, 0444);
 MODULE_PARM_DESC(no_clock_disable,
-		"if Y, the core is not disabled when inactive, otherwise APM is used");
+	"if Y, the device is not disabled when inactive, otherwise APM is used");
+
 static int pm_delay = 0;
 module_param(pm_delay, int, S_IRUSR | S_IRGRP);
 MODULE_PARM_DESC(pm_delay, "Delay, in ms, before powering off the core that's idle");
@@ -97,15 +97,19 @@ MODULE_PARM_DESC(pm_delay, "Delay, in ms, before powering off the core that's id
 static int freq_khz = -1;
 module_param(freq_khz, int, 0444);
 MODULE_PARM_DESC(freq_khz,
-		"core frequency in kHz, -1=start self measurement during driver load, 0=use platform defined value");
+	"core frequency in kHz, -1=start self measurement during driver load, 0=use platform defined value, otherwise (>0) declared value is used");
 static uint32_t hw_bypass;
 module_param(hw_bypass, uint, 0444);
 MODULE_PARM_DESC(hw_bypass,
-		"Number of cnn kicks(segments) to be bypassed within the session, 0=none");
+	"Number of cnn kicks(segments) to be bypassed within the session, 0=none");
 static uint32_t slc_bypass;
 module_param(slc_bypass, uint, 0444);
 MODULE_PARM_DESC(slc_bypass, "SLC bypass mode");
+#ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
 static uint32_t low_latency = VHA_LL_SW_KICK;
+#else
+static uint32_t low_latency = VHA_LL_SELF_KICK;
+#endif
 module_param(low_latency, uint, 0444);
 MODULE_PARM_DESC(low_latency, "Low latency mode: 0-disabled, 1-sw kick, 2-self kick");
 
@@ -113,7 +117,7 @@ static bool zero_buffers;
 module_param(zero_buffers, bool, 0444);
 MODULE_PARM_DESC(zero_buffers, "fill every allocated buffer with zeros");
 
-static unsigned long onchipmem_phys_start= ~0;
+static unsigned long onchipmem_phys_start= VHA_OCM_ADDR_START;
 module_param(onchipmem_phys_start, ulong, 0444);
 MODULE_PARM_DESC(onchipmem_phys_start,
 	"Physical address of start of on-chip ram. '0xFs' means that ocm is disabled");
@@ -121,6 +125,12 @@ static uint32_t onchipmem_size;
 module_param(onchipmem_size, uint, 0444);
 MODULE_PARM_DESC(onchipmem_size,
 	"Size of on-chip memory in bytes");
+
+/* bringup test: force MMU fault with MMU base register */
+static bool test_mmu_base_pf;
+module_param(test_mmu_base_pf, bool, 0444);
+MODULE_PARM_DESC(test_mmu_base_pf,
+	"Bringup test: force MMU page fault on first access");
 
 /* bringup test: do not map into the device after the Nth buffer */
 static int32_t test_mmu_no_map_count = -1;
@@ -132,13 +142,18 @@ MODULE_PARM_DESC(test_mmu_no_map_count,
 static bool parity_disable = false;
 module_param(parity_disable, bool, 0444);
 MODULE_PARM_DESC(parity_disable,
-		"if Y, the core parity feature will be disabled, if it is supported");
+	"if Y, the core parity feature will be disabled, if it is supported");
+
+static bool confirm_config_reg = false;
+module_param(confirm_config_reg, bool, 0444);
+MODULE_PARM_DESC(confirm_config_reg,
+	"Enables confirmation of register writes");
 #endif
 
 static bool test_without_bvnc_check;
 module_param(test_without_bvnc_check, bool, 0444);
 MODULE_PARM_DESC(test_without_bvnc_check,
-		"When set BVNC check is ignored, allowing to kick the hw");
+	"When set BVNC check is ignored, allowing to kick the hw");
 
 /* Fault inject parameter is only applicable when
  * kernel fault injection feature is enabled
@@ -148,17 +163,26 @@ MODULE_PARM_DESC(test_without_bvnc_check,
 static bool fault_inject;
 module_param(fault_inject, bool, 0444);
 MODULE_PARM_DESC(fault_inject,
-		"Enable fault injection. To be used with kernel fault injection feature");
+	"Enable fault injection. To be used with kernel fault injection feature");
+
+/* Interval in milliseconds for testing/simulating system suspend/resume functionality */
+static uint8_t suspend_interval_msec;
+module_param(suspend_interval_msec, byte, 0444);
+MODULE_PARM_DESC(suspend_interval_msec,
+	"Test suspend/resume interval, 0=disabled, otherwise defines interval in milliseconds");
+
+static bool cnn_combined_crc_enable = false;
+module_param(cnn_combined_crc_enable, bool, 0444);
+MODULE_PARM_DESC(cnn_combined_crc_enable,
+	"Enables the combined CRC feature");
 
 /* Event observers, to be notified when significant events occur */
 struct vha_observers vha_observers;
 
 /* Driver context */
 static struct {
-	/* Available memory heaps. List of <struct vha_heap> */
+	/* Available driver memory heaps. List of <struct vha_heap> */
 	struct list_head heaps;
-	/* heap id for all internal allocations */
-	int internal_heap_id;
 
 	/* Memory Management context for driver */
 	struct mem_ctx *mem_ctx;
@@ -171,17 +195,38 @@ static struct {
 	int initialised;
 } drv;
 
-/* node for heaps list */
-struct vha_heap {
-	int id;
-	struct list_head list;	/* Entry in <struct vha_drv:heaps> */
-};
+/* Session id counter. */
+static uint32_t vha_session_id_cnt = 0;
 
 static void cmd_worker(struct work_struct *work);
-static void vha_sched_apm(struct vha_dev *vha, uint32_t delay_ms);
 
 static const size_t mmu_page_size_kb_lut[] =
 		{ 4096, 16384, 65536, 262144, 1048576, 2097152};
+
+#ifdef CONFIG_FUNCTION_ERROR_INJECTION
+int __IOPOLL64_RET(int ret) {
+	return ret;
+}
+
+#include <asm-generic/error-injection.h>
+/* this is the placeholder function to support error code injection from
+ * all IOPOLL_PDUMP* macros
+ */
+ALLOW_ERROR_INJECTION(__IOPOLL64_RET, ERRNO);
+
+#ifdef VHA_EVENT_INJECT
+/*
+ * called in __handle_event_injection()
+ * if normal circumstances, return 0 and do not inject EVENT
+ * otherwise, return -errno
+ */
+int __EVENT_INJECT(void) {
+	return 0;
+}
+ALLOW_ERROR_INJECTION(__EVENT_INJECT, ERRNO);
+#endif /* VHA_EVENT_INJECT */
+
+#endif
 
 /* Calculate current timespan for the given timestamp */
 bool get_timespan_us(struct timespec *from, struct timespec *to, uint64_t *result)
@@ -204,14 +249,82 @@ bool get_timespan_us(struct timespec *from, struct timespec *to, uint64_t *resul
 	return true;
 }
 
-void vha_early_init(void)
+/* Used for simulating system level suspend/resume functionality */
+static void suspend_test_worker(struct work_struct *work)
 {
+	struct vha_dev *vha = container_of(work, struct vha_dev, suspend_dwork.work);
+
+	/* Make resume/suspend cycle */
+	vha_suspend_dev(vha->dev);
+	WARN_ON(vha->state == VHA_STATE_ON);
+	vha_resume_dev(vha->dev);
+
+	mutex_lock(&vha->lock);
+	/* Retrigger suspend worker */
+	schedule_delayed_work(&vha->suspend_dwork,
+			msecs_to_jiffies(vha->suspend_interval_msec));
+	mutex_unlock(&vha->lock);
+}
+
+/*
+ * Initialize common platform (driver) memory heaps.
+ * device (cluster) heaps are initialized in vha_init()
+ */
+int vha_init_plat_heaps(const struct heap_config heap_configs[], int heaps)
+{
+	int i;
+	int ret = 0;
+	/* Initialise memory management component */
+	for (i = 0; i < heaps; i++) {
+		struct vha_heap *heap;
+
+		pr_debug("%s: adding platform heap of type %d\n",
+			__func__, heap_configs[i].type);
+
+		heap = kzalloc(sizeof(struct vha_heap), GFP_KERNEL);
+		if (!heap) {
+			ret = -ENOMEM;
+			goto drv_heap_add_failed;
+		}
+		heap->global = true;
+		ret = img_mem_add_heap(&heap_configs[i], &heap->id);
+		if (ret < 0) {
+			pr_err("%s: failed to init platform heap (type %d)!\n",
+				__func__, heap_configs[i].type);
+			kfree(heap);
+			goto drv_heap_add_failed;
+		}
+		list_add(&heap->list, &drv.heaps);
+	}
+
+	return ret;
+
+drv_heap_add_failed:
+	while (!list_empty(&drv.heaps)) {
+		struct vha_heap *heap;
+
+		heap = list_first_entry(&drv.heaps, struct vha_heap, list);
+		list_del(&heap->list);
+		img_mem_del_heap(heap->id);
+		kfree(heap);
+	}
+	return ret;
+}
+
+int vha_early_init(void)
+{
+	int ret;
 	INIT_LIST_HEAD(&drv.heaps);
-	drv.internal_heap_id = VHA_INVALID_ID;
-
-	drv.mem_ctx = NULL;
-
 	INIT_LIST_HEAD(&drv.devices);
+
+	/* Create memory management context for HW buffers */
+	ret = img_mem_create_proc_ctx(&drv.mem_ctx);
+	if (ret) {
+		pr_err("%s: failed to create mem context (err:%d)!\n",
+			__func__, ret);
+		drv.mem_ctx = NULL;
+	}
+	return ret;
 }
 
 /*
@@ -223,11 +336,37 @@ static int vha_init(struct vha_dev *vha,
 	struct device *dev = vha->dev;
 	int ret, i;
 
-	/* Initialise memory management component */
+#ifdef CONFIG_HW_MULTICORE
+	vha->hw_sched_status.num_cores_free = vha->core_props.num_cnn_core_devs;
+	vha->hw_sched_status.num_wms_free   = vha->core_props.num_cnn_core_devs;
+	vha->hw_sched_status.free_core_mask =
+				VHA_GET_CORE_MASK(vha->core_props.num_cnn_core_devs);
+	vha->hw_sched_status.free_wm_mask =
+				VHA_GET_WM_MASK(vha->core_props.num_cnn_core_devs);
+	vha->full_core_mask = vha->hw_sched_status.free_core_mask;
+	vha->wm_core_assignment = (uint64_t)(
+			VHA_CR_CORE_ASSIGNMENT_CORE_7_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_6_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_5_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_4_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_3_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_2_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_1_WM_MAPPING_UNALLOCATED |
+			VHA_CR_CORE_ASSIGNMENT_CORE_0_WM_MAPPING_UNALLOCATED);
+	vha->active_core_mask = 0;
+	vha->apm_core_mask = 0;
+
+	if (!vha_dev_dbg_params_valid(vha)) {
+		dev_err(dev, "%s: invalid debug params detected!\n", __func__);
+		return -EINVAL;
+	}
+#endif
+
+	/* Initialise local device (cluster) heaps */
 	for (i = 0; i < heaps; i++) {
 		struct vha_heap *heap;
 
-		dev_dbg(dev, "%s: adding heap of type %d\n",
+		dev_dbg(dev, "%s: adding device heap of type %d\n",
 			__func__, heap_configs[i].type);
 
 		heap = kzalloc(sizeof(struct vha_heap), GFP_KERNEL);
@@ -238,25 +377,36 @@ static int vha_init(struct vha_dev *vha,
 
 		ret = img_mem_add_heap(&heap_configs[i], &heap->id);
 		if (ret < 0) {
-			dev_err(dev, "%s: failed to init heap (type %d)!\n",
+			dev_err(dev, "%s: failed to init device heap (type %d)!\n",
 				__func__, heap_configs[i].type);
 			kfree(heap);
 			goto heap_add_failed;
 		}
-		list_add(&heap->list, &drv.heaps);
+		list_add(&heap->list, &vha->heaps);
+	}
 
-		/* Implicitly, first heap is used for internal allocations */
-		if (drv.internal_heap_id < 0) {
-			drv.internal_heap_id = heap->id;
-			dev_dbg(dev, "%s: using heap %d for internal alloc\n",
-				__func__, drv.internal_heap_id);
+	/* now copy platform (global) heap id's to device vha_heap list, the global heap id's are
+	 * not owned by vha_dev anyway (heap->global=true)
+	 * This is done for vha_ioctl_query_heaps() to be able to report both platform
+	 * and device heaps easily. */
+	{
+		struct list_head* pos;
+		list_for_each_prev(pos, &drv.heaps) {
+			struct vha_heap* heap = list_entry(pos, struct vha_heap, list);
+			struct vha_heap* heap_copy = kmemdup(heap, sizeof(*heap), GFP_KERNEL);
+			if(!heap_copy) {
+				ret = -ENOMEM;
+				goto heap_add_failed;
+			}
+			INIT_LIST_HEAD(&heap_copy->list);
+			list_add(&heap_copy->list, &vha->heaps);
 		}
 	}
 
+	/* initialize local ocm cluster heaps */
 	if (vha->core_props.locm_size_bytes && onchipmem_phys_start == ~0)
 		dev_warn(dev, "%s: Onchip memory physical address not set!\n",
 						__func__);
-
 	/* OCM heap type is automatically appended */
 	if (vha->core_props.locm_size_bytes && onchipmem_phys_start != ~0) {
 		struct heap_config heap_cfg;
@@ -280,87 +430,78 @@ static int vha_init(struct vha_dev *vha,
 		ret = img_mem_add_heap(&heap_cfg, &heap->id);
 		if (ret < 0) {
 			dev_err(dev, "%s: failed to init heap (type %d)!\n",
-				__func__, heap_configs[i].type);
+				__func__, heap_cfg.type);
 			kfree(heap);
 			goto heap_add_failed;
 		}
-		list_add(&heap->list, &drv.heaps);
+		list_add(&heap->list, &vha->heaps);
 	}
 #ifdef CONFIG_HW_MULTICORE
 	if (vha->core_props.socm_size_bytes && onchipmem_phys_start != ~0) {
-			struct heap_config heap_cfg;
-			struct vha_heap *heap;
+		struct heap_config heap_cfg;
+		struct vha_heap *heap;
 
-			memset(&heap_cfg, 0, sizeof(heap_cfg));
-			heap_cfg.type = IMG_MEM_HEAP_TYPE_OCM;
-			heap_cfg.options.ocm.phys = onchipmem_phys_start +
-					vha->core_props.locm_size_bytes + IMG_MEM_VA_GUARD_GAP;
-			heap_cfg.options.ocm.size = vha->core_props.socm_size_bytes;
-			heap_cfg.options.ocm.hattr = IMG_MEM_HEAP_ATTR_SHARED;
+		memset(&heap_cfg, 0, sizeof(heap_cfg));
+		heap_cfg.type = IMG_MEM_HEAP_TYPE_OCM;
+		heap_cfg.options.ocm.phys = onchipmem_phys_start +
+				vha->core_props.locm_size_bytes + IMG_MEM_VA_GUARD_GAP;
+		heap_cfg.options.ocm.size = vha->core_props.socm_size_bytes;
+		heap_cfg.options.ocm.hattr = IMG_MEM_HEAP_ATTR_SHARED;
 
-			dev_dbg(dev, "%s: adding heap of type %d\n",
-					__func__, heap_cfg.type);
+		dev_dbg(dev, "%s: adding heap of type %d\n",
+				__func__, heap_cfg.type);
 
-			heap = kzalloc(sizeof(struct vha_heap), GFP_KERNEL);
-			if (!heap) {
-				ret = -ENOMEM;
-				goto heap_add_failed;
-			}
-
-			ret = img_mem_add_heap(&heap_cfg, &heap->id);
-			if (ret < 0) {
-				dev_err(dev, "%s: failed to init heap (type %d)!\n",
-					__func__, heap_configs[i].type);
-				kfree(heap);
-				goto heap_add_failed;
-			}
-			list_add(&heap->list, &drv.heaps);
+		heap = kzalloc(sizeof(struct vha_heap), GFP_KERNEL);
+		if (!heap) {
+			ret = -ENOMEM;
+			goto heap_add_failed;
 		}
+
+		ret = img_mem_add_heap(&heap_cfg, &heap->id);
+		if (ret < 0) {
+			dev_err(dev, "%s: failed to init heap (type %d)!\n",
+				__func__, heap_cfg.type);
+			kfree(heap);
+			goto heap_add_failed;
+		}
+		list_add(&heap->list, &vha->heaps);
+	}
 #endif
 
+	{
+		/* now get the last entry and make it responsible for internal allocations
+		 * use last entry because list_add() inserts at the head
+		 * When choosing the internal alloc heap, the device local heaps take precedence over
+		 * global platform heaps */
+		struct vha_heap* heap = list_last_entry(&vha->heaps, struct vha_heap, list);
+		if(!heap) {
+			dev_err(dev, "%s: failed to locate heap for internal alloc\n",
+				__func__);
+			ret = -EINVAL;
+			/* Loop registered heaps just for sanity */
+			goto heap_add_failed;
+		}
+		vha->int_heap_id = heap->id;
+		dev_dbg(dev, "%s: using heap %d for internal alloc\n",
+				__func__, vha->int_heap_id);
+	}
 	/* Do not proceed if internal heap not defined */
-	if (drv.internal_heap_id < 0) {
-		dev_err(dev, "%s: failed to locate heap for internal alloc\n",
-			__func__);
-		ret = -EINVAL;
-		/* Loop registered heaps just for sanity */
-		goto heap_add_failed;
-	}
-
-	/* Create memory management context for HW buffers */
-	ret = img_mem_create_proc_ctx(&drv.mem_ctx);
-	if (ret) {
-		dev_err(dev, "%s: failed to create mem context (err:%d)!\n",
-			__func__, ret);
-		goto create_mem_context_failed;
-	}
-
-#ifdef CONFIG_HW_MULTICORE
-	vha->hw_sched_status.num_cores_free = vha->core_props.num_cnn_core_devs;
-	vha->hw_sched_status.num_wms_free   = vha->core_props.num_cnn_core_devs;
-	vha->hw_sched_status.free_core_mask =
-				VHA_GET_CORE_MASK(vha->core_props.num_cnn_core_devs);
-	vha->hw_sched_status.free_wm_mask =
-				VHA_GET_WM_MASK(vha->core_props.num_cnn_core_devs);
-	vha->full_core_mask = vha->hw_sched_status.free_core_mask;
-#endif
 
 	drv.initialised = 1;
 
 	dev_dbg(dev, "%s: vha drv init done\n", __func__);
 	return 0;
 
-create_mem_context_failed:
 heap_add_failed:
-	while (!list_empty(&drv.heaps)) {
+	while (!list_empty(&vha->heaps)) {
 		struct vha_heap *heap;
 
-		heap = list_first_entry(&drv.heaps, struct vha_heap, list);
+		heap = list_first_entry(&vha->heaps, struct vha_heap, list);
 		list_del(&heap->list);
-		img_mem_del_heap(heap->id);
+		if(!heap->global)
+			img_mem_del_heap(heap->id);
 		kfree(heap);
 	}
-	drv.internal_heap_id = VHA_INVALID_ID;
 	return ret;
 }
 
@@ -385,14 +526,13 @@ int vha_deinit(void)
 		struct vha_heap *heap;
 
 		heap = list_first_entry(&drv.heaps, struct vha_heap, list);
+		BUG_ON(!heap->global);
 		list_del(&heap->list);
 		img_mem_del_heap(heap->id);
 		kfree(heap);
 	}
-	drv.internal_heap_id = VHA_INVALID_ID;
 
 	drv.initialised = 0;
-	vha_pdump_deinit();
 	return 0;
 }
 
@@ -454,120 +594,13 @@ bool vha_dev_check_hw_capab(struct vha_dev* vha, uint64_t expected_hw_capab)
 	return true;
 }
 
-/* start the device */
-int vha_dev_start(struct vha_dev *vha)
-{
-	int ret = 0;
-
-	/* Cancel APM request if new inference comes */
-	cancel_delayed_work(&vha->apm_dwork);
-
-	if (vha->state == VHA_STATE_ON)
-		return -1;
-
-	dev_dbg(vha->dev, "%s\n", __func__);
-
-/* Assuming OS0 is the privileged one */
-#if _OSID_ == 0 /* For HW_AX2 & HW_AX3 MULTICORE this is always true */
-	/////////////// POWER ON //////////////////////////
-	img_pdump_printf("-- POWER_ON_BEGIN\n");
-	/* Prepare device ...  */
-	vha_dev_prepare(vha);
-	/* Enable device clocks */
-	vha_dev_enable_clocks(vha);
-	/* Reset device */
-	vha_dev_reset(vha);
-	/* Enable device clocks */
-	vha_dev_enable_clocks(vha);
-	img_pdump_printf("-- POWER_ON_END\n");
-	/* Call device specific setup */
-	vha_dev_setup(vha);
-	/////////////////////////////////////////////////////
-#endif
-
-	vha_dev_ready(vha);
-
-	vha->state = VHA_STATE_ON;
-	/* Remember the time hw is powered on */
-	getnstimeofday(&vha->stats.hw_start);
-	return ret;
-}
-
-/* stop the device */
-int vha_dev_stop(struct vha_dev *vha, bool reset)
-{
-	int ret = 0;
-
-	if (vha->state == VHA_STATE_OFF)
-		return -1;
-
-	/* Cancel APM request if we are about to power off the core */
-	cancel_delayed_work(&vha->apm_dwork);
-
-	dev_dbg(vha->dev, "%s\n", __func__);
-	/* Disable events at first */
-	vha_dev_disable_events(vha);
-
-	vha->is_ready = false;
-/* Assuming OS0 is the privileged one */
-#if _OSID_ == 0 /* For HW_AX2 & HW_AX3 MULTICORE this is always true */
-	/////////////// POWER_OFF //////////////////////////
-	img_pdump_printf("-- POWER_OFF_BEGIN\n");
-	/* Reset core in case of error or pending inference */
-	if (reset)
-		vha_dev_reset(vha);
-
-	/* Disable device clocks */
-	vha_dev_disable_clocks(vha);
-
-	/* Execute any outstanding routines to flush the device */
-	vha_dev_flush(vha);
-
-	img_pdump_printf("-- POWER_OFF_END\n");
-#endif
-
-	vha->state = VHA_STATE_OFF;
-	/* Update the up time of the core */
-	if (!vha->do_calibration) {
-		uint64_t tmp = 0;
-		struct timespec now;
-		getnstimeofday(&now);
-		if (get_timespan_us(&vha->stats.hw_start, &now, &tmp)) {
-			do_div(tmp, 1000UL);
-			vha->stats.uptime_ms += tmp;
-			tmp = vha->stats.cnn_total_proc_us;
-			if (vha->stats.uptime_ms) {
-				do_div(tmp, vha->stats.uptime_ms);
-				vha->stats.cnn_utilization = tmp;
-			} else
-				dev_dbg(vha->dev,
-					"%s Too short execution time to calculate utilization!\n",
-					__func__);
-		} else
-			WARN_ON(1);
-	}
-
-	vha->active_mmu_ctx = VHA_INVALID_ID;
-
-	spin_lock_irq(&vha->irq_lock);
-#ifdef CONFIG_HW_MULTICORE
-	memset(&vha->irq_status, 0, sizeof(vha->irq_status));
-#else
-	vha->irq_status = 0;
-#endif
-	vha->irq_count = 0;
-	vha->stream_count = 0;
-	spin_unlock_irq(&vha->irq_lock);
-
-	return ret;
-}
-
 /* notify the user space if a response msg is ready */
 void vha_cmd_notify(struct vha_cmd *cmd)
 {
 	struct vha_session *session = cmd->session;
 	struct vha_rsp *rsp = cmd->rsp;
-	dev_dbg(session->vha->dev, "%s %p\n", __func__, cmd);
+	dev_dbg(session->vha->dev, "%s: 0x%08x/%u\n",
+		__func__, cmd->user_cmd.cmd_id, session->id);
 
 	if (rsp) {
 		cmd->rsp = NULL;
@@ -581,9 +614,6 @@ void vha_cmd_notify(struct vha_cmd *cmd)
 
 static void vha_measure_core_freq(struct vha_dev *vha)
 {
-	vha_dev_stop(vha, false);
-	vha->do_calibration = false;
-
 	if (vha->stats.last_proc_us) {
 		uint64_t proc = vha->stats.last_proc_us;
 		do_div(proc, 1000UL);
@@ -609,7 +639,17 @@ bool vha_check_calibration(struct vha_dev *vha)
 		/* Core may have been kicked to
 		 * measure frequency */
 		if (vha->do_calibration) {
+#ifdef CONFIG_HW_MULTICORE
+			struct vha_hw_sched_info sched_info = {
+					.wm_id = VHA_CALIBRATION_WM_ID,
+					.core_mask = VHA_CALIBRATION_CORE_MASK
+			};
+			vha_wm_reset(vha, &sched_info);
+			vha_wm_release_cores(vha, VHA_CALIBRATION_CORE_MASK, false);
+#endif
+			vha_dev_stop(vha, true);
 			vha_measure_core_freq(vha);
+			vha->do_calibration = false;
 			/* Something may have been scheduled in
 			 * the middle so poke the worker */
 			vha_chk_cmd_queues(vha, false);
@@ -647,13 +687,17 @@ int vha_add_session(struct vha_session *session)
 
 	memset(&mmu_config, 0, sizeof(mmu_config));
 	/* Create a memory context for this session */
-	if (vha->mmu_mode == 0)
-		/* if mmu_mode==0, then MMU is disabled,
-		 * so bypass the mmu hw layer,
+	if (vha->mmu_mode == VHA_MMU_DISABLED) {
+		/* if MMU is disabled,
+		 * bypass the mmu hw layer,
 		 * but still need do the buffer
 		 * allocation through img_mem api
 		 */
 		mmu_config.bypass_hw = true;
+#ifdef CONFIG_HW_MULTICORE
+		mmu_config.bypass_offset = IMG_MEM_VA_HEAP1_BASE;
+#endif
+	}
 
 #ifdef VHA_SCF
 	/* Do not calculate parity when core does not support it,
@@ -685,7 +729,7 @@ int vha_add_session(struct vha_session *session)
 			goto out_unlock;
 		}
 
-		if (vha->mmu_mode) {
+		if (vha->mmu_mode != VHA_MMU_DISABLED) {
 			uint8_t hw_ctxid = 0;
 			/* Store mmu context id */
 			session->mmu_ctxs[ctx_id].id = ret;
@@ -717,7 +761,7 @@ int vha_add_session(struct vha_session *session)
 					__func__);
 			goto out_free_mmu_ctx;
 		}
-		vha_dev_ocm_configure(vha, onchipmem_phys_start);
+		vha_dev_ocm_configure(vha);
 	}
 #endif
 
@@ -727,6 +771,17 @@ int vha_add_session(struct vha_session *session)
 		goto out_free_mmu_ctx;
 
 	img_pdump_printf("-- OPEN_END\n");
+
+	/* Used for simulating system level suspend/resume functionality */
+	if (list_empty(&vha->sessions) && vha->suspend_interval_msec) {
+		INIT_DELAYED_WORK(&vha->suspend_dwork, suspend_test_worker);
+		/* Start suspend worker */
+		schedule_delayed_work(&vha->suspend_dwork,
+				msecs_to_jiffies(vha->suspend_interval_msec));
+	}
+
+	/* Assign session id. */
+	session->id = vha_session_id_cnt++;
 
 	list_add_tail(&session->list, &vha->sessions);
 	{
@@ -822,7 +877,11 @@ void vha_rm_session(struct vha_session *session)
 	}
 
 	/* Disable CRC and DEBUG capture. */
-	vha_dbg_stop_hwbufs(session);
+#ifdef CONFIG_HW_MULTICORE
+	vha_dbg_stop_hwbufs(session, vha->full_core_mask);
+#else
+	vha_dbg_stop_hwbufs(session, 0);
+#endif
 	vha_dbg_destroy_hwbufs(session);
 
 	list_for_each_entry_safe(cur_buf, tmp_buf, &session->bufs, list) {
@@ -850,14 +909,15 @@ void vha_rm_session(struct vha_session *session)
 
 	/* Reset hardware if required. */
 	if ((list_empty(&vha->sessions) && !vha->do_calibration)
-			|| reschedule)
+			|| reschedule
+			)
 		vha_dev_stop(vha, reschedule);
 
 	/* Delete session's MMU memory contexts. */
 	for (ctx_id = 0; ctx_id < ARRAY_SIZE(session->mmu_ctxs); ctx_id++) {
 		img_mmu_ctx_destroy(session->mmu_ctxs[ctx_id].ctx);
 
-		if (vha->mmu_mode) {
+		if (vha->mmu_mode != VHA_MMU_DISABLED) {
 			uint8_t hw_ctxid = session->mmu_ctxs[ctx_id].hw_id;
 			WARN_ON(!vha->mmu_ctxs[hw_ctxid]);
 			if (vha->mmu_ctxs[hw_ctxid])
@@ -878,9 +938,18 @@ void vha_rm_session(struct vha_session *session)
 			__func__, MB, kB);
 	}
 
+	vha->active_mmu_ctx = VHA_INVALID_ID;
 	img_pdump_printf("-- VHA driver session complete\n");
 	img_pdump_printf("-- CLOSE_END\n");
-	vha->active_mmu_ctx = VHA_INVALID_ID;
+
+	/* Used for simulating system level suspend/resume functionality */
+	if (list_empty(&vha->sessions) && vha->suspend_interval_msec) {
+		mutex_unlock(&vha->lock);
+		flush_scheduled_work();
+		cancel_delayed_work_sync(&vha->suspend_dwork);
+		mutex_lock(&vha->lock);
+	}
+
 	mutex_unlock(&vha->lock);
 
 	/* Reschedule once the session is removed. */
@@ -901,7 +970,7 @@ static int vha_alloc_common(struct vha_dev *vha)
 static ssize_t
 BVNC_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	struct vha_core_props *props = &vha->core_props;
 
 	return snprintf(buf, 4*6, "%hu.%hu.%hu.%hu\n",
@@ -923,23 +992,25 @@ static const struct attribute_group vha_attr_group = {
 	.attrs  = vha_sysfs_entries,
 };
 
-static void vha_sched_apm(struct vha_dev *vha, uint32_t delay_ms)
+void vha_sched_apm(struct vha_dev *vha, struct vha_apm_work *apm_work)
 {
-	unsigned long work_at = jiffies + msecs_to_jiffies(delay_ms);
+	unsigned long work_at = jiffies + msecs_to_jiffies(apm_work->delay_ms);
 	int ret;
 
-	dev_dbg(vha->dev, "%s: %d\n", __func__, pm_delay);
+	dev_dbg(vha->dev, "%s: core_mask:%#x delay:%d\n",
+			__func__, apm_work->core_mask, apm_work->delay_ms);
+
 	/*
 	 * Try to queue the work.
 	 */
-	ret = schedule_delayed_work(&vha->apm_dwork,
+	ret = schedule_delayed_work(&apm_work->dwork,
 								work_at - jiffies);
-	if (ret) {
+	if (!ret) {
 		/* Work is already in the queue
 		 * Canceling & rescheduling might be problematic,
-		 * so just modify it
+		 * so just modify to postpone.
 		 */
-		ret = mod_delayed_work(system_wq, &vha->apm_dwork,
+		ret = mod_delayed_work(system_wq, &apm_work->dwork,
 								work_at - jiffies);
 		if (!ret) {
 			dev_err(vha->dev, "%s: failed to modify work!\n",
@@ -951,11 +1022,14 @@ static void vha_sched_apm(struct vha_dev *vha, uint32_t delay_ms)
 
 static void vha_apm_worker(struct work_struct *work)
 {
-	struct vha_dev *vha = container_of(work, struct vha_dev, apm_dwork.work);
+	struct vha_apm_work *apm_work =
+			container_of(work, struct vha_apm_work, dwork.work);
+	struct vha_dev *vha = apm_work->vha;
 
 	mutex_lock(&vha->lock);
-	dev_dbg(vha->dev, "%s: apm expired\n", __func__);
-	vha_try_stop(vha);
+	dev_dbg(vha->dev, "%s: apm expired! core_mask:%#x\n",
+		__func__, apm_work->core_mask);
+	vha_dev_apm_stop(vha, apm_work);
 	mutex_unlock(&vha->lock);
 }
 
@@ -963,40 +1037,86 @@ int vha_add_dev(struct device *dev,
 		const struct heap_config heap_configs[], const int heaps,
 		void *plat_data, void __iomem *reg_base, uint32_t reg_size)
 {
+	struct vha_dev_common* vha_common;
 	struct vha_dev *vha;
 	int ret;
+	int id;
 
 #ifdef CONFIG_FAULT_INJECTION
 	current->make_it_fail = fault_inject;
 #endif
 
-	vha = devm_kzalloc(dev, sizeof(struct vha_dev), GFP_KERNEL);
-	if (!vha)
+	/* Validate module params. */
+	ret = -EINVAL;
+	if (low_latency > VHA_LL_SELF_KICK) {
+		dev_err(dev, "%s: Unsupported low latency mode %u!\n", __func__, low_latency);
+		goto out_validate_params;
+	} else if ((mmu_mode != VHA_MMU_DISABLED) &&
+			(mmu_mode != VHA_MMU_DIRECT) &&
+			(mmu_mode != VHA_MMU_40BIT)) {
+		dev_err(dev, "%s: Unsupported MMU mode %u!\n", __func__, mmu_mode);
+		goto out_validate_params;
+	} else if (mmu_ctx_default >= VHA_MMU_MAX_HW_CTXS) {
+		dev_err(dev, "%s: Unsupported MMU context id %u!\n", __func__, mmu_ctx_default);
+		goto out_validate_params;
+	} else if (mmu_page_size > ARRAY_SIZE(mmu_page_size_kb_lut)) {
+		dev_err(dev, "%s: Unsupported MMU page size %u!\n", __func__, mmu_page_size);
+		goto out_validate_params;
+	}
+	ret = 0;
+
+	vha_common = devm_kzalloc(dev, sizeof(struct vha_dev_common), GFP_KERNEL);
+	if (!vha_common)
 		return -ENOMEM;
 
-	dev_dbg(dev, "%s: allocated vha_dev @ %p\n", __func__, vha);
-	vha->dev          = dev;
-	vha->reg_base     = reg_base;
-	vha->reg_size     = reg_size;
-	vha->plat_data    = plat_data;
-	vha->fault_inject = fault_inject;
-	vha->hw_bypass    = hw_bypass;
-	vha->low_latency  = low_latency;
-	vha->mmu_mode     = mmu_mode;
-	vha->mmu_ctx_default = mmu_ctx_default;
-	vha->mmu_page_size = mmu_page_size;
+	vha = devm_kzalloc(dev, sizeof(struct vha_dev), GFP_KERNEL);
+	if (!vha) {
+		ret = -ENOMEM;
+		goto out_free_dev;
+	}
+
+	vha_common->vha_dev = vha;
+
+	dev_dbg(dev, "%s: allocated vha_dev @ %px\n", __func__, vha);
+	vha->dev                   = dev;
+	vha->reg_base              = reg_base;
+	vha->reg_size              = reg_size;
+	vha->plat_data             = plat_data;
+	vha->fault_inject          = fault_inject;
+	vha->suspend_interval_msec = suspend_interval_msec;
+	vha->hw_bypass             = hw_bypass;
+	vha->low_latency           = low_latency;
+	vha->no_clock_disable      = no_clock_disable;
+	vha->pm_delay              = pm_delay;
+	vha->mmu_mode              = mmu_mode;
+	vha->mmu_ctx_default       = mmu_ctx_default;
+	vha->mmu_page_size         = mmu_page_size;
+	vha->mmu_base_pf_test      = test_mmu_base_pf;
+	vha->mmu_no_map_count      = test_mmu_no_map_count;
+	vha->ocm_paddr             = onchipmem_phys_start;
 #ifdef VHA_SCF
-	vha->parity_disable  = parity_disable;
+	vha->parity_disable        = parity_disable;
+	vha->confirm_config_reg    = confirm_config_reg;
 #endif
-	vha->active_mmu_ctx = VHA_INVALID_ID;
+	vha->cnn_combined_crc_enable = cnn_combined_crc_enable;
+	vha->active_mmu_ctx        = VHA_INVALID_ID;
 
 	/* Read HW properties */
 	ret = vha_dev_get_props(vha, onchipmem_size);
 	if (ret) {
-		dev_err(dev, "%s: could not get vha properties at %p\n",
+		dev_err(dev, "%s: could not get vha properties at %px\n",
 			__func__, (__force void *)vha->reg_base);
 		goto out_free_dev;
 	}
+
+	if (test_without_bvnc_check)
+		vha->core_props.skip_bvnc_check = true;
+
+	mutex_init(&vha->lock);
+	spin_lock_init(&vha->irq_lock);
+	INIT_LIST_HEAD(&vha->sessions);
+	INIT_LIST_HEAD(&vha->sched_sessions);
+	INIT_LIST_HEAD(&vha->heaps);
 
 	ret = vha_init(vha, heap_configs, heaps);
 	if (ret) {
@@ -1005,13 +1125,6 @@ int vha_add_dev(struct device *dev,
 		goto out_free_dev;
 	}
 
-	vha->int_heap_id = drv.internal_heap_id;
-
-	mutex_init(&vha->lock);
-	spin_lock_init(&vha->irq_lock);
-	INIT_LIST_HEAD(&vha->sessions);
-	INIT_LIST_HEAD(&vha->sched_sessions);
-
 	/* Initialise command data pump worker */
 	INIT_WORK(&vha->worker, cmd_worker);
 
@@ -1019,12 +1132,11 @@ int vha_add_dev(struct device *dev,
 	/* Initialise hw processing time simulation worker */
 #ifdef CONFIG_HW_MULTICORE
 	{
-		uint32_t i;
-		for (i = 0; i < vha->core_props.num_cnn_core_devs; i ++) {
-			INIT_DELAYED_WORK(&vha->dummy_dworks[i].dummy_dwork,
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id ++) {
+			INIT_DELAYED_WORK(&vha->dummy_dworks[id].dummy_dwork,
 								vha_dummy_worker);
-			vha->dummy_dworks[i].wm_id = i;
-			vha->dummy_dworks[i].vha = vha;
+			vha->dummy_dworks[id].wm_id = id;
+			vha->dummy_dworks[id].vha = vha;
 		}
 	}
 #else
@@ -1032,7 +1144,7 @@ int vha_add_dev(struct device *dev,
 #endif
 #endif
 
-	dev_set_drvdata(dev, vha);
+	dev_set_drvdata(dev, vha_common);
 
 	ret = vha_api_add_dev(dev, vha, drv.num_devs);
 	if (ret) {
@@ -1041,7 +1153,11 @@ int vha_add_dev(struct device *dev,
 	}
 
 	vha_dbg_init(vha);
-	vha_pdump_init(vha);
+	ret = vha_pdump_init(vha, &vha_common->pdump);
+	if (ret == -EPERM)
+		goto out_alloc_common;
+	else
+		ret = 0;
 
 	ret = vha_alloc_common(vha);
 	if (ret) {
@@ -1079,20 +1195,26 @@ int vha_add_dev(struct device *dev,
 #  endif
 #endif
 
-	INIT_DELAYED_WORK(&vha->apm_dwork, vha_apm_worker);
-#ifdef VHA_DEVFREQ
-	ret = vha_devfreq_init(vha);
-#endif
+	for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+		vha->apm_dworks[id].vha = vha;
+		INIT_DELAYED_WORK(&vha->apm_dworks[id].dwork, vha_apm_worker);
+	}
 
+#ifdef VHA_DEVFREQ
+	vha_devfreq_init(vha);
+#endif
 
 	return ret;
 out_alloc_common:
 	vha_api_rm_dev(dev, vha);
+	vha_dbg_deinit(vha);
 out_add_dev:
 	dev_set_drvdata(dev, NULL);
 	vha_deinit();
 out_free_dev:
 	devm_kfree(dev, vha);
+	devm_kfree(dev, vha_common);
+out_validate_params:
 	return ret;
 }
 
@@ -1106,8 +1228,14 @@ static void vha_free_common(struct vha_dev *vha)
 
 void vha_rm_dev(struct device *dev)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	struct vha_dev *vha;
+	struct vha_dev_common* vha_common;
 	int ret;
+	int id;
+
+	vha_common = dev_get_drvdata(dev);
+	BUG_ON(vha_common == NULL);
+	vha = vha_common->vha_dev;
 
 	if (!vha) {
 		pr_err("%s: vha ptr is invalid!\n", __func__);
@@ -1120,22 +1248,32 @@ void vha_rm_dev(struct device *dev)
 	}
 
 	flush_scheduled_work();
-	cancel_delayed_work_sync(&vha->apm_dwork);
+
+	for (id = 0; id < vha->core_props.num_cnn_core_devs; id++)
+		cancel_delayed_work_sync(&vha->apm_dworks[id].dwork);
+
 #ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
 #ifdef CONFIG_HW_MULTICORE
 	{
-		uint32_t i;
-		for (i = 0; i < vha->core_props.num_cnn_core_devs; i++)
-			cancel_delayed_work_sync(&vha->dummy_dworks[i].dummy_dwork);
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++)
+			cancel_delayed_work_sync(&vha->dummy_dworks[id].dummy_dwork);
 	}
 #else
 	cancel_delayed_work_sync(&vha->dummy_dwork);
 #endif
 #endif
 #ifdef VHA_DEVFREQ
-	npu_cooling_device_unregister();
+	vha_devfreq_term(vha);
 #endif
 	vha_free_common(vha);
+
+	while (!list_empty(&vha->heaps)) {
+		struct vha_heap *heap = list_first_entry(&vha->heaps, struct vha_heap, list);
+		list_del(&heap->list);
+		if(!heap->global) /* remove only device heaps */
+			img_mem_del_heap(heap->id);
+		kfree(heap);
+	}
 
 	ret = vha_api_rm_dev(dev, vha);
 	if (ret)
@@ -1144,23 +1282,26 @@ void vha_rm_dev(struct device *dev)
 	list_del(&vha->sessions);
 	list_del(&vha->sched_sessions);
 	list_del(&vha->list);
+	list_del(&vha->heaps);
 	BUG_ON(!drv.num_devs--);
 	sysfs_remove_group(&dev->kobj, &vha_attr_group);
 
 	vha_dbg_deinit(vha);
-
+	vha_pdump_deinit(&vha_common->pdump);
 	dev_set_drvdata(dev, NULL);
 
 	devm_kfree(dev, vha);
+	devm_kfree(dev, vha_common);
 }
 
 /* performs device self test operations */
-void vha_dev_calibrate(struct device *dev, uint32_t cycles)
+int vha_dev_calibrate(struct device *dev, uint32_t cycles)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	int ret = 0;
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	if (!vha) {
 		WARN_ON(1);
-		return;
+		return -EFAULT;
 	}
 
 	mutex_lock(&vha->lock);
@@ -1168,12 +1309,16 @@ void vha_dev_calibrate(struct device *dev, uint32_t cycles)
 		vha->calibration_cycles = cycles;
 		dev_info(dev, "%s: Starting core frequency measurement (%d)...",
 				__func__, cycles);
-		vha_dev_start(vha);
+		ret = vha_dev_start(vha);
+		if (ret)
+			goto calib_err;
 #if (defined(HW_AX2) || defined(CONFIG_HW_MULTICORE))
 		vha_cnn_start_calib(vha);
 #endif
 	}
+calib_err:
 	mutex_unlock(&vha->lock);
+	return ret;
 }
 
 /* map buffer into the device */
@@ -1293,7 +1438,7 @@ int vha_map_buffer(struct vha_session *session,
 	/* Note: VHA_MAP_FLAG_WRITE_ONLY is not supported by the mmuv3 hw */
 
 	/* Direct 1:1 mappings */
-	if (vha->mmu_mode == 1) {
+	if (vha->mmu_mode == VHA_MMU_DIRECT) {
 		uint64_t *phys = img_mem_get_page_array(session->mem_ctx,
 						buf_id);
 		WARN_ON(!phys);
@@ -1328,7 +1473,7 @@ int vha_map_buffer(struct vha_session *session,
 #endif
 
 	/* force MMU fault after N buffer map operations */
-	if (test_mmu_no_map_count != 0) {
+	if (vha->mmu_no_map_count != 0) {
 		int ctx_id;
 		if (map_flags & VHA_MAP_FLAG_MODEL) {
 			ctx_id = VHA_MMU_REQ_MODEL_CTXID;
@@ -1347,11 +1492,11 @@ int vha_map_buffer(struct vha_session *session,
 			dev_err(vha->dev, "%s: map failed!\n", __func__);
 			goto out_unlock;
 		}
-		if (test_mmu_no_map_count >= 0)
-			--test_mmu_no_map_count;
+		if (vha->mmu_no_map_count >= 0)
+			--vha->mmu_no_map_count;
 	} else
 		dev_info(vha->dev, "Bringup test: MMU no map count = %d\n",
-			test_mmu_no_map_count);
+			vha->mmu_no_map_count);
 
 	buf->devvirt = virt_addr;
 	dev_dbg(vha->dev, "%s: mapped buf %s (%u) to %#llx, flags: 0x%x\n",
@@ -1420,11 +1565,11 @@ uint64_t vha_buf_addr(struct vha_session *session, struct vha_buffer *buf)
 {
 	struct vha_dev *vha = session->vha;
 
-	if (vha->mmu_mode == 0) {
+	if (vha->mmu_mode == VHA_MMU_DISABLED) {
 		uint64_t *phys;
 
 		/* no-MMU mode */
-		if (vha->reg_base == NULL)
+		if (vha->core_props.dummy_dev)
 			return 0; /* no-MMU: dummy hardware */
 
 		phys = img_mem_get_page_array(session->mem_ctx, buf->id);
@@ -1498,7 +1643,8 @@ int vha_add_buf(struct vha_session *session,
 #endif
 	list_add(&buf->list, &session->bufs);
 	INIT_LIST_HEAD(&buf->onchip_maps);
-	img_pdump_printf("-- <-- New buffer name: %s\n", buf->name);
+	if (!(attr & IMG_MEM_ATTR_OCM))
+		img_pdump_printf("-- <-- New buffer name: %s\n", buf->name);
 
 	if (zero_buffers && !(buf->attr & IMG_MEM_ATTR_NOMAP)) {
 		ret = img_mem_map_km(session->mem_ctx, buf_id);
@@ -1593,9 +1739,10 @@ static bool vha_is_waiting_on_input_buffs(struct vha_session *session,
 
 
 /* process the cmd if everything is ready */
-static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
+enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 {
 	struct vha_session *session = cmd->session;
+	struct vha_dev* vha = session->vha;
 	enum do_cmd_status cmd_status = CMD_OK;
 	/* already submitted, wait until processed */
 	if (cmd->in_hw)
@@ -1605,7 +1752,7 @@ static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 	if (vha_is_waiting_on_input_buffs(session, cmd))
 		return CMD_WAIT_INBUFS;
 
-#ifndef CONFIG_VHA_DUMMY
+#if !defined(CONFIG_VHA_DUMMY) && !defined(CONFIG_HW_MULTICORE)
 	if (!session->vha->is_ready)
 		return CMD_HW_BUSY;
 #endif
@@ -1626,6 +1773,8 @@ static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 
 	/* at this point we should be able to process the cmd */
 	cmd_status = vha_do_cnn_cmd(cmd);
+	if (cmd_status != 0)
+		return CMD_DONE;
 
 	return cmd_status;
 }
@@ -1634,166 +1783,19 @@ static enum do_cmd_status vha_do_cmd(struct vha_cmd *cmd)
 static void cmd_worker(struct work_struct *work)
 {
 	struct vha_dev *vha = container_of(work, struct vha_dev, worker);
-	struct vha_cmd *cmd, *tmp;
-	struct vha_session *session, *wait_session = NULL;
-	bool queued, in_hw;
-	bool retry = false;
-	bool retrying = false;
-	enum do_cmd_status cmd_status = CMD_OK;
 
 	dev_dbg(vha->dev, "%s\n", __func__);
 	mutex_lock(&vha->lock);
 
 	if (vha->do_calibration) {
 		/* Postpone any worker tasks. */
-		dev_dbg(vha->dev, "%s Postpone worker task!\n", __func__);
+		dev_dbg(vha->dev, "%s: Postpone worker task!\n", __func__);
 		goto exit;
 	}
 
-#ifdef CONFIG_HW_MULTICORE
-	if (vha_dev_schedule_cmd(vha, NULL) != 0) {
-		/* Postpone worker task if nothing can be scheduled. */
-		dev_dbg(vha->dev, "%s Nothing can be scheduled at the moment. "
-				"Postpone worker task!\n", __func__);
-		goto exit;
-	}
-#else
-	if (vha_is_queue_full(vha, NULL)) {
-		/* Postpone worker task if command queue is full. */
-		dev_dbg(vha->dev, "%s Queue full. Postpone worker task!\n", __func__);
-		goto exit;
-	}
-#endif
+	/* Execute the main scheduling loop. */
+	vha_scheduler_loop(vha);
 
-	do {
-		list_for_each_entry(session, &vha->sched_sessions, sched_list) {
-			list_for_each_entry_safe(cmd, tmp, &session->cmds, list) {
-
-				/* Reset previous state. */
-				queued = false;
-				in_hw = false;
-				/* For hw commands... */
-				if (CMD_EXEC_ON_HW(cmd)) {
-					if (!VHA_IS_DUMMY(vha)) {
-						/* Start device. */
-						vha_dev_start(vha);
-					}
-					/* Store previous state. */
-					queued = cmd->queued;
-					in_hw = cmd->in_hw;
-				}
-
-				/* Attempt to schedule command for execution. */
-				cmd_status = vha_do_cmd(cmd);
-				if (cmd_status == CMD_NOTIFIED) {
-					continue;
-				}
-
-				/* For hw commands... */
-				if (CMD_EXEC_ON_HW(cmd)) {
-					/* For low latency processing... */
-					if (vha->low_latency != VHA_LL_DISABLED) {
-						if (cmd->in_hw) {
-							if (!retrying) {
-								/* Set for retrying in case nothing will be queued
-								 * in this round */
-								retry = true;
-							} else {
-								/* Retry only once. */
-								retry = false;
-								/* It's a retry round, so nothing was queued in the previous
-								 * one. Check the command following the one in the hardware
-								 * for this session then. */
-								continue;
-							}
-							/* If command is already in hw, go to next session. */
-							break;
-						}
-						if (!cmd->inbufs_ready) {
-							/* If command is waiting for input buffers, set this session
-							 * as a starting point for next scheduling round. */
-							if (wait_session == NULL)
-								wait_session = session;
-							/* Go to the next session. */
-							break;
-						}
-						if (cmd->queued != queued) {
-							/* If command has just been queued, set following session
-							 * as a starting point for the next scheduling round. */
-							if (wait_session == NULL) {
-								wait_session = list_next_entry(session, sched_list);
-								if (&wait_session->sched_list == &vha->sched_sessions)
-									wait_session = list_first_entry(&vha->sched_sessions,
-																									struct vha_session,
-																									sched_list);
-							}
-							/* Quit this scheduling round as there's no room for more
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-						if (cmd->queued == queued && cmd->in_hw == in_hw) {
-							/* If command has neither been scheduled for execution nor queued,
-							 * quit this scheduling round as there's no room for
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-					} else {
-						/* For non low latency processing... */
-						if (cmd->in_hw) {
-							/* If command is already in hw, set following session
-							 * as a starting point for the next scheduling round. */
-							if (wait_session == NULL) {
-								wait_session = list_next_entry(session, sched_list);
-								if (&wait_session->sched_list == &vha->sched_sessions)
-									wait_session = list_first_entry(&vha->sched_sessions,
-																									struct vha_session,
-																									sched_list);
-							}
-							/* Quit this scheduling round as there's no room for more
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-						if (!cmd->inbufs_ready) {
-							/* If command is waiting for input buffers, set this session
-							 * as a starting point for next scheduling round. */
-							if (wait_session == NULL)
-								wait_session = session;
-							/* Go to the next session. */
-							break;
-						}
-						if (cmd->in_hw == in_hw) {
-							/* If command has not been scheduled for execution,
-							 * quit this scheduling round as there's no room for
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-					}
-				}
-			}
-		}
-		retrying = true;
-	} while (retry);
-
-	if (!VHA_IS_DUMMY(vha)) {
-		/* Schedule APM if needed */
-		if (!vha_is_busy(vha) &&
-				!no_clock_disable) {
-			if (!pm_delay)
-				vha_dev_stop(vha, false);
-			else
-				vha_sched_apm(vha, pm_delay);
-		}
-	}
-skip_cmds:
-
-	/* Set a starting point session for next scheduling round. */
-	if (wait_session != NULL)
-		session = wait_session;
-	if (session != list_entry(&vha->sched_sessions, struct vha_session,
-														sched_list))
-		while(list_first_entry(&vha->sched_sessions, struct vha_session,
-													sched_list) != session)
-			list_rotate_left(&vha->sched_sessions);
 exit:
 	mutex_unlock(&vha->lock);
 }
@@ -1915,6 +1917,13 @@ int vha_set_buf_status(struct vha_session *session,
 			buf->status = status;
 		}
 #endif
+	}
+
+	/* If buffer has been filled by SW,
+	 * after being filled by the hw, flush it too */
+	if (buf->status == VHA_BUF_FILLED_BY_HW &&
+			status == VHA_BUF_FILLED_BY_SW) {
+		buf->flush = true;
 	}
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
@@ -2296,8 +2305,7 @@ int vha_add_cmd(struct vha_session *session, struct vha_cmd *cmd)
 	/* number of words in vha_user_cmd->data[0] */
 	uint32_t num_params = (cmd->size - sizeof(struct vha_user_cmd))/sizeof(uint32_t);
 
-	if (user_cmd->num_inbufs > user_cmd->num_bufs
-		|| user_cmd->num_bufs > num_params * sizeof(uint32_t)) {
+	if (user_cmd->num_bufs > num_params * sizeof(uint32_t)) {
 		dev_err(dev, "%s: invalid number of buffers in message: in:%x total:%x>%lx\n",
 			__func__, user_cmd->num_inbufs, user_cmd->num_bufs,
 			num_params * sizeof(uint32_t));
@@ -2310,35 +2318,70 @@ int vha_add_cmd(struct vha_session *session, struct vha_cmd *cmd)
 		return -EINVAL;
 	}
 
-	/* check input and output buffers are valid */
-	for (i = 0; i < user_cmd->num_bufs; i++) {
-		uint32_t buf_id = user_cmd->data[i];
-
-		if (vha_find_bufid(session, buf_id) == NULL) {
-			dev_err(dev, "%s: unrecognised buf id[%u]:%x\n",
-				__func__, i, buf_id);
-			return -EINVAL;
-		}
-	}
-
 	switch(cmd->user_cmd.cmd_type) {
-	case VHA_CMD_CNN_SUBMIT:
-		/* send out a event notifications when submit is enqueued */
-		if (vha_observers.enqueued)
-			vha_observers.enqueued(session->vha->id,
-						cmd->user_cmd.cmd_id);
-		break;
-	case VHA_CMD_CNN_PDUMP_MSG:
-		if (!img_pdump_enabled()) {
-			kfree(cmd);
-			/* Silently ignore this pdump message */
-			return 0;
+		case VHA_CMD_CNN_SUBMIT:
+			/* check input and output buffers are valid */
+			for (i = 0; i < user_cmd->num_bufs; i++) {
+				uint32_t buf_id = user_cmd->data[i];
+
+				if (vha_find_bufid(session, buf_id) == NULL) {
+					dev_err(dev, "%s: unrecognised buf id[%u]:%x\n",
+						__func__, i, buf_id);
+					return -EINVAL;
+				}
+			}
+			/* send out a event notifications when submit is enqueued */
+			if (vha_observers.enqueued)
+				vha_observers.enqueued(session->vha->id,
+							cmd->user_cmd.cmd_id);
+			break;
+		case VHA_CMD_CNN_SUBMIT_MULTI:
+		{
+			uint32_t num_cmd_bufs = 0;
+
+			/* check if command stream buffers are valid */
+			for (i = 0; i < VHA_MAX_CORES; i++) {
+				uint32_t buf_id = user_cmd->data[i];
+
+				if (buf_id == 0)
+					break;
+				if (vha_find_bufid(session, buf_id) == NULL) {
+					dev_err(dev, "%s: unrecognised cmdstr buf id[%u]:%x\n",
+						__func__, i, buf_id);
+					return -EINVAL;
+				}
+				num_cmd_bufs++;
+			}
+			/* check input and output buffers are valid */
+			for (i = VHA_MAX_CORES; i < (user_cmd->num_bufs - 1); i++) {
+				uint32_t buf_id = user_cmd->data[i];
+
+				if (vha_find_bufid(session, buf_id) == NULL) {
+					dev_err(dev, "%s: unrecognised buf id[%u]:%x\n",
+						__func__, i, buf_id);
+					return -EINVAL;
+				}
+			}
+			/* send out a event notifications when submit is enqueued */
+			if (vha_observers.enqueued)
+				vha_observers.enqueued(session->vha->id,
+							cmd->user_cmd.cmd_id);
+			break;
+		}
+		case VHA_CMD_CNN_PDUMP_MSG:
+		{
+			struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(dev);
+			if (!img_pdump_enabled(pdump)) {
+				kfree(cmd);
+				/* Silently ignore this pdump message */
+				return 0;
+			}
 		}
 	}
 	/* add the command to the pending list */
 	list_add_tail(&cmd->list, &session->cmds);
 	dev_dbg(session->vha->dev,
-			"%s: %p session:%p\n", __func__, cmd, session);
+			"%s: cmd id: 0x%08x/%u\n", __func__, cmd->user_cmd.cmd_id, session->id);
 
 	/* We are already locked!
 	 * Run in separate thread
@@ -2356,7 +2399,7 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 	struct vha_rsp *cur_rsp, *tmp_rsp;
 	bool reschedule = false;
 	bool respond = false;
-
+	int ret = 0;
 	mutex_lock(&vha->lock);
 
 	/* Remove pend/queued session commands that match the cmd_id. */
@@ -2367,6 +2410,9 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 		if ((cur_cmd->user_cmd.cmd_id & cmd_id_mask) == cmd_id) {
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
+			switch (cur_cmd->user_cmd.cmd_type)
+			{
+			case VHA_CMD_CNN_SUBMIT:
 			{
 				struct vha_user_cnn_submit_cmd *cnn_cmd =
 						(struct vha_user_cnn_submit_cmd *)&cur_cmd->user_cmd;
@@ -2380,6 +2426,30 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 						_vha_rm_buf_fence(session, buf);
 					}
 				}
+				break;
+			}
+#ifdef CONFIG_HW_MULTICORE
+			case VHA_CMD_CNN_SUBMIT_MULTI:
+			{
+				struct vha_user_cnn_submit_multi_cmd *cnn_cmd =
+						(struct vha_user_cnn_submit_multi_cmd *)&cur_cmd->user_cmd;
+				int j;
+				for (j = 0; j < (cnn_cmd->msg.num_bufs - cnn_cmd->num_cores); j++) {
+					struct vha_buffer *buf = vha_find_bufid(session, cnn_cmd->bufs[j]);
+					if (buf == NULL) {
+						dev_warn(vha->dev, "%s: could not find buf %x\n", __func__,
+										cnn_cmd->bufs[j]);
+					} else {
+						_vha_rm_buf_fence(session, buf);
+					}
+				}
+				break;
+			}
+#endif
+			default:
+				dev_warn(vha->dev, "%s: invalid cmd type %x\n", __func__,
+							cur_cmd->user_cmd.cmd_type);
+				break;
 			}
 #endif
 
@@ -2407,7 +2477,7 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 
 	/* Reset hardware if required. */
 	if (reschedule)
-		vha_dev_stop(vha, reschedule);
+		ret = vha_dev_stop(vha, reschedule);
 
 	/* Generate "cancel" response if any commands matching command id template
 	 * were removed. */
@@ -2420,7 +2490,7 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 		struct vha_rsp *rsp = kzalloc(sz, GFP_KERNEL);
 		if (rsp == NULL) {
 			dev_crit(session->vha->dev,
-					"Failed to allocate memory to notify cancel for cmds %x\n", cmd_id);
+					"Failed to allocate memory to notify cancel for cmds 0x%08x\n", cmd_id);
 			session->oom = true;
 		} else {
 			rsp->size = sizeof(struct vha_user_cnn_submit_rsp);
@@ -2440,29 +2510,29 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 	if (reschedule)
 		vha_chk_cmd_queues(vha, true);
 
-	return 0;
+	return ret;
 }
 
 int vha_suspend_dev(struct device *dev)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	bool processing = false;
-
+	int ret;
 	mutex_lock(&vha->lock);
 	dev_dbg(dev, "%s: taking a nap!\n", __func__);
 
 	processing = vha_rollback_cmds(vha);
 	/* Forcing hardware disable */
-	vha_dev_stop(vha, processing);
+	ret = vha_dev_stop(vha, processing);
 
 	mutex_unlock(&vha->lock);
 
-	return 0;
+	return ret;
 }
 
 int vha_resume_dev(struct device *dev)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 
 	mutex_lock(&vha->lock);
 	dev_dbg(dev, "%s: waking up!\n", __func__);
@@ -2499,7 +2569,7 @@ EXPORT_SYMBOL(vha_observe_event_submit);
 
 void vha_observe_event_complete(void (*func)(uint32_t devid,
 							uint32_t cmdid,
-							int status,
+							uint64_t status,
 							uint64_t cycles,
 							uint64_t mem_usage))
 {
@@ -2510,7 +2580,9 @@ void vha_observe_event_complete(void (*func)(uint32_t devid,
 }
 EXPORT_SYMBOL(vha_observe_event_complete);
 
-void vha_observe_event_error(void (*func)(uint32_t devid, uint32_t cmdid, uint64_t status))
+void vha_observe_event_error(void (*func)(uint32_t devid,
+							uint32_t cmdid,
+							uint64_t status))
 {
 	if (func && vha_observers.error)
 		pr_warn("%s: vha_observer for ERROR events is already set to '%pf'\n",

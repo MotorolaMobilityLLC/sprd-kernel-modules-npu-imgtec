@@ -41,6 +41,8 @@
 
 #include <linux/delay.h>
 #include <linux/irq.h>
+#include <linux/moduleparam.h>
+#include <linux/pm_runtime.h>
 
 #include <uapi/vha.h>
 #include "vha_common.h"
@@ -53,13 +55,10 @@
 
 #define ERR_EVENT_DESC(b) VHA_CR_OS(VHA_EVENT_STATUS_VHA_##b##_EN), __stringify(b)
 
-void vha_dev_flush(struct vha_dev *vha)
+static void vha_dev_disable_events(struct vha_dev *vha)
 {
-	/* Nothing to be done */
-}
-
-void vha_dev_disable_events(struct vha_dev *vha)
-{
+	img_pdump_printf("-- Clear CNN events\n");
+	IOWRITE64_PDUMP(VHA_EVNTS_DEFAULT, VHA_CR_OS(VHA_EVENT_CLEAR));
 	img_pdump_printf("-- Disable CNN events\n");
 	IOWRITE64_PDUMP(0, VHA_CR_OS(VHA_EVENT_ENABLE));
 	/* Clear the START bit !
@@ -74,7 +73,29 @@ void vha_dev_disable_events(struct vha_dev *vha)
 	IOWRITE64_PDUMP(0, VHA_CR_OS(VHA_EVENT_ENABLE));
 }
 
-void vha_dev_ready(struct vha_dev *vha)
+__maybe_unused
+static void vha_dev_enable_clocks(struct vha_dev *vha)
+{
+	uint64_t __maybe_unused sys_clks = 0;
+	uint64_t __maybe_unused main_clks = 0;
+
+	/* Always AUTO gating  when needed */
+	sys_clks = VHA_SYS_CLOCKS_DEFAULT(AUTO);
+	main_clks = VHA_MAIN_CLOCKS_DEFAULT(AUTO);
+	/* Enable sys clocks ! */
+	img_pdump_printf("-- Enable SYS clocks\n");
+	IOWRITE64_PDUMP(sys_clks, VHA_CR_SYS_CLK_CTRL0);
+	/* Enable main clocks ! */
+	img_pdump_printf("-- Enable MAIN clocks\n");
+	IOWRITE64_PDUMP(main_clks, VHA_CR_CLK_CTRL0);
+#if defined(CFG_SYS_VAGUS)
+	img_pdump_printf("-- Enable NN_SYS clocks\n");
+	IOWRITE64_PDUMP_REGIO(NN_SYS_CR_CLK_CTRL_MODE_AUTO,
+			NN_SYS_CR_BASE, NN_SYS_CR_CLK_CTRL, "REG_NNSYS");
+#endif
+}
+
+static void vha_dev_ready(struct vha_dev *vha)
 {
 #ifndef CONFIG_VHA_DUMMY
 	if (!vha->is_ready)
@@ -101,7 +122,8 @@ void vha_dev_ready(struct vha_dev *vha)
 	IOWRITE64_PDUMP(0, VHA_CR_PERF_RESET_FULL);
 }
 
-void vha_dev_reset(struct vha_dev *vha)
+__maybe_unused
+static int vha_dev_reset(struct vha_dev *vha)
 {
 	img_pdump_printf("-- Set RESET bits\n");
 #if defined(CFG_SYS_VAGUS)
@@ -121,31 +143,11 @@ void vha_dev_reset(struct vha_dev *vha)
 #endif
 	IOPOLL64_PDUMP(0, 16, 256, VHA_CR_RESET_CTRL_MASKFULL,
 					VHA_CR_RESET_CTRL);
+	return 0;
 }
 
-void vha_dev_enable_clocks(struct vha_dev *vha)
-{
-	uint64_t __maybe_unused sys_clks = 0;
-	uint64_t __maybe_unused main_clks = 0;
-
-	/* Always AUTO gating  when needed */
-	sys_clks = VHA_SYS_CLOCKS_DEFAULT(AUTO);
-	main_clks = VHA_MAIN_CLOCKS_DEFAULT(AUTO);
-	/* Enable sys clocks ! */
-	img_pdump_printf("-- Enable SYS clocks\n");
-	IOWRITE64_PDUMP(sys_clks, VHA_CR_SYS_CLK_CTRL0);
-	/* Enable main clocks ! */
-	img_pdump_printf("-- Enable MAIN clocks\n");
-	IOWRITE64_PDUMP(main_clks, VHA_CR_CLK_CTRL0);
-#if defined(CFG_SYS_VAGUS)
-	img_pdump_printf("-- Enable NN_SYS clocks\n");
-	IOWRITE64_PDUMP_REGIO(NN_SYS_CR_CLK_CTRL_MODE_AUTO,
-			NN_SYS_CR_BASE, NN_SYS_CR_CLK_CTRL, "REG_NNSYS");
-#endif
-}
-
-/* stop the device */
-void vha_dev_disable_clocks(struct vha_dev *vha)
+__maybe_unused
+static int vha_dev_disable_clocks(struct vha_dev *vha)
 {
 	/* If auto gating was turned on, wait for clocks idle state */
 	img_pdump_printf("-- Wait for clocks IDLE state\n");
@@ -171,18 +173,140 @@ void vha_dev_disable_clocks(struct vha_dev *vha)
 	IOWRITE64_PDUMP_REGIO(0, NN_SYS_CR_BASE,
 			NN_SYS_CR_CLK_CTRL, "REG_NNSYS"); /* nn_sys */
 #endif
+	return 0;
+}
+
+/* start the device */
+int vha_dev_start(struct vha_dev *vha)
+{
+	int ret = 0;
+
+	/* Cancel APM request if new inference comes */
+	cancel_delayed_work(&vha->apm_dworks[0].dwork);
+
+	if (vha->state == VHA_STATE_ON)
+		return 0; /* not an error */
+
+	dev_dbg(vha->dev, "%s\n", __func__);
+
+/* Assuming OS0 is the privileged one */
+#if _OSID_ == 0 /* For HW_AX2 this is always true */
+	/////////////// POWER ON //////////////////////////
+	img_pdump_printf("-- POWER_ON_BEGIN\n");
+
+	/* Prepare device ...  */
+	ret = vha_dev_prepare(vha);
+	if (ret) {
+		dev_err(vha->dev, "%s: Error preparing device!\n", __func__);
+		return ret;
+	}
+	/* Reset device */
+	ret = vha_dev_reset(vha);
+	if (ret){
+		dev_err(vha->dev, "%s: Error reseting device!\n", __func__);
+		return ret;
+	}
+	/* Enable device clocks */
+	vha_dev_enable_clocks(vha);
+	img_pdump_printf("-- POWER_ON_END\n");
+	/* Call device specific setup */
+	vha_dev_setup(vha);
+	/////////////////////////////////////////////////////
+#endif
+
+	vha_dev_ready(vha);
+
+	vha->state = VHA_STATE_ON;
+	/* Remember the time hw is powered on */
+	getnstimeofday(&vha->stats.hw_start);
+	return ret;
+}
+
+/* stop the device */
+int vha_dev_stop(struct vha_dev *vha, bool reset)
+{
+	int ret = 0;
+
+	if (vha->state == VHA_STATE_OFF)
+		return 0;  /* not an error */
+
+	/* Cancel APM request if we are about to power off the core */
+	cancel_delayed_work(&vha->apm_dworks[0].dwork);
+
+	dev_dbg(vha->dev, "%s\n", __func__);
+	/* Disable events at first */
+	vha_dev_disable_events(vha);
+
+	vha->is_ready = false;
+/* Assuming OS0 is the privileged one */
+#if _OSID_ == 0 /* For HW_AX2 */
+	/////////////// POWER_OFF //////////////////////////
+	img_pdump_printf("-- POWER_OFF_BEGIN\n");
+	/* Reset core in case of error or pending inference */
+	if (reset)
+		ret = vha_dev_reset(vha);
+	if(ret)
+		dev_warn(vha->dev,
+			"%s: Problem with resetting device!\n",
+			__func__);
+
+	/* Disable device clocks */
+	ret = vha_dev_disable_clocks(vha);
+	if(ret)
+		dev_warn(vha->dev,
+			"%s: Problem with disabling clocks!\n",
+			__func__);
+
+	img_pdump_printf("-- POWER_OFF_END\n");
+#endif
+
+	vha->state = VHA_STATE_OFF;
+	/* Update the up time of the core */
+	if (!vha->do_calibration) {
+		uint64_t tmp = 0;
+		struct timespec now;
+		getnstimeofday(&now);
+		if (get_timespan_us(&vha->stats.hw_start, &now, &tmp)) {
+			do_div(tmp, 1000UL);
+			vha->stats.uptime_ms += tmp;
+			if (vha->stats.uptime_ms)
+				vha_update_utilization(vha);
+			else
+				dev_dbg(vha->dev,
+					"%s Too short execution time to calculate utilization!\n",
+					__func__);
+		} else
+			WARN_ON(1);
+	}
+
+	vha->active_mmu_ctx = VHA_INVALID_ID;
+
+	spin_lock_irq(&vha->irq_lock);
+	vha->irq_status = 0;
+	vha->irq_count = 0;
+	vha->stream_count = 0;
+	spin_unlock_irq(&vha->irq_lock);
+
+	return ret;
+}
+
+void vha_update_utilization(struct vha_dev *vha)
+{
+	uint64_t tmp;
+	tmp = vha->stats.cnn_total_proc_us;
+	do_div(tmp, vha->stats.uptime_ms);
+	vha->stats.cnn_utilization = tmp;
 }
 
 /* Top half */
 irqreturn_t vha_handle_irq(struct device *dev)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	int ret = IRQ_HANDLED;
 	uint64_t event_status;
 #ifdef VHA_DEVFREQ
 	ktime_t now;
 #endif
-
 	if (!vha)
 		return IRQ_NONE;
 
@@ -277,12 +401,15 @@ static bool vha_rollback_cnn_cmds(struct vha_dev *vha)
 		vha->pendcmd[VHA_CNN_CMD].cmd->queued = false;
 		vha->pendcmd[VHA_CNN_CMD].cmd = NULL;
 		processing = true;
+		vha->stats.cnn_kicks_aborted++;
 	}
 	/* low_latency ...*/
 	if (vha->queuedcmd[VHA_CNN_CMD].cmd) {
 		vha->queuedcmd[VHA_CNN_CMD].cmd->in_hw = false;
 		vha->queuedcmd[VHA_CNN_CMD].cmd->queued = false;
 		vha->queuedcmd[VHA_CNN_CMD].cmd = NULL;
+		if (vha->low_latency == VHA_LL_SELF_KICK)
+			vha->stats.cnn_kicks_aborted++;
 	}
 	dev_dbg(vha->dev, "%s: (%d)\n", __func__, processing);
 
@@ -469,7 +596,7 @@ void vha_dummy_worker(struct work_struct *work)
 /* Bottom half */
 irqreturn_t vha_handle_thread_irq(struct device *dev)
 {
-	struct vha_dev *vha = dev_get_drvdata(dev);
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	irqreturn_t ret = IRQ_HANDLED;
 	uint64_t status;
 	uint8_t count, c = 0;
@@ -574,7 +701,7 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 	} while (c < count && !err);
 
 	if (err) {
-		vha->stats.total_failures += count;
+		vha->stats.total_failures += count ? count : 1;
 		vha_dev_stop(vha, true);
 		/* Check queues ... */
 		vha_chk_cmd_queues(vha, true);
@@ -721,18 +848,175 @@ bool vha_is_queue_full(struct vha_dev *vha, struct vha_cmd *cmd)
 	return vha->pendcmd[VHA_CNN_CMD].cmd != NULL;
 }
 
-void vha_try_stop(struct vha_dev *vha)
+void vha_scheduler_loop(struct vha_dev *vha)
+{
+	struct vha_cmd *cmd, *tmp;
+	struct vha_session *session, *wait_session = NULL;
+	bool queued, in_hw;
+	bool retry = false;
+	bool retrying = false;
+	enum do_cmd_status cmd_status = CMD_OK;
+
+	if (vha_is_queue_full(vha, NULL)) {
+		/* Postpone worker task if command queue is full. */
+		dev_dbg(vha->dev, "%s Queue full. Postpone worker task!\n", __func__);
+		return;
+	}
+
+	do {
+		list_for_each_entry(session, &vha->sched_sessions, sched_list) {
+			list_for_each_entry_safe(cmd, tmp, &session->cmds, list) {
+
+				/* Reset previous state. */
+				queued = false;
+				in_hw = false;
+				/* For hw commands... */
+				if (CMD_EXEC_ON_HW(cmd)) {
+					if (!VHA_IS_DUMMY(vha)) {
+						/* Start device. */
+						if(vha_dev_start(vha))
+							return;
+					}
+					/* Store previous state. */
+					queued = cmd->queued;
+					in_hw = cmd->in_hw;
+				}
+
+				/* Attempt to schedule command for execution. */
+				cmd_status = vha_do_cmd(cmd);
+				if (cmd_status == CMD_NOTIFIED) {
+					continue;
+				}
+
+				/* For hw commands... */
+				if (CMD_EXEC_ON_HW(cmd)) {
+					/* For low latency processing... */
+					if (vha->low_latency != VHA_LL_DISABLED) {
+						if (cmd->in_hw) {
+							if (!retrying) {
+								/* Set for retrying in case nothing will be queued
+								 * in this round */
+								retry = true;
+							} else {
+								/* Retry only once. */
+								retry = false;
+								/* It's a retry round, so nothing was queued in the previous
+								 * one. Check the command following the one in the hardware
+								 * for this session then. */
+								continue;
+							}
+							/* If command is already in hw, go to next session. */
+							break;
+						}
+						if (!cmd->inbufs_ready) {
+							/* If command is waiting for input buffers, set this session
+							 * as a starting point for next scheduling round. */
+							if (wait_session == NULL)
+								wait_session = session;
+							/* Go to the next session. */
+							break;
+						}
+						if (cmd->queued != queued) {
+							/* If command has just been queued, set following session
+							 * as a starting point for the next scheduling round. */
+							if (wait_session == NULL) {
+								wait_session = list_next_entry(session, sched_list);
+								if (&wait_session->sched_list == &vha->sched_sessions)
+									wait_session = list_first_entry(&vha->sched_sessions,
+																	struct vha_session,
+																	sched_list);
+							}
+							/* Quit this scheduling round as there's no room for more
+							 * commands to be scheduled. */
+							goto skip_cmds;
+						}
+						if (cmd->queued == queued && cmd->in_hw == in_hw) {
+							/* If command has neither been scheduled for execution nor queued,
+							 * quit this scheduling round as there's no room for
+							 * commands to be scheduled. */
+							goto skip_cmds;
+						}
+					} else {
+						/* For non low latency processing... */
+						if (cmd->in_hw) {
+							/* If command is already in hw, set following session
+							 * as a starting point for the next scheduling round. */
+							if (wait_session == NULL) {
+								wait_session = list_next_entry(session, sched_list);
+								if (&wait_session->sched_list == &vha->sched_sessions)
+									wait_session = list_first_entry(&vha->sched_sessions,
+																	struct vha_session,
+																	sched_list);
+							}
+							/* Quit this scheduling round as there's no room for more
+							 * commands to be scheduled. */
+							goto skip_cmds;
+						}
+						if (!cmd->inbufs_ready) {
+							/* If command is waiting for input buffers, set this session
+							 * as a starting point for next scheduling round. */
+							if (wait_session == NULL)
+								wait_session = session;
+							/* Go to the next session. */
+							break;
+						}
+						if (cmd->in_hw == in_hw) {
+							/* If command has not been scheduled for execution,
+							 * quit this scheduling round as there's no room for
+							 * commands to be scheduled. */
+							goto skip_cmds;
+						}
+					}
+				}
+			}
+		}
+		retrying = true;
+	} while (retry);
+
+	if (!VHA_IS_DUMMY(vha)) {
+		/* Schedule APM if needed */
+		if (!vha_is_busy(vha) &&
+				!vha->no_clock_disable) {
+			if (!vha->pm_delay) {
+				if (vha_dev_stop(vha, false)) {
+					dev_warn(vha->dev, "%s: Failed to soft stop device. trying with reset",
+						__func__);
+					if (vha_dev_stop(vha, true))
+						dev_err(vha->dev, "%s: Failed to stop device with reset!", __func__);
+				}
+			}
+			else
+				vha_sched_apm(vha, &vha->apm_dworks[0]);
+		}
+	}
+
+skip_cmds:
+	/* Set a starting point session for next scheduling round. */
+	if (wait_session != NULL)
+		session = wait_session;
+	if (session != list_entry(&vha->sched_sessions, struct vha_session,
+														sched_list))
+		while(list_first_entry(&vha->sched_sessions, struct vha_session,
+													sched_list) != session)
+			list_rotate_left(&vha->sched_sessions);
+}
+
+void vha_dev_apm_stop(struct vha_dev *vha, struct vha_apm_work *apm_work)
 {
 	if (!vha->do_calibration &&
 			(vha->pendcmd[VHA_CNN_CMD].cmd == NULL &&
 			vha->queuedcmd[VHA_CNN_CMD].cmd == NULL))
-		vha_dev_stop(vha, false);
+		if (vha_dev_stop(vha, false)) {
+			dev_warn(vha->dev, "%s: Failed to soft stop device. trying with reset",
+				__func__);
+			if (vha_dev_stop(vha, true))
+				dev_err(vha->dev, "%s: Failed to stop device with reset!", __func__);
+		}
 }
 
 int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 {
 	struct vha_core_props *props = &vha->core_props;
-	int ret = 0;
 	uint64_t ip_config;
 	uint32_t ocm_size_kb = 0;
 
@@ -749,6 +1033,7 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 	props->product_id  = IOREAD64(vha->reg_base, VHA_CR_PRODUCT_ID);
 	props->core_id  = IOREAD64(vha->reg_base, VHA_CR_CORE_ID);
 #endif
+	props->skip_bvnc_check = false;
 	/*
 	 * New mmu version 3 and onwards operates on 40bit physical & virtual addresses
 	 */
@@ -779,12 +1064,12 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 
 	if ((props->num_cnn_core_devs == 0)
 		|| VHA_CR_GETBITS(CORE_ID, BRANCH_ID, props->core_id) != HW_SERIES) {
-		ret = -EINVAL;
 		dev_err(vha->dev, "%s: Wrong core configuration detected. "
 			"Expected BVNC %d.x.x.x, got %llu.x.x.x. "
 			"Maybe kernel module was built with wrong params.\n",
 			__func__, HW_SERIES,
 			VHA_CR_GETBITS(CORE_ID, BRANCH_ID, props->core_id));
+		return -ENODEV;
 	}
 
 	props->soc_axi  = IOREAD64(vha->reg_base, VHA_CR_SOC_AXI);
@@ -838,18 +1123,18 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 			props->dummy_dev ? props->num_cnn_core_devs : 0,
 			props->dummy_dev ? 0 : props->num_cnn_core_devs);
 
-	return ret;
+	return 0;
 }
 
-void vha_dev_ocm_configure(struct vha_dev *vha, unsigned long ocm_phys_start)
+void vha_dev_ocm_configure(struct vha_dev *vha)
 {
 #if defined(CFG_SYS_VAGUS)
 	dev_dbg(vha->dev, "%s: OCM address range: %#lx - %#lx\n",
-			__func__, ocm_phys_start,
-			ocm_phys_start + vha->core_props.locm_size_bytes - 1);
-	IOWRITE64(vha->reg_base, NN_SYS_CR(NOC_LOWER_ADDR1), ocm_phys_start);
+			__func__, vha->ocm_paddr,
+			vha->ocm_paddr + vha->core_props.locm_size_bytes - 1);
+	IOWRITE64(vha->reg_base, NN_SYS_CR(NOC_LOWER_ADDR1), vha->ocm_paddr);
 	IOWRITE64(vha->reg_base, NN_SYS_CR(NOC_UPPER_ADDR1),
-			ocm_phys_start + vha->core_props.locm_size_bytes - 1);
+			vha->ocm_paddr + vha->core_props.locm_size_bytes - 1);
 	img_pdump_printf("-- Setup NN_SYS OCM phys address range\n"
 		"WRW "_PMEM_":$0 :OCM:BLOCK_CACHE:0x0\n"
 		"WRW64 :REG_NNSYS:%#x "_PMEM_":$0\n"
@@ -861,19 +1146,20 @@ void vha_dev_ocm_configure(struct vha_dev *vha, unsigned long ocm_phys_start)
 }
 
 /* prepare CRC and DEBUG data buffers */
-void vha_dbg_prepare_hwbufs(struct vha_session *session)
+void vha_dbg_prepare_hwbufs(struct vha_session *session, uint8_t mask, struct vha_crc_config_regs *regs)
 {
 	struct vha_dev *vha = session->vha;
+	(void)mask;
 
-	if (session->cnn_dbg.cnn_crc_buf) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf;
+	if (session->cnn_dbg.cnn_crc_buf[0]) {
+		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf[0];
 		uint64_t val64;
 
 		/* enable CRC: address + mode */
 		val64 = VHA_CR_SETBITS_OS(CNN_CRC_CONTROL, CNN_CRC_ENABLE,
 				session->cnn_dbg.cnn_crc_mode);
-		img_pdump_printf("-- CRC_CONTROL=%u buf '%s' size=%zx\n",
-				session->cnn_dbg.cnn_crc_mode, buf->name, buf->size);
+		img_pdump_printf("-- CRC_CONTROL=%u buf 'CRC' size=%zx\n",
+				session->cnn_dbg.cnn_crc_mode, buf->size);
 		IOWRITE_PDUMP_BUFADDR(session, buf, 0, VHA_CR_OS(CNN_CRC_ADDRESS));
 
 		IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_CRC_CONTROL));
@@ -883,42 +1169,44 @@ void vha_dbg_prepare_hwbufs(struct vha_session *session)
 		IOWRITE64_PDUMP(session->cnn_dbg.cnn_crc_mask, VHA_CR_OS(CNN_CRC_MASK_CTRL));
 #endif
 	}
-	if (session->cnn_dbg.cnn_dbg_buf && session->cnn_dbg.cnn_dbg_pdump_enable) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf;
+	if (session->cnn_dbg.cnn_dbg_buf[0] && session->cnn_dbg.cnn_dbg_pdump_enable) {
+		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf[0];
 		uint64_t val64;
 
 		/* enable DEBUG: address, perf mode, band mode */
-		img_pdump_printf("-- DEBUG_CONTROL=%u,%u buf '%s' size=%zx\n",
+		img_pdump_printf("-- DEBUG_CONTROL=%u,%u buf 'DBG' size=%zx\n",
 				session->cnn_dbg.cnn_dbg_modes[0], session->cnn_dbg.cnn_dbg_modes[1],
-				buf->name, buf->size);
+				buf->size);
 		IOWRITE_PDUMP_BUFADDR(session, buf, 0,
-				      VHA_CR_OS(CNN_DEBUG_ADDRESS));
+					VHA_CR_OS(CNN_DEBUG_ADDRESS));
 		val64 = VHA_CR_ALIGN_SETBITS_OS(CNN_DEBUG_SIZE,
-					      CNN_DEBUG_SIZE,
-					      buf->size);
+						CNN_DEBUG_SIZE,
+						buf->size);
 		IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_DEBUG_SIZE));
 
 		/* Set the CONTROL register only if requested */
 		if (session->cnn_dbg.cnn_dbg_modes[0] > 0 || session->cnn_dbg.cnn_dbg_modes[1] > 0) {
 			val64 = VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL,
-				       CNN_PERF_ENABLE,
-					   session->cnn_dbg.cnn_dbg_modes[0]);
+						 CNN_PERF_ENABLE,
+						 session->cnn_dbg.cnn_dbg_modes[0]);
 			val64 |= VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL,
-				       CNN_BAND_ENABLE,
-					   session->cnn_dbg.cnn_dbg_modes[1]);
+						 CNN_BAND_ENABLE,
+						 session->cnn_dbg.cnn_dbg_modes[1]);
 			IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_DEBUG_CONTROL));
 		}
 	}
 }
 
 /* flush CRC and DEBUG data buffers */
-void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint)
+void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint, uint8_t mask)
 {
+	struct vha_dev* vha = session->vha;
+	(void)mask;
 	if (session->cnn_dbg.cnn_dbg_flush != checkpoint)
 		return;
 
-	if (session->cnn_dbg.cnn_crc_buf) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf;
+	if (session->cnn_dbg.cnn_crc_buf[0] && !session->use_cmd_crc_buf) {
+		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf[0];
 		/*
 		 * TOBEDONE: calculate CRC buffer size based
 		 * on num passes, num layers, etc
@@ -927,22 +1215,21 @@ void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint)
 		img_pdump_printf("IF CHECK_CRCS\n");
 		img_pdump_printf("COM Checking CRCs ...\n");
 		vha_pdump_sab_buf(session, PDUMP_CRC,
-				  buf, 0, buf->size);
+					buf, 0, buf->size);
 		img_pdump_printf("ELSE CHECK_CRCS\n");
 		img_pdump_printf("COM Not checking CRCs!\n");
 		img_pdump_printf("FI CHECK_CRCS\n");
 	}
-	if (session->cnn_dbg.cnn_dbg_buf && session->cnn_dbg.cnn_dbg_pdump_enable) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf;
-		struct vha_dev *vha = session->vha;
+	if (session->cnn_dbg.cnn_dbg_buf[0] && session->cnn_dbg.cnn_dbg_pdump_enable) {
+		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf[0];
 		/* read the size of the DEBUG buffer */
 		uint64_t size = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_DEBUG_STATUS));
 		/*
 		 * SAB the DBG buffer, even though "it is not deterministic"
 		 */
 		size = VHA_CR_GETBITS_OS(CNN_DEBUG_STATUS,
-					    CNN_DEBUG_OFFSET,
-					    size);
+					CNN_DEBUG_OFFSET,
+					size);
 		img_pdump_printf("-- Save DEBUG info\n");
 
 		vha_pdump_sab_buf(session, PDUMP_DBG, buf, 0, buf->size);
@@ -950,17 +1237,18 @@ void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint)
 }
 
 /* stop capturing CRC and DEBUG data */
-void vha_dbg_stop_hwbufs(struct vha_session *session)
+void vha_dbg_stop_hwbufs(struct vha_session *session, uint8_t mask)
 {
 	struct vha_dev *vha = session->vha;
+	(void)mask;
 
 	/* Flush hw debug buffers */
-	vha_dbg_flush_hwbufs(session, 0);
+	vha_dbg_flush_hwbufs(session, 0, 0);
 
-	if (session->cnn_dbg.cnn_crc_buf) {
+	if (session->cnn_dbg.cnn_crc_buf[0] || session->use_cmd_crc_buf) {
 		IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_CRC_CONTROL));
 	}
-	if (session->cnn_dbg.cnn_dbg_buf) {
+	if (session->cnn_dbg.cnn_dbg_buf[0]) {
 		/* read the size of the DEBUG buffer */
 		uint64_t size = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_DEBUG_STATUS));
 

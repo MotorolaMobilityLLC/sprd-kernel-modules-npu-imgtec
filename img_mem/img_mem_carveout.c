@@ -202,14 +202,14 @@ static int carveout_heap_export(struct device *device, struct heap *heap,
 			goto free_sgt_mem;
 		}
 		sg_set_page(buffer_data->sgt->sgl,
-				pfn_to_page(PFN_DOWN(buffer_data->addr)),
-			    PAGE_ALIGN(size), 0);
+				pfn_to_page(PFN_DOWN(buffer_data->addr+heap->options.carveout.offs)),
+				PAGE_ALIGN(size), 0);
 		/* Store dma info */
 		if (heap->to_dev_addr)
 			buffer_data->dma_base = heap->to_dev_addr(&heap->options,
-					buffer_data->addr);
+					buffer_data->addr+heap->options.carveout.offs);
 		else
-			buffer_data->dma_base = buffer_data->addr;
+			buffer_data->dma_base = buffer_data->addr+heap->options.carveout.offs;
 
 		buffer_data->dma_size = PAGE_ALIGN(size);
 		/* No mapping yet */
@@ -291,7 +291,8 @@ static int carveout_heap_alloc(struct device *device, struct heap *heap,
 	}
 
 	/* The below assigns buffer_data->addr-> 1:1 mapping */
-	phys_addr = gen_pool_virt_to_phys(heap_data->pool, buffer_data->addr);
+	phys_addr = gen_pool_virt_to_phys(heap_data->pool,
+			buffer_data->addr + heap->options.carveout.offs);
 
 	page = 0;
 	while (page < pages) {
@@ -536,6 +537,18 @@ static int carveout_heap_get_page_array(struct heap *heap,
 	return 0;
 }
 
+static int carveout_set_offset(struct heap *heap, size_t offs)
+{
+	if (heap->options.carveout.offs > heap->options.carveout.size) {
+		pr_err("%s offset exceeds size!\n", __func__);
+		return -EINVAL;
+	}
+
+	heap->options.carveout.offs = offs;
+
+	return 0;
+}
+
 static void carveout_cache_update(struct vm_area_struct *vma)
 {
 	if (!vma)
@@ -592,6 +605,7 @@ static struct heap_ops carveout_heap_ops = {
 	.get_page_array = carveout_heap_get_page_array,
 	.sync_cpu_to_dev = carveout_sync_cpu_to_dev,
 	.sync_dev_to_cpu = carveout_sync_dev_to_cpu,
+	.set_offset = carveout_set_offset,
 	.destroy = carveout_heap_destroy,
 };
 
@@ -603,18 +617,24 @@ int img_mem_carveout_init(const struct heap_config *config, struct heap *heap)
 	int pool_order = POOL_ALLOC_ORDER_BASE +
 			heap->options.carveout.pool_order;
 
-	pr_debug("%s phys:%#llx offs:%llx order:%d\n", __func__,
-		 (unsigned long long)config->options.carveout.phys,
-		 (unsigned long long)config->options.carveout.offs,
-		 pool_order);
-
-	if (config->options.carveout.phys & ((1<<pool_order)-1)) {
-		pr_err("%s phys addr (%#llx) is not aligned to allocation order!\n",
-				__func__, (unsigned long long)config->options.carveout.phys);
+	if (heap->options.carveout.offs > heap->options.carveout.size) {
+		pr_err("%s offset exceeds size!\n", __func__);
 		return -EINVAL;
 	}
 
-	if (config->options.carveout.size == 0) {
+	pr_debug("%s phys base:%#llx (offs:%llx) size:%zu order:%d\n", __func__,
+		 (unsigned long long)heap->options.carveout.phys,
+		 (unsigned long long)heap->options.carveout.offs,
+		 heap->options.carveout.size,
+		 pool_order);
+
+	if (heap->options.carveout.phys & ((1<<pool_order)-1)) {
+		pr_err("%s phys addr (%#llx) is not aligned to allocation order!\n",
+				__func__, (unsigned long long)heap->options.carveout.phys);
+		return -EINVAL;
+	}
+
+	if (heap->options.carveout.size == 0) {
 		pr_err("%s size cannot be zero!\n", __func__);
 		return -EINVAL;
 	}
@@ -635,14 +655,14 @@ int img_mem_carveout_init(const struct heap_config *config, struct heap *heap)
 	 * if address returned from gen_pool_alloc is an error or valid address,
 	 * so add a const offset.
 	 */
-	virt_start = (unsigned long)config->options.carveout.phys;
+	virt_start = (unsigned long)heap->options.carveout.phys;
 	if (!virt_start)
 		virt_start = 1<<pool_order;
 
 	ret = gen_pool_add_virt(heap_data->pool, virt_start,
-				config->options.carveout.phys,
-				config->options.carveout.size,
-				-1);
+			heap->options.carveout.phys,
+			heap->options.carveout.size,
+			-1);
 	if (ret) {
 		pr_err("%s gen_pool_add_virt failed\n", __func__);
 		goto pool_add_failed;

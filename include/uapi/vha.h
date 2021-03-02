@@ -85,9 +85,11 @@ struct vha_core_props {
 		uint8_t features;
 	};
 	bool     dummy_dev;
+	bool     skip_bvnc_check;
 	uint8_t  num_cnn_core_devs;
-	uint32_t locm_size_bytes;
-	uint32_t socm_size_bytes;
+	uint32_t locm_size_bytes; /* per core */
+	uint32_t socm_size_bytes; /* total size for all cores */
+	uint32_t socm_core_size_bytes; /* per core */
 
 } __attribute__((aligned(8)));
 
@@ -131,7 +133,7 @@ struct vha_user_cmd {
 struct vha_hw_brns {
 	union {
 		struct {
-			unsigned bRN69315: 1;
+			unsigned bReserved: 1;
 		} bit;
 		uint64_t map;
 	};
@@ -148,21 +150,18 @@ struct vha_hw_brns {
  */
 struct vha_user_cnn_submit_cmd {
 	struct vha_user_cmd msg;
-	uint32_t cmdbuf;	/* bufid of cmdstream buffer */
-	uint32_t bufs[VHA_CORE_MAX_ALT_ADDRS];	/* bufid of IN, COEFF, OUT,
-			INTERNAL,CRC,DBG,WB buffers */
-	uint32_t bufoffsets[VHA_CORE_MAX_ALT_ADDRS]; /* offsets into inbufs and
-			outbufs buffers */
-	uint32_t bufsizes[VHA_CORE_MAX_ALT_ADDRS];	/* sizes of the inbufs and
-			outbufs buffers */
-	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];	/* register to be used for
-			inbufs and outbufs */
-	uint32_t onchipram_map_id; /* OCM mapping id - hot pages */
-	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX]; /* OCM linear mapping buffers */
-	uint32_t estimated_cycles; /* estimated number of cycles
-			for this command */
-	uint64_t expected_ip_capab; /* expected BVNC */
-	uint64_t hw_brns; /* BRNSs bit map */
+	uint32_t cmdbuf;                             /* bufid of cmdstream buffer */
+	uint32_t bufs[VHA_CORE_MAX_ALT_ADDRS];       /* bufid of IN, COEFF, OUT, INTERNAL,CRC,DBG,WB buffers */
+	uint32_t bufoffsets[VHA_CORE_MAX_ALT_ADDRS]; /* offsets into inbufs and outbufs buffers */
+	uint32_t bufsizes[VHA_CORE_MAX_ALT_ADDRS];   /* sizes of the inbufs and outbufs buffers */
+	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];     /* register to be used for inbufs and outbufs */
+	uint32_t onchipram_map_id;                   /* OCM mapping id - hot pages */
+	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX];   /* OCM linear mapping buffers */
+	uint32_t crc_buf;                            /* bufid of CRC buffer */
+	uint32_t crc_buf_offset;                     /* offsets into CRC buffer */
+	uint32_t estimated_cycles;                   /* estimated number of cycles for this command */
+	uint64_t expected_ip_capab;                  /* expected BVNC */
+	uint64_t hw_brns;                            /* BRNSs bit map */
 } __attribute__((aligned(8)));
 
 /*
@@ -183,6 +182,8 @@ struct vha_user_cnn_submit_multi_cmd {
 	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];     /* register to be used for inbufs and outbufs */
 	uint8_t  num_cores;                          /* number of cores required for this workload */
 	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX];   /* OCM linear mapping buffers */
+	uint32_t crc_buf;                            /* bufid of CRC buffer */
+	uint32_t crc_buf_offset;                     /* offsets into CRC buffer */
 	uint32_t shared_circ_buf_offs;               /* circular buffer offset in the shared memory */
 	uint32_t estimated_cycles;                   /* estimated number of cycles for this command */
 	uint64_t expected_ip_capab;                  /* expected BVNC */

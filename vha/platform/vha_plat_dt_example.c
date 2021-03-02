@@ -91,8 +91,7 @@ void vha_plat_write64(void *addr, uint64_t val)
 	writeq(val, (volatile void __iomem *)addr);
 }
 
-int vha_plat_dt_hw_init(struct platform_device *pdev,
-			struct heap_config **heap_configs, int *num_heaps)
+int vha_plat_dt_hw_init(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	int ret;
@@ -126,11 +125,14 @@ int vha_plat_dt_hw_init(struct platform_device *pdev,
 
 	/* Put any vendor related code:
 	 * get clock domain, voltage regulator, set clock rate, etc */
+	return 0;
+}
 
+/* return platform global heaps */
+void vha_plat_dt_get_heaps(struct heap_config **heap_configs, int *num_heaps)
+{
 	*heap_configs = example_heap_configs;
 	*num_heaps = sizeof(example_heap_configs)/sizeof(struct heap_config);
-
-	return 0;
 }
 
 void vha_plat_dt_hw_destroy(struct platform_device *pdev)

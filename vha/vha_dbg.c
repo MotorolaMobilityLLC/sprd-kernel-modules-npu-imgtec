@@ -52,6 +52,8 @@
 #include "vha_plat.h"
 #include "vha_io.h"
 
+#define VHA_DBG_CONBINED_CRC_BUF_SIZE 0x1000
+
 static uint32_t cnn_crc_size_kB;
 static uint32_t cnn_dbg_size_kB;
 static bool cnn_dbg_pdump_enable = true;
@@ -83,8 +85,20 @@ module_param(cnn_pdump_flush_dbg, uint, 0444);
 MODULE_PARM_DESC(cnn_pdump_flush_dbg,
 	"PDUMP: flushing debug buffs: 0:session,1:stream(default)");
 
+static unsigned long vaa_offset = 0;
+module_param(vaa_offset, ulong, 0444);
+MODULE_PARM_DESC(vaa_offset,
+	"Page aligned offset in virtual address allocator space for kernel buffers."
+	" NOTE: given offset decreases the size of vaa heap, accordingly");
+
 struct vha_dbgfs_ctx {
 	struct dentry    *debugfs_dir;
+#if defined VHA_EVENT_INJECT
+	struct dentry    *event_inject_dir;
+#endif
+#if defined VHA_FUNCT_CTRL
+	struct dentry    *funct_ctrl_dir;
+#endif
 	struct vha_regset regset;
 	uint64_t          rtm_ctrl;
 	uint64_t          ioreg_addr;
@@ -263,109 +277,109 @@ static const struct file_operations vha_mmu_ptedump_fops = {
 
 static void *vha_buffer_dump_start(struct seq_file *seq, loff_t *pos)
 {
-    struct vha_session *session = seq->private;
-    int ret;
+	struct vha_session *session = seq->private;
+	int ret;
 
-    if (session == NULL) {
-        pr_warn("Invalid VHA session pointer...\n");
-        return  NULL;
-    }
+	if (session == NULL) {
+		pr_warn("Invalid VHA session pointer...\n");
+		return  NULL;
+	}
 
-    if (list_empty(&session->bufs))
-        return NULL;
-
-
-    ret = mutex_lock_interruptible(&session->vha->lock);
-
-    if (ret) {
-        pr_warn("Error while trying to get vha lock (%d)...\n", ret);
-        return  NULL;
-    }
+	if (list_empty(&session->bufs))
+		return NULL;
 
 
-    seq_printf(seq, "Allocated buffers:\n");
-    seq_printf(seq, "ID    Name       Size       Atributes  Status     Kptr              DevVirt     Inval?  Flush?\n");
-    /*               6005  012345678  123456789  CUWSNM     SW filled            (null)  0x40002001  n       Y\n" */
+	ret = mutex_lock_interruptible(&session->vha->lock);
 
-    /* Then first buffer from it */
-    return seq_list_start(&session->bufs, *pos);
+	if (ret) {
+		pr_warn("Error while trying to get vha lock (%d)...\n", ret);
+		return  NULL;
+	}
+
+
+	seq_printf(seq, "Allocated buffers:\n");
+	seq_printf(seq, "ID    Name       Size       Atributes  Status     Kptr              DevVirt     Inval?  Flush?\n");
+	/*               6005  012345678  123456789  CUWSNM     SW filled            (null)  0x40002001  n       Y\n" */
+
+	/* Then first buffer from it */
+	return seq_list_start(&session->bufs, *pos);
 }
 
 static void *vha_buffer_dump_next(struct seq_file *seq, void *priv, loff_t *pos)
 {
-    struct vha_session *session = seq->private;
-    return seq_list_next(priv, &session->bufs, pos);
+	struct vha_session *session = seq->private;
+	return seq_list_next(priv, &session->bufs, pos);
 }
 
 static void vha_buffer_dump_stop(struct seq_file *seq, void *priv)
 {
-    struct vha_session *session = seq->private;
-    mutex_unlock(&session->vha->lock);
+	struct vha_session *session = seq->private;
+	mutex_unlock(&session->vha->lock);
 
-    seq_printf(seq, "Attributes: Cached;Uncached;Writecombine;Secure;Nomap;Mmu\n");
+	seq_printf(seq, "Attributes: Cached;Uncached;Writecombine;Secure;Nomap;Mmu\n");
 }
 
 static const char *BufferStatus[] = {
-        "Unfilled ",
-        "SW filled",
-        "HW filled"
+	"Unfilled ",
+	"SW filled",
+	"HW filled"
 };
 
 
 static int vha_buffer_dump_show(struct seq_file *seq, void *priv)
 {
-    const struct vha_buffer *buf = list_entry(priv, struct vha_buffer, list);
+	const struct vha_buffer *buf = list_entry(priv, struct vha_buffer, list);
 
-    /* ID    Name       Size       Atributes  Status     Kptr              DevVirt     Inval?  Flush? */
-    seq_printf(seq, "%04u  %9s  %9ld  %c%c%c%c%c%c     %s  %p  0x%08llX  %c       %c\n",
-               buf->id,
-               buf->name,
-               buf->size,
-               (buf->attr & IMG_MEM_ATTR_CACHED)?'C':'.',
-               (buf->attr & IMG_MEM_ATTR_UNCACHED)?'U':'.',
-               (buf->attr & IMG_MEM_ATTR_WRITECOMBINE)?'W':'.',
-               (buf->attr & IMG_MEM_ATTR_SECURE)?'S':'.',
-               (buf->attr & IMG_MEM_ATTR_NOMAP)?'N':'.',
-               (buf->attr & IMG_MEM_ATTR_MMU)?'M':'.',
-               BufferStatus[buf->status],
-               buf->kptr,
-               buf->devvirt,
-               (buf->inval)?'Y':'n',
-               (buf->flush)?'Y':'n'
-              );
-    return 0;
+	/* ID    Name       Size       Atributes  Status     Kptr              DevVirt     Inval?  Flush? */
+	seq_printf(seq, "%04u  %9s  %9ld  %c%c%c%c%c%c     %s  %p  0x%08llX  %c       %c\n",
+		   buf->id,
+		   buf->name,
+		   buf->size,
+		   (buf->attr & IMG_MEM_ATTR_CACHED)?'C':'.',
+		   (buf->attr & IMG_MEM_ATTR_UNCACHED)?'U':'.',
+		   (buf->attr & IMG_MEM_ATTR_WRITECOMBINE)?'W':'.',
+		   (buf->attr & IMG_MEM_ATTR_SECURE)?'S':'.',
+		   (buf->attr & IMG_MEM_ATTR_NOMAP)?'N':'.',
+		   (buf->attr & IMG_MEM_ATTR_MMU)?'M':'.',
+		   BufferStatus[buf->status],
+		   buf->kptr,
+		   buf->devvirt,
+		   (buf->inval)?'Y':'n',
+		   (buf->flush)?'Y':'n'
+		  );
+	return 0;
 }
 
 static const struct seq_operations vha_buffer_dump_sops = {
-        .start = vha_buffer_dump_start,
-        .next  = vha_buffer_dump_next,
-        .show  = vha_buffer_dump_show,
-        .stop  = vha_buffer_dump_stop
+	.start = vha_buffer_dump_start,
+	.next  = vha_buffer_dump_next,
+	.show  = vha_buffer_dump_show,
+	.stop  = vha_buffer_dump_stop
 };
 
 static int vha_buffer_dump_open(struct inode *inode, struct file *file)
 {
-    struct seq_file *s;
-    int err;
+	struct seq_file *s;
+	int err;
 
-    err = seq_open(file, &vha_buffer_dump_sops);
-    if (err)
-        return err;
+	err = seq_open(file, &vha_buffer_dump_sops);
+	if (err)
+		return err;
 
-    s = file->private_data;
+	s = file->private_data;
 
-    /* i_private containt a pointer to the vha_session structure */
-    s->private = inode->i_private;
+	/* i_private containt a pointer to the vha_session structure */
+	s->private = inode->i_private;
 
-    return 0;
+	return 0;
 }
 
 static const struct file_operations vha_buffer_dump_fops = {
-        .owner = THIS_MODULE,
-        .open = vha_buffer_dump_open,
-        .read    = seq_read,
-        .llseek  = seq_lseek,
-        .release = seq_release,
+	.owner = THIS_MODULE,
+	.open = vha_buffer_dump_open,
+	.read    = seq_read,
+	.llseek  = seq_lseek,
+	.release = seq_release,
 };
 
 static ssize_t vha_session_mem_max_read(struct file *file, char __user *buf,
@@ -413,7 +427,7 @@ struct dbgfs_buf_info {
 
 /* debugfs read a buffer */
 static ssize_t dbgfs_buf_read(struct file *file, char __user *user_buf,
-			      size_t count, loff_t *ppos)
+						size_t count, loff_t *ppos)
 {
 	struct dbgfs_buf_info *info = file->private_data;
 	struct vha_buffer *buf = info->buf;
@@ -439,7 +453,7 @@ static ssize_t dbgfs_buf_read(struct file *file, char __user *user_buf,
 		buf->kptr = img_mem_get_kptr(session->mem_ctx, buf->id);
 
 		ret = simple_read_from_buffer(user_buf, count, ppos,
-				       buf->kptr, buf->size);
+						 buf->kptr, buf->size);
 		if (ret < 0)
 			dev_err(session->vha->dev, "failed to read buff %x to km: %d\n",
 				buf->id, ret);
@@ -483,7 +497,7 @@ static void dbg_add_buf(struct vha_session *session, struct vha_buffer *buf)
 						 info, &dbgfs_buf_fops);
 		if (!info->dbgfs)
 			dev_warn(session->vha->dev,
-					 "%s: failed to debugfs entry for '%s'!\n",
+					 "%s: failed to create debugfs entry for '%s'!\n",
 					 __func__, name);
 		buf->dbgfs_priv = (void*)info;
 	}
@@ -509,8 +523,8 @@ static void dbg_rm_buf(struct vha_session *session, uint32_t buf_id)
  * Buffers are mapped into device mmu on demand(when map=true)
  */
 int vha_dbg_alloc_hwbuf(struct vha_session *session, size_t size,
-			    struct vha_buffer **buffer,
-			    const char *name, bool map)
+			struct vha_buffer **buffer,
+			const char *name, bool map)
 {
 	struct vha_dev *vha = session->vha;
 	struct vha_buffer *buf;
@@ -604,9 +618,16 @@ int vha_dbg_create_hwbufs(struct vha_session *session)
 
 	if (vha->mmu_mode &&
 		((session->cnn_dbg.cnn_crc_mode > 0 && session->cnn_dbg.cnn_crc_size_kB > 0) ||
-		 (session->cnn_dbg.cnn_crc_size_kB > 0))) {
+		 (session->cnn_dbg.cnn_crc_size_kB > 0) || vha->cnn_combined_crc_enable)) {
+		if (vaa_offset & (PAGE_SIZE-1)) {
+			dev_err(vha->dev, "%s: given vaa offset is not page aligned!\n",
+				__func__);
+			return -EINVAL;
+		}
+
 		ret = img_mmu_vaa_create(vha->dev,
-				IMG_MEM_VA_HEAP1_BASE, IMG_MEM_VA_HEAP1_SIZE,
+				IMG_MEM_VA_HEAP1_BASE + vaa_offset,
+				IMG_MEM_VA_HEAP1_SIZE - vaa_offset,
 				&session->vaa_ctx);
 		if (ret) {
 			dev_err(vha->dev, "%s: failed to allocate vaa heap\n",
@@ -653,29 +674,52 @@ int vha_dbg_create_hwbufs(struct vha_session *session)
 
 	if (session->cnn_dbg.cnn_crc_mode > 0 && session->cnn_dbg.cnn_crc_size_kB > 0) {
 		struct vha_buffer *buf;
-		size_t size = cnn_crc_size_kB * 1024 * vha->core_props.num_cnn_core_devs;
+		size_t size = cnn_crc_size_kB * 1024;
+		int id;
 
-		ret = vha_dbg_alloc_hwbuf(session, size, &buf, "CRC", true);
-		if (ret) {
-			dev_err(vha->dev, "%s: failed to allocate buffer for CNN_CRC\n",
-				__func__);
-			goto out_disable;
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+			char name[10] = { 0 };
+			snprintf(name, sizeof(name)-1, "CRC_%u", id);
+			ret = vha_dbg_alloc_hwbuf(session, size, &buf, name, true);
+			if (ret) {
+				dev_err(vha->dev, "%s: failed to allocate buffer for CNN_CRC\n",
+						__func__);
+				goto out_disable;
+			}
+			session->cnn_dbg.cnn_crc_buf[id] = buf;
+			dbg_add_buf(session, buf);
 		}
-		session->cnn_dbg.cnn_crc_buf = buf;
-		dbg_add_buf(session, buf);
 	}
 
 	if (cnn_dbg_size_kB > 0) {
 		struct vha_buffer *buf;
-		size_t size = cnn_dbg_size_kB * 1024 * vha->core_props.num_cnn_core_devs;
-		ret = vha_dbg_alloc_hwbuf(session, size, &buf, "DBG", true);
+		size_t size = cnn_dbg_size_kB * 1024;
+		int id;
+
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+			char name[10] = { 0 };
+			snprintf(name, sizeof(name)-1, "DBG_%u", id);
+			ret = vha_dbg_alloc_hwbuf(session, size, &buf, name, true);
+			if (ret) {
+				dev_err(vha->dev, "%s: failed to allocate buffer for CNN_DEBUG\n",
+						__func__);
+				goto out_disable;
+			}
+			session->cnn_dbg.cnn_dbg_buf[id] = buf;
+			dbg_add_buf(session, buf);
+		}
+	}
+
+	if (vha->cnn_combined_crc_enable) {
+		struct vha_buffer *buf;
+		ret = vha_dbg_alloc_hwbuf(session, VHA_DBG_CONBINED_CRC_BUF_SIZE, &buf,
+				"CRC_Cmb", true);
 		if (ret) {
-			dev_err(vha->dev,
-				"%s: failed to allocate buffer for CNN_DEBUG\n",
-				__func__);
+			dev_err(vha->dev, "%s: failed to allocate buffer for CRC_Cmb\n",
+					__func__);
 			goto out_disable;
 		}
-		session->cnn_dbg.cnn_dbg_buf = buf;
+		session->cnn_dbg.cnn_combined_crc = buf;
 		dbg_add_buf(session, buf);
 	}
 
@@ -690,6 +734,8 @@ void vha_dbg_hwbuf_cleanup(struct vha_session *session,
 		struct vha_buffer *buf)
 {
 	struct vha_dev *vha = session->vha;
+	if (buf == NULL)
+		return;
 
 	if (vha->mmu_mode) {
 		img_mmu_vaa_free(session->vaa_ctx, buf->devvirt, buf->size);
@@ -706,13 +752,25 @@ void vha_dbg_destroy_hwbufs(struct vha_session *session)
 {
 	struct vha_dev *vha = session->vha;
 
-	if (session->cnn_dbg.cnn_crc_buf) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf;
-		vha_dbg_hwbuf_cleanup(session, buf);
+	if (session->cnn_dbg.cnn_combined_crc) {
+		vha_dbg_hwbuf_cleanup(session, session->cnn_dbg.cnn_combined_crc);
 	}
-	if (session->cnn_dbg.cnn_dbg_buf) {
-		struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf;
-		vha_dbg_hwbuf_cleanup(session, buf);
+
+	if (session->cnn_dbg.cnn_crc_buf[0]) {
+		int id;
+
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+			struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf[id];
+			vha_dbg_hwbuf_cleanup(session, buf);
+		}
+	}
+	if (session->cnn_dbg.cnn_dbg_buf[0]) {
+		int id;
+
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+			struct vha_buffer *buf = session->cnn_dbg.cnn_dbg_buf[id];
+			vha_dbg_hwbuf_cleanup(session, buf);
+		}
 	}
 
 	if (vha->mmu_mode && session->vaa_ctx)
@@ -775,8 +833,13 @@ static ssize_t vha_cnn_utilization_read(struct file *file, char __user *buf,
 		return 0;
 
 	snprintf(utilization, (int)sizeof(utilization)-1, "%d.%d[%%]\n",
+#ifdef CONFIG_HW_MULTICORE
+			vha->stats.cluster_utilization / 10,
+			vha->stats.cluster_utilization % 10);
+#else
 			vha->stats.cnn_utilization / 10,
 			vha->stats.cnn_utilization % 10);
+#endif
 
 	if (copy_to_user(buf, utilization,
 			strlen(utilization))) {
@@ -798,7 +861,7 @@ static const struct file_operations vha_cnn_utilization_fops = {
 };
 
 static ssize_t vha_cnn_last_cycles_read(struct file *file, char __user *buf, size_t len,
-			     loff_t *ppos)
+					 loff_t *ppos)
 {
 	struct vha_dev *vha = file->private_data;
 	char cycles[16];
@@ -835,17 +898,17 @@ static const struct file_operations vha_cnn_last_cycles_fops = {
 };
 
 static ssize_t vha_bvnc_read(struct file *file, char __user *buf, size_t len,
-			     loff_t *ppos)
+				loff_t *ppos)
 {
 	struct vha_dev *vha = file->private_data;
 	char bvnc[4*6];
 #define BVNC_OFFSET (0x20U)
 	uint64_t core_id = IOREAD64(vha->reg_base, BVNC_OFFSET);
 	size_t size = snprintf(bvnc, sizeof(bvnc), "%hu.%hu.%hu.%hu\n",
-		      (unsigned short)((core_id & 0xffff000000000000ULL) >> 48),
-		      (unsigned short)((core_id & 0x0000ffff00000000ULL) >> 32),
-		      (unsigned short)((core_id & 0x00000000ffff0000ULL) >> 16),
-		      (unsigned short)((core_id & 0x000000000000ffffULL) >> 0));
+				(unsigned short)((core_id & 0xffff000000000000ULL) >> 48),
+				(unsigned short)((core_id & 0x0000ffff00000000ULL) >> 32),
+				(unsigned short)((core_id & 0x00000000ffff0000ULL) >> 16),
+				(unsigned short)((core_id & 0x000000000000ffffULL) >> 0));
 
 	return simple_read_from_buffer(buf, len, ppos, bvnc, size);
 }
@@ -859,7 +922,7 @@ static const struct file_operations vha_bvnc_fops = {
 /* Real Time Monitor facilities.
  * It allows to peek hw internals. Please refer to TRM */
 static ssize_t vha_rtm_read(struct file *file, char __user *buf, size_t len,
-			     loff_t *ppos)
+				 loff_t *ppos)
 {
 	struct vha_dev *vha = file->private_data;
 	struct vha_dbgfs_ctx *ctx =
@@ -894,7 +957,7 @@ static const struct file_operations vha_rtm_fops = {
 /* Generic IO access facilities.
  * It allows read/write any register in the address space */
 static ssize_t vha_ioreg_read(struct file *file, char __user *buf, size_t len,
-			     loff_t *ppos)
+				 loff_t *ppos)
 {
 	struct vha_dev *vha = file->private_data;
 	struct vha_dbgfs_ctx *ctx =
@@ -950,7 +1013,7 @@ static const struct file_operations vha_ioreg_fops = {
 };
 
 static ssize_t vha_stats_reset_write(struct file *file, const char __user *buf,
-	   size_t count, loff_t *ppos)
+		 size_t count, loff_t *ppos)
 {
 	struct vha_dev *vha = file->private_data;
 
@@ -964,6 +1027,200 @@ static const struct file_operations vha_stats_reset_fops = {
 	.write = vha_stats_reset_write,
 	.open = simple_open,
 };
+
+#ifdef CONFIG_HW_MULTICORE
+/* Per core scheduling stats. */
+static ssize_t vha_cnn_kicks_per_core_read(struct file *file, char __user *buf,
+		size_t len, loff_t *ppos)
+{
+#define MAX_CORE_REPORT_LEN 64
+#define MAX_REPORT_LEN ((2 * VHA_NUM_CORES + 1) * MAX_CORE_REPORT_LEN)
+
+	struct vha_dev *vha = file->private_data;
+	int ret;
+	char kicks_per[MAX_REPORT_LEN] = "";
+
+	ret = mutex_lock_interruptible(&vha->lock);
+	if (!ret) {
+		char core_report_line[MAX_CORE_REPORT_LEN];
+		size_t size = 0;
+		uint8_t id;
+		bool include_cancels = false;
+
+		/* Check if any cancels were recorded. */
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++)
+			if (vha->stats.wm_stats[id].kicks_cancelled > 0) {
+				include_cancels = true;
+			}
+
+		if (include_cancels) {
+			if (vha->low_latency == VHA_LL_DISABLED) {
+				size += snprintf(kicks_per, MAX_CORE_REPORT_LEN,
+								"            total   cancelled   completed\n");
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"core%u: %10u  %10u  %10u\n",
+									id,
+									vha->stats.core_stats[id].kicks,
+									vha->stats.core_stats[id].kicks_cancelled,
+									vha->stats.core_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"WM%u:   %10u  %10u  %10u\n",
+									id,
+									vha->stats.wm_stats[id].kicks,
+									vha->stats.wm_stats[id].kicks_cancelled,
+									vha->stats.wm_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+			} else {
+				if (vha->low_latency == VHA_LL_SW_KICK) {
+					size += snprintf(kicks_per, MAX_CORE_REPORT_LEN,
+									"            total      queued   cancelled   completed\n");
+				} else {
+					size += snprintf(kicks_per, MAX_CORE_REPORT_LEN,
+									"            total  selfkicked   cancelled   completed\n");
+				}
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"core%u: %10u  %10u  %10u  %10u\n",
+									id,
+									vha->stats.core_stats[id].kicks,
+									vha->stats.core_stats[id].kicks_queued,
+									vha->stats.core_stats[id].kicks_cancelled,
+									vha->stats.core_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"WM%u:   %10u  %10u  %10u  %10u\n",
+									id,
+									vha->stats.wm_stats[id].kicks,
+									vha->stats.wm_stats[id].kicks_queued,
+									vha->stats.wm_stats[id].kicks_cancelled,
+									vha->stats.wm_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+			}
+		} else {
+			if (vha->low_latency == VHA_LL_DISABLED) {
+				size += snprintf(kicks_per, MAX_CORE_REPORT_LEN,
+								"            total   completed\n");
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"core%u: %10u  %10u\n",
+									id,
+									vha->stats.core_stats[id].kicks,
+									vha->stats.core_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"WM%u:   %10u  %10u\n",
+									id,
+									vha->stats.wm_stats[id].kicks,
+									vha->stats.wm_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+			} else {
+				if (vha->low_latency == VHA_LL_SW_KICK) {
+					size += snprintf(kicks_per, MAX_CORE_REPORT_LEN,
+									"            total      queued   completed\n");
+				} else {
+					size += snprintf(kicks_per, MAX_CORE_REPORT_LEN,
+									"            total  selfkicked   completed\n");
+				}
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"core%u: %10u  %10u  %10u\n",
+									id,
+									vha->stats.core_stats[id].kicks,
+									vha->stats.core_stats[id].kicks_queued,
+									vha->stats.core_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+				for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+					size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+									"WM%u:   %10u  %10u  %10u\n",
+									id,
+									vha->stats.wm_stats[id].kicks,
+									vha->stats.wm_stats[id].kicks_queued,
+									vha->stats.wm_stats[id].kicks_completed);
+					strcat(kicks_per, core_report_line);
+				}
+			}
+		}
+
+		mutex_unlock(&vha->lock);
+
+		return simple_read_from_buffer(buf, len, ppos, kicks_per, size);
+	}
+
+#undef MAX_CORE_REPORT_LEN
+#undef MAX_REPORT_LEN
+
+	return ret;
+}
+
+static const struct file_operations vha_cnn_kicks_per_core_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = vha_cnn_kicks_per_core_read,
+};
+
+/* Per core utilization stats. */
+static ssize_t vha_cnn_utilization_per_core_read(struct file *file,
+		char __user *buf, size_t len, loff_t *ppos)
+{
+#define MAX_CORE_REPORT_LEN 24
+#define MAX_REPORT_LEN ((2 * VHA_NUM_CORES) * MAX_CORE_REPORT_LEN)
+
+	struct vha_dev *vha = file->private_data;
+	int ret;
+	char utilization_per[MAX_REPORT_LEN] = "";
+
+	ret = mutex_lock_interruptible(&vha->lock);
+	if (!ret) {
+		char core_report_line[MAX_CORE_REPORT_LEN];
+		size_t size = 0;
+		uint8_t id;
+
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+			size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+							"core%u: %d.%d[%%]\n",
+							id,
+							vha->stats.core_stats[id].utilization / 10,
+							vha->stats.core_stats[id].utilization % 10);
+			strcat(utilization_per, core_report_line);
+		}
+		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
+			size += snprintf(core_report_line, MAX_CORE_REPORT_LEN,
+							"WM%u:   %d.%d[%%]\n",
+							id,
+							vha->stats.wm_stats[id].utilization / 10,
+							vha->stats.wm_stats[id].utilization % 10);
+			strcat(utilization_per, core_report_line);
+		}
+
+		mutex_unlock(&vha->lock);
+
+		return simple_read_from_buffer(buf, len, ppos, utilization_per, size);
+	}
+
+#undef MAX_CORE_REPORT_LEN
+#undef MAX_REPORT_LEN
+
+	return ret;
+}
+
+static const struct file_operations vha_cnn_utilization_per_core_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = vha_cnn_utilization_per_core_read,
+};
+#endif
 
 void vha_dbg_init(struct vha_dev *vha)
 {
@@ -985,22 +1242,10 @@ void vha_dbg_init(struct vha_dev *vha)
 		return;
 	}
 
-	/* and some registers for debug */
-	if (vha->reg_base) {
-		ctx->regset.regs = vha_regs;
-		ctx->regset.nregs = vha->reg_size / sizeof(uint64_t);
-		ctx->regset.base = vha->reg_base;
-		if (!debugfs_create_file("regdump", S_IRUGO, ctx->debugfs_dir,
-					&ctx->regset, &vha_regset_fops))
-			dev_warn(vha->dev,
-				"%s: failed to create regdump file!\n",
-				__func__);
-	}
-
-#define VHA_DBGFS_CREATE(_type_, _name_, _vha_dev_member_) \
+#define VHA_DBGFS_CREATE_(_type_, _name_, _vha_dev_member_, flags, dir) \
 	{ \
 			if (!debugfs_create_##_type_(_name_, \
-				S_IRUGO, ctx->debugfs_dir, \
+				(flags), ctx->dir, \
 				&vha->_vha_dev_member_)) { \
 				dev_warn(vha->dev, \
 					"%s: failed to create %s dbg file!\n", \
@@ -1008,59 +1253,123 @@ void vha_dbg_init(struct vha_dev *vha)
 			} \
 	}
 
-	VHA_DBGFS_CREATE(u32, "core_freq_khz", freq_khz);
-	VHA_DBGFS_CREATE(u32, "core_state", state);
-	VHA_DBGFS_CREATE(u64, "core_uptime_ms", stats.uptime_ms);
-	VHA_DBGFS_CREATE(u64, "core_last_proc_us", stats.last_proc_us);
-	VHA_DBGFS_CREATE(u32, "cnn_kicks", stats.cnn_kicks);
-	VHA_DBGFS_CREATE(u32, "cnn_queued_kicks", stats.cnn_queued_kicks);
-	VHA_DBGFS_CREATE(u32, "cnn_kicks_completed", stats.cnn_kicks_completed);
-	VHA_DBGFS_CREATE(u64, "cnn_total_proc_us", stats.cnn_total_proc_us);
-	VHA_DBGFS_CREATE(u64, "cnn_last_proc_us", stats.cnn_last_proc_us);
-	VHA_DBGFS_CREATE(u64, "cnn_avg_proc_us", stats.cnn_avg_proc_us);
-	VHA_DBGFS_CREATE(u64, "cnn_last_est_proc_us", stats.cnn_last_est_proc_us);
-	VHA_DBGFS_CREATE(u64, "cnn_avg_est_proc_us", stats.cnn_avg_est_proc_us);
+#define VHA_DBGFS_CREATE_RO(_type_, _name_, _vha_dev_member_, dir) \
+  VHA_DBGFS_CREATE_(_type_, _name_, _vha_dev_member_, S_IRUGO, dir)
 
-	VHA_DBGFS_CREATE(u32, "mem_usage_last", stats.mem_usage_last);
-	VHA_DBGFS_CREATE(u32, "total_failures", stats.total_failures);
+#define VHA_DBGFS_CREATE_RW(_type_, _name_, _vha_dev_member_, dir) \
+  VHA_DBGFS_CREATE_(_type_, _name_, _vha_dev_member_, S_IWUSR|S_IRUGO, dir)
 
-#undef VHA_DBGFS_CREATE
 
-	if (vha->core_props.supported.rtm) {
-		if (!debugfs_create_u64("rtm_ctrl",
-				S_IWUSR|S_IRUGO, ctx->debugfs_dir,
-				&ctx->rtm_ctrl))
-			dev_warn(vha->dev,
-				"%s: failed to create rtm_ctrl dbg file!\n", __func__);
-
-		if (!debugfs_create_file("rtm_data", S_IRUGO, ctx->debugfs_dir,
-				vha, &vha_rtm_fops))
-			dev_warn(vha->dev,
-				"%s: failed to create debugfs file!\n", __func__);
+#define CTX_DBGFS_CREATE_RW(_type_, _name_, _ctx_dev_member_, dir) \
+	{ \
+			if (!debugfs_create_##_type_(_name_, \
+				S_IWUSR|S_IRUGO, ctx->dir, \
+				&ctx->_ctx_dev_member_)) { \
+				dev_warn(vha->dev, \
+					"%s: failed to create %s dbg file!\n", \
+					__func__, _name_); \
+			} \
+	}
+#define VHA_DBGFS_CREATE_FILE(_perm_, _name_, _fops_) \
+	{ \
+			if (!debugfs_create_file(_name_, \
+				_perm_, ctx->debugfs_dir, vha, \
+				&vha_##_fops_##_fops)) { \
+				dev_warn(vha->dev, \
+					"%s: failed to create %s dbg file!\n", \
+					__func__, _name_); \
+			} \
+	}
+#define CTX_DBGFS_CREATE_FILE(_perm_, _name_, _fops_) \
+	{ \
+			if (!debugfs_create_file(_name_, \
+				_perm_, ctx->debugfs_dir, &ctx->_fops_, \
+				&vha_##_fops_##_fops)) { \
+				dev_warn(vha->dev, \
+					"%s: failed to create %s dbg file!\n", \
+					__func__, _name_); \
+			} \
 	}
 
-	if (!debugfs_create_u64("ioreg_addr",
-			S_IWUSR|S_IRUGO, ctx->debugfs_dir,
-			&ctx->ioreg_addr))
-		dev_warn(vha->dev,
-			"%s: failed to create ioreg_addr dbg file!\n", __func__);
+	/* and some registers for debug */
+	if (vha->reg_base) {
+		ctx->regset.regs = vha_regs;
+		ctx->regset.nregs = vha->reg_size / sizeof(uint64_t);
+		ctx->regset.base = vha->reg_base;
+		CTX_DBGFS_CREATE_FILE(S_IRUGO, "regdump", regset);
+	}
 
-	if (!debugfs_create_file("ioreg_data", S_IRUGO, ctx->debugfs_dir,
-			vha, &vha_ioreg_fops))
-		dev_warn(vha->dev,
-			"%s: failed to create debugfs file!\n", __func__);
+	VHA_DBGFS_CREATE_RO(u32, "core_freq_khz", freq_khz, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "core_state", state, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u64, "core_uptime_ms", stats.uptime_ms, debugfs_dir);
+#ifndef CONFIG_HW_MULTICORE
+	VHA_DBGFS_CREATE_RO(u64, "core_last_proc_us", stats.last_proc_us, debugfs_dir);
+#endif
+	VHA_DBGFS_CREATE_RO(u32, "cnn_kicks", stats.cnn_kicks, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "cnn_queued_kicks", stats.cnn_queued_kicks, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "cnn_kicks_completed", stats.cnn_kicks_completed, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "cnn_kicks_aborted", stats.cnn_kicks_aborted, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u64, "cnn_total_proc_us", stats.cnn_total_proc_us, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u64, "cnn_last_proc_us", stats.cnn_last_proc_us, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u64, "cnn_avg_proc_us", stats.cnn_avg_proc_us, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u64, "cnn_last_est_proc_us", stats.cnn_last_est_proc_us, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u64, "cnn_avg_est_proc_us", stats.cnn_avg_est_proc_us, debugfs_dir);
+#ifdef CONFIG_HW_MULTICORE
+	VHA_DBGFS_CREATE_RO(u8,  "num_cores", core_props.num_cnn_core_devs, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "socm_bytes", core_props.socm_size_bytes, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "socm_core_bytes", core_props.socm_core_size_bytes, debugfs_dir);
+#endif
+	VHA_DBGFS_CREATE_RO(u32, "locm_bytes", core_props.locm_size_bytes, debugfs_dir);
 
-	if (!debugfs_create_file("cnn_utilization", S_IRUGO, ctx->debugfs_dir,
-				vha, &vha_cnn_utilization_fops)
-		|| !debugfs_create_file("cnn_last_cycles", S_IRUGO,
-					ctx->debugfs_dir, vha, &vha_cnn_last_cycles_fops)
-		|| !debugfs_create_file("stats_reset", S_IWUSR,
-				ctx->debugfs_dir, vha, &vha_stats_reset_fops)
-		|| !debugfs_create_file("BVNC", S_IRUGO, ctx->debugfs_dir,
-					vha, &vha_bvnc_fops))
-		dev_warn(vha->dev,
-			"%s: failed to create debugfs file!\n",
-			__func__);
+	VHA_DBGFS_CREATE_RO(u32, "mem_usage_last", stats.mem_usage_last, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "total_failures", stats.total_failures, debugfs_dir);
+
+	if (vha->core_props.supported.rtm) {
+		CTX_DBGFS_CREATE_RW(u64, "rtm_ctrl", rtm_ctrl, debugfs_dir);
+		VHA_DBGFS_CREATE_FILE(S_IRUGO, "rtm_data", rtm);
+	}
+
+	CTX_DBGFS_CREATE_RW(u64, "ioreg_addr", ioreg_addr, debugfs_dir);
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "ioreg_data", ioreg);
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "cnn_utilization", cnn_utilization);
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "cnn_last_cycles", cnn_last_cycles);
+	VHA_DBGFS_CREATE_FILE(S_IWUSR, "stats_reset", stats_reset);
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "BVNC", bvnc);
+#ifdef CONFIG_HW_MULTICORE
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "cnn_kicks_per_core", cnn_kicks_per_core);
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "cnn_utilization_per_core", cnn_utilization_per_core);
+#endif
+
+#ifdef VHA_FUNCT_CTRL
+	ctx->funct_ctrl_dir = debugfs_create_dir("FUNCT_CTRL", ctx->debugfs_dir);
+  if (ctx->funct_ctrl_dir) {
+    VHA_DBGFS_CREATE_RW(u32, "pm_delay", pm_delay, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(u8, "mmu_mode", mmu_mode, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(u8, "mmu_ctx_default", mmu_ctx_default, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(u32, "mmu_page_size", mmu_page_size, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(bool, "mmu_base_pf_test", mmu_base_pf_test, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(u32, "mmu_no_map_count", mmu_no_map_count, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(u8, "low_latency", low_latency, funct_ctrl_dir);
+    VHA_DBGFS_CREATE_RW(u32, "suspend_interval_msec", suspend_interval_msec, funct_ctrl_dir);
+  }
+#endif
+
+#ifdef VHA_EVENT_INJECT
+	ctx->event_inject_dir = debugfs_create_dir("EVENT_INJECT", ctx->debugfs_dir);
+  if (ctx->event_inject_dir) {
+    VHA_DBGFS_CREATE_RW(u64, "VHA_CR_CORE_EVENT", injection.vha_cr_core_event, event_inject_dir);
+    VHA_DBGFS_CREATE_RW(u64, "VHA_CR_SYS_EVENT", injection.vha_cr_sys_event, event_inject_dir);
+    VHA_DBGFS_CREATE_RW(u64, "VHA_CR_INTERCONNECT_EVENT", injection.vha_cr_interconnect_event, event_inject_dir);
+    VHA_DBGFS_CREATE_RW(u64, "VHA_CR_WM_EVENT", injection.vha_cr_wm_event, event_inject_dir);
+  }
+#endif /* VHA_EVENT_INJECT */
+
+#undef CTX_DBGFS_CREATE_FILE
+#undef VHA_DBGFS_CREATE_FILE
+#undef CTX_DBGFS_CREATE
+#undef VHA_DBGFS_CREATE_RO
+#undef VHA_DBGFS_CREATE_RW
+
 
 	vha->dbgfs_ctx = (void *)ctx;
 }

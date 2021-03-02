@@ -62,7 +62,7 @@ static uint32_t hl_wdt_mode = 1;
 module_param(hl_wdt_mode, uint, 0444);
 MODULE_PARM_DESC(hl_wdt_mode, "High level watchdog mode: 1-pass; 2-layer group. See TRM");
 
-void vha_dev_mh_setup(struct vha_dev *vha, int ctx_id)
+void vha_dev_mh_setup(struct vha_dev *vha, int ctx_id, struct vha_mh_config_regs *regs)
 {
 	uint64_t val64 = 0;
 
@@ -85,7 +85,7 @@ void vha_dev_hwwdt_setup(struct vha_dev *vha, uint64_t cycles, uint64_t mode)
 	IOWRITE64_PDUMP(0, VHA_CR_CNN_HL_WDT_TIMER);
 
 	/* Setup memory watchdog */
-	IOWRITE64(vha->reg_base, VHA_CR_CNN_MEM_WDT_COMPAREMATCH, VHA_MEM_WDT_CYCLES);
+	IOWRITE64(vha->reg_base, VHA_CR_CNN_MEM_WDT_COMPAREMATCH, VHA_CORE_MEM_WDT_CYCLES);
 	IOWRITE64(vha->reg_base, VHA_CR_CNN_MEM_WDT_CTRL,
 			VHA_CR_CNN_MEM_WDT_CTRL_CNN_MEM_WDT_CTRL_KICK_PASS);
 	IOWRITE64(vha->reg_base, VHA_CR_CNN_MEM_WDT_TIMER, 0);
@@ -100,13 +100,15 @@ int vha_dev_hwwdt_calculate(struct vha_dev *vha, struct vha_cmd *cmd,
 	return -EIO;
 }
 
-void vha_dev_prepare(struct vha_dev *vha)
+int vha_dev_prepare(struct vha_dev *vha)
 {
 	/* Enable core events */
 	img_pdump_printf("-- Enable CORE events\n");
 	IOWRITE64_PDUMP(VHA_CORE_EVNTS, VHA_CR_OS(VHA_EVENT_ENABLE));
 	img_pdump_printf("-- Clear CORE events\n");
 	IOWRITE64_PDUMP(VHA_CORE_EVNTS, VHA_CR_OS(VHA_EVENT_CLEAR));
+
+	return 0;
 }
 
 void vha_dev_setup(struct vha_dev *vha)
