@@ -134,7 +134,7 @@ int vha_pdump_init(struct vha_dev *vha, struct pdump_descr* pdump)
 				if (pbuf)
 					pbuf->drop_data = true;
 			} else {
-				pbuf = img_pdump_create(pdump, i, pdump_sizes_kB[i]*1024);
+				pbuf = img_pdump_create(pdump, i, pdump_sizes_kB[i]*1024ULL);
 				if (pbuf)
 					pbuf->drop_data = false;
 			}
