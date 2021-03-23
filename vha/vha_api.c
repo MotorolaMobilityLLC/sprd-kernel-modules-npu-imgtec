@@ -62,8 +62,8 @@
 static uint32_t default_mem_heap = IMG_MEM_MAN_HEAP_ID_INVALID;
 module_param(default_mem_heap, uint, 0444);
 MODULE_PARM_DESC(default_mem_heap,
-		"default heap to use when allocating device memory, \
-		when 'invalid' -> user requested id will be used.");
+		"default heap to use when allocating device memory,"
+		"when 'invalid' -> user requested id will be used.");
 
 static void vha_session_pm_get(struct vha_session *session)
 {

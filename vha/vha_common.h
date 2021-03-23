@@ -119,12 +119,12 @@
 #if defined(HW_AX2) || defined(CONFIG_HW_MULTICORE)
 #  define VHA_MMU_GET_CTXID(session) \
 		(((session->mmu_ctxs[0].id-1) + session->vha->mmu_ctx_default) \
-		% VHA_MMU_MAX_HW_CTXS);
+		% VHA_MMU_MAX_HW_CTXS)
 #elif defined(HW_AX3)
 #  define VHA_MMU_GET_CTXID(session) \
 		((_OSID_ * VHA_MMU_MAX_HW_CTXS) + \
 		(((session->mmu_ctxs[0].id-1) + session->vha->mmu_ctx_default) \
-		% (VHA_MMU_MAX_HW_CTXS / 2)));
+		% (VHA_MMU_MAX_HW_CTXS / 2)))
 #endif
 #else
 #  define VHA_MMU_GET_CTXID(session) \
