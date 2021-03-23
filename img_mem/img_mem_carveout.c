@@ -628,7 +628,7 @@ int img_mem_carveout_init(const struct heap_config *config, struct heap *heap)
 		 heap->options.carveout.size,
 		 pool_order);
 
-	if (heap->options.carveout.phys & ((1<<pool_order)-1)) {
+	if (heap->options.carveout.phys & ((phys_addr_t)(1<<pool_order)-1)) {
 		pr_err("%s phys addr (%#llx) is not aligned to allocation order!\n",
 				__func__, (unsigned long long)heap->options.carveout.phys);
 		return -EINVAL;
@@ -657,7 +657,7 @@ int img_mem_carveout_init(const struct heap_config *config, struct heap *heap)
 	 */
 	virt_start = (unsigned long)heap->options.carveout.phys;
 	if (!virt_start)
-		virt_start = 1<<pool_order;
+		virt_start = (phys_addr_t)(1<<pool_order);
 
 	ret = gen_pool_add_virt(heap_data->pool, virt_start,
 			heap->options.carveout.phys,
