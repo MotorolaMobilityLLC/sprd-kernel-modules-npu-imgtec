@@ -510,11 +510,11 @@ int vha_deinit(void)
 	/* Destroy memory management context */
 	if (drv.mem_ctx) {
 		size_t mem_usage = img_mem_get_usage_max(drv.mem_ctx);
-		uint32_t MB = mem_usage / (1024 * 1024);
-		uint32_t bytes = mem_usage - (MB * (1024 * 1024));
-		uint32_t kB = (bytes * 1000) / (1024 * 1024);
+		size_t MB = mem_usage / (1024 * 1024);
+		size_t bytes = mem_usage - (MB * (1024 * 1024));
+		size_t kB = (bytes * 1000) / (1024 * 1024);
 
-		pr_debug("%s: Total kernel memory used: %u.%u MB\n",
+		pr_debug("%s: Total kernel memory used: %zu.%zu MB\n",
 				__func__, MB, kB);
 
 		img_mem_destroy_proc_ctx(drv.mem_ctx);
