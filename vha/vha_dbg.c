@@ -674,7 +674,7 @@ int vha_dbg_create_hwbufs(struct vha_session *session)
 
 	if (session->cnn_dbg.cnn_crc_mode > 0 && session->cnn_dbg.cnn_crc_size_kB > 0) {
 		struct vha_buffer *buf;
-		size_t size = cnn_crc_size_kB * 1024;
+		size_t size = cnn_crc_size_kB * 1024ULL;
 		int id;
 
 		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
@@ -693,7 +693,7 @@ int vha_dbg_create_hwbufs(struct vha_session *session)
 
 	if (cnn_dbg_size_kB > 0) {
 		struct vha_buffer *buf;
-		size_t size = cnn_dbg_size_kB * 1024;
+		size_t size = cnn_dbg_size_kB * 1024ULL;
 		int id;
 
 		for (id = 0; id < vha->core_props.num_cnn_core_devs; id++) {
