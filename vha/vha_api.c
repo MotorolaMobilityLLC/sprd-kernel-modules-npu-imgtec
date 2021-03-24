@@ -768,6 +768,25 @@ static long vha_ioctl_clk_ctrl(struct vha_session *session, void __user *buf)
 	return ret;
 }
 
+static long vha_ioctl_state(struct vha_session *session, void __user *buf)
+{
+	struct vha_dev *vha = session->vha;
+	enum vha_device_state state;
+
+	if (vha->pendcmd[VHA_CNN_CMD].cmd!=NULL ||
+			vha->queuedcmd[VHA_CNN_CMD].cmd!=NULL)
+		state = VHA_BUSY;
+	else
+		state = VHA_IDLE;
+
+	if (copy_to_user(buf, &state, sizeof(state))) {
+		dev_err(vha->dev, "%s: copy to user failed!\n", __func__);
+		return -EFAULT;
+	}
+
+	return 0;
+}
+
 static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 {
 	struct vha_session *session = (struct vha_session *)file->private_data;
@@ -812,6 +831,8 @@ static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 		return vha_ioctl_cancel(session, (void __user *)value);
 	case VHA_IOC_CLK_CTRL:
 		return vha_ioctl_clk_ctrl(session, (void __user *)value);
+	case VHA_IOC_DEVICE_STATE:
+		return vha_ioctl_state(session, (void __user*)value);
 	default:
 		dev_err(miscdev->this_device, "%s: code %#x unknown\n",
 			__func__, code);

@@ -347,6 +347,11 @@ struct vha_clk_ctrl_data {
 	uint32_t fg_enable; /* enable(1)/disable(0) clock */
 }__attribute__((aligned(8)));
 
+enum vha_device_state {
+	VHA_IDLE  = 0,
+	VHA_BUSY  = 1
+};
+
 #define VHA_IOC_MAGIC  'q'
 
 #define VHA_IOC_CORE_PROPS        _IOR(VHA_IOC_MAGIC,  0, struct vha_core_props)
@@ -363,6 +368,7 @@ struct vha_clk_ctrl_data {
 #define VHA_IOC_SYNC              _IOWR(VHA_IOC_MAGIC, 11, struct vha_sync_data)
 #define VHA_IOC_CANCEL            _IOW(VHA_IOC_MAGIC,  12, struct vha_cancel_data)
 #define VHA_IOC_CLK_CTRL          _IOW(VHA_IOC_MAGIC,  13, struct vha_clk_ctrl_data)
+#define VHA_IOC_DEVICE_STATE      _IOR(VHA_IOC_MAGIC,  14, enum vha_device_state)
 
 #define VHA_SCOPE_DEV_NAME "vha_scope"
 
