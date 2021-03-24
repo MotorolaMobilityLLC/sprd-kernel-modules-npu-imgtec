@@ -163,14 +163,18 @@ static int vha_set_freq_volt(int pvr_index, int mtx_index, int ocm_index)
 	return 0;
 }
 
-static void npu_dvfs_ctx_init(struct device *dev)
+static int npu_dvfs_ctx_init(struct device *dev)
 {
-	int i = 0;
+	unsigned int i = 0;
 	int ret;
 
 	npu_dvfs_ctx.dvfs_reg.regmap_ptr = syscon_regmap_lookup_by_name(dev->of_node,
 									"dvfs_reg");
-	syscon_get_args_by_name(dev->of_node, "dvfs_reg", 2, npu_dvfs_ctx.dvfs_reg.args);
+	ret = syscon_get_args_by_name(dev->of_node, "dvfs_reg", 2, npu_dvfs_ctx.dvfs_reg.args);
+	if (ret != 2) {
+		dev_err(dev, "Failed to get dvfs reg:%d\n", ret);
+		return ret;
+	}
 
 	npu_dvfs_ctx.freq_list_len = of_property_count_elems_of_size(dev->of_node,
 								"sprd,dvfs-powervr-tbl",
@@ -203,29 +207,38 @@ static void npu_dvfs_ctx_init(struct device *dev)
 	}
 
 	ret = sysfs_create_group(&(dev->kobj), &dev_attr_group);
-	if (ret)
-		dev_err(dev, "sysfs create fail: %d", ret);
+	if (ret) {
+		dev_err(dev, "sysfs create fail: %d\n", ret);
+		return ret;
+	}
 
-	of_property_read_u32(dev->of_node, "sprd,npu_dvfs_default", &i);
+	ret = of_property_read_u32(dev->of_node, "sprd,npu_dvfs_default", &i);
+	if (ret) {
+		dev_warn(dev, "read dvfs default fail: %d\n", ret);
+		i = 0;
+	}
+	if (i >= npu_dvfs_ctx.freq_list_len) {
+		dev_err(dev, "set fault failed, out of range: %d\n", i);
+		return -ERANGE;
+	}
 	npu_dvfs_ctx.pvr_freq_default = &npu_dvfs_ctx.pvr_freq_list[i];
 	npu_dvfs_ctx.mtx_freq_default = &npu_dvfs_ctx.mtx_freq_list[i];
 	npu_dvfs_ctx.ocm_freq_default = &npu_dvfs_ctx.ocm_freq_list[i];
 
 	vha_set_freq_volt(i, i, i);
+
+	return ret;
 }
 
 static int vha_freq_search(struct npu_freq_info freq_list[], int len, unsigned long key)
 {
 	int low = 0, high = len - 1, mid;
-	if (0 > key){
-		return -1;
-	}
 	while (low <= high){
 		mid = (low + high) / 2;
-		if (key == freq_list[mid].freq * 1000){
+		if (key == freq_list[mid].freq * 1000UL){
 			return mid;
 		}
-		if (key < freq_list[mid].freq * 1000){
+		if (key < freq_list[mid].freq * 1000UL){
 			high = mid - 1;
 		}else {
 			low = mid + 1;
@@ -331,7 +344,7 @@ static int vha_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
 	volt = dev_pm_opp_get_voltage(opp);
 	exact_freq = dev_pm_opp_get_freq(opp);
 	dev_pm_opp_put(opp);
-	if (exact_freq == npu_dvfs_ctx.pvr_freq_cur->freq * 1000)
+	if (exact_freq == npu_dvfs_ctx.pvr_freq_cur->freq * 1000UL)
 		return 0;
 	index = vha_freq_search(npu_dvfs_ctx.pvr_freq_list,
 					npu_dvfs_ctx.freq_list_len,
@@ -357,7 +370,7 @@ void vha_devfreq_force_freq(struct vha_dev *vha, unsigned long freq)
 
 static int vha_devfreq_cur_freq(struct device *dev, unsigned long *freq)
 {
-	*freq = npu_dvfs_ctx.pvr_freq_cur->freq * 1000;
+	*freq = npu_dvfs_ctx.pvr_freq_cur->freq * 1000UL;
 	return 0;
 }
 
@@ -387,7 +400,7 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 	vha_get_dvfs_metrics(vha, &vha->last_devfreq_metrics, &diff);
 	state->busy_time = diff.time_busy;
 	state->total_time = diff.time_busy + diff.time_idle;
-	state->current_frequency = npu_dvfs_ctx.pvr_freq_cur-> freq * 1000;
+	state->current_frequency = npu_dvfs_ctx.pvr_freq_cur-> freq * 1000UL;
 	state->private_data = NULL;
 	return 0;
 }
@@ -400,7 +413,11 @@ int vha_devfreq_init(struct vha_dev *vha)
 	int ret;
 
 	npu_dvfs_ctx.npu_on = 1;
-	npu_dvfs_ctx_init(vha->dev);
+	ret = npu_dvfs_ctx_init(vha->dev);
+	if (ret) {
+		dev_err(vha->dev, "failed to init npu_dvfs_ctx: %d\n", ret);
+		return ret;
+	}
 	ret = dev_pm_opp_of_add_table(vha->dev);
 	if (ret) {
 		dev_err(vha->dev, "failed to init OPP table: %d\n", ret);
@@ -409,7 +426,7 @@ int vha_devfreq_init(struct vha_dev *vha)
 
 	dp = &vha->devfreq_profile;
 	dp->polling_ms = VHA_POLL_MS;
-	dp->initial_freq = npu_dvfs_ctx.pvr_freq_default->freq * 1000;
+	dp->initial_freq = npu_dvfs_ctx.pvr_freq_default->freq * 1000UL;
 	dp->target = vha_devfreq_target;
 	dp->get_cur_freq = vha_devfreq_cur_freq;
 	dp->get_dev_status = vha_devfreq_status;

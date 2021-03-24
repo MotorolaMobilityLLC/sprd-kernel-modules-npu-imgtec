@@ -195,7 +195,7 @@ static void dt_plat_poll_interrupt(unsigned long ctx)
 static struct regulator *vddai;
 static int vddai_enable(struct device *dev)
 {
-	int err = 0;
+	int err = 0, ret = 0;
 	if (!vddai) {
 		vddai = regulator_get(dev, "vddai");
 		if (IS_ERR_OR_NULL(vddai)) {
@@ -204,9 +204,9 @@ static int vddai_enable(struct device *dev)
 		}
 	}
 	if (!regulator_is_enabled(vddai)) {
-		regulator_enable(vddai);
+		ret = regulator_enable(vddai);
 	}
-	return 0;
+	return ret;
 }
 
 static void vddai_disable(struct device *dev)
@@ -258,7 +258,11 @@ static int vha_plat_probe(struct platform_device *ofdev)
 		return -ENXIO;
 	}
 
-	vddai_enable(&ofdev->dev);
+	ret = vddai_enable(&ofdev->dev);
+	if (ret) {
+		dev_err(&ofdev->dev, "failed to enable vddai:%d\n", ret);
+		return ret;
+	}
 	vha_chip_init(&ofdev->dev);
 
 	pm_runtime_enable(&ofdev->dev);
