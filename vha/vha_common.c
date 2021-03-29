@@ -1457,6 +1457,12 @@ int vha_map_buffer(struct vha_session *session,
 	}
 
 	buf = vha_find_bufid(session, buf_id);
+	if (buf == NULL) {
+		dev_err(vha->dev, "%s: could not find buf %x\n",
+			__func__, buf_id);
+		ret = -EINVAL;
+		goto out_unlock;
+	}
 
 #ifdef CONFIG_HW_MULTICORE
 	if (buf->attr & IMG_MEM_ATTR_OCM) {
@@ -1488,7 +1494,7 @@ int vha_map_buffer(struct vha_session *session,
 		}
 		ret = img_mmu_map(session->mmu_ctxs[ctx_id].ctx,
 				session->mem_ctx, buf_id, virt_addr, flags);
-		if (ret || buf == NULL) {
+		if (ret) {
 			dev_err(vha->dev, "%s: map failed!\n", __func__);
 			goto out_unlock;
 		}
@@ -1521,6 +1527,12 @@ int vha_unmap_buffer(struct vha_session *session,
 		return ret;
 
 	buf = vha_find_bufid(session, buf_id);
+	if (buf == NULL) {
+		dev_err(vha->dev, "%s: could not find buf %x\n",
+			__func__, buf_id);
+		ret = -EINVAL;
+		goto out_unlock;
+	}
 
 #ifdef CONFIG_HW_MULTICORE
 	if (buf->attr & IMG_MEM_ATTR_OCM) {
@@ -1539,7 +1551,7 @@ int vha_unmap_buffer(struct vha_session *session,
 
 	ret = img_mmu_unmap(session->mmu_ctxs[ctx_id].ctx,
 				session->mem_ctx, buf_id);
-	if (ret || buf == NULL) {
+	if (ret) {
 		dev_err(vha->dev, "%s: unmap failed!\n", __func__);
 		goto out_unlock;
 	}
