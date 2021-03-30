@@ -651,6 +651,9 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 
 	addr = cat->config.page_read(
 			cat->page, cat_entry, &flags);
+
+	if (dir->page == NULL)
+		return (uint64_t)-1;
 	/* Check consistency of PCE */
 	if (addr != dir->page->phys_addr) {
 		mmu_log_err("PCE entry inconsistent!\n");
@@ -658,7 +661,7 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 	}
 
 	tab = dir->page_map[dir_entry];
-	if (tab == NULL || dir->page == NULL)
+	if (tab == NULL)
 		return (uint64_t)-1;
 
 	addr = dir->config.page_read(
