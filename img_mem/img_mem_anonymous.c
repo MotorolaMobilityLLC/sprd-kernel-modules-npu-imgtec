@@ -114,7 +114,7 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 		goto get_user_pages_failed;
 	}
 
-	sgt = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
+	sgt = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
 	if (!sgt) {
 		ret = -ENOMEM;
 		goto alloc_sgt_failed;
@@ -126,7 +126,7 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 		goto alloc_sgt_pages_failed;
 	}
 
-	data = kmalloc(sizeof(struct buffer_data), GFP_KERNEL);
+	data = kzalloc(sizeof(struct buffer_data), GFP_KERNEL);
 	if (!data) {
 		ret = -ENOMEM;
 		goto alloc_priv_failed;
