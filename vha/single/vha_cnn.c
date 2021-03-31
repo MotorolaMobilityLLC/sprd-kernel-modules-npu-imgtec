@@ -179,6 +179,11 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 			 * offset can be specified for all
 			 * buffers except cmdstream buf
 			 */
+			if (i <= 0) {
+				dev_err(vha->dev, "%s: out of range:%d\n",
+					__func__, i);
+				goto out_error;
+			}
 			offset = user_cmd->bufoffsets[i-1];
 			size = user_cmd->bufsizes[i-1];
 
