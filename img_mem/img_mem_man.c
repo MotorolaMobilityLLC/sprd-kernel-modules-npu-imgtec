@@ -2410,7 +2410,7 @@ int img_mmu_vaa_free(struct mmu_vaa *vaa, uint32_t addr, size_t size)
 
 	entry = list_first_entry(&vaa->entries,
 		struct vaa_entry, mmu_vaa_entry);
-	while (!entry) {
+	while (entry) {
 		if (entry->alloc->vaddr == addr &&
 			entry->alloc->size == size)
 			break;
