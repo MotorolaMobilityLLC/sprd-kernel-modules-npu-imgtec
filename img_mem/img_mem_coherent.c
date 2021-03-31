@@ -72,7 +72,7 @@ static int coherent_heap_alloc(struct device *device, struct heap *heap,
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		 buffer->id, buffer);
 
-	buffer_data = kmalloc(sizeof(struct buffer_data), GFP_KERNEL);
+	buffer_data = kzalloc(sizeof(struct buffer_data), GFP_KERNEL);
 	if (!buffer_data)
 		return -ENOMEM;
 
