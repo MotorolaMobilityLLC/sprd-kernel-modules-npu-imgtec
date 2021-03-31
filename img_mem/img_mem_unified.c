@@ -442,7 +442,7 @@ static int unified_alloc(struct device *device, struct heap *heap,
 		}
 	}
 
-	sgt = kmalloc(sizeof(struct sg_table), GFP_KERNEL);
+	sgt = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
 	if (!sgt) {
 		ret = -ENOMEM;
 		goto alloc_pages_failed;
