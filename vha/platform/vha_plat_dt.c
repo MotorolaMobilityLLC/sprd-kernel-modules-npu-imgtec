@@ -263,6 +263,7 @@ static int vha_plat_probe(struct platform_device *ofdev)
 		dev_err(&ofdev->dev, "failed to enable vddai:%d\n", ret);
 		return ret;
 	}
+	udelay(400);
 	vha_chip_init(&ofdev->dev);
 
 	pm_runtime_enable(&ofdev->dev);
