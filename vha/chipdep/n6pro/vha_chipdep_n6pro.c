@@ -50,6 +50,8 @@ struct npu_regmap{
 	struct regmap *ai_mtx_regs;
 	struct regmap *ai_busmon_regs;
 	struct regmap *ai_pd_regs;
+	struct regmap *top_dvfs_regs;
+	struct regmap *ai_sw_dvfs_regs;
 };
 static struct npu_regmap ai_regs;
 
@@ -190,6 +192,18 @@ static int vha_init_regs(struct device *dev)
 		dev_err_once(dev, "failed to get pd_ai_reg\n");
 		return -EINVAL;
 	}
+
+	ai_regs.top_dvfs_regs = syscon_regmap_lookup_by_name(np, "top_dvfs_cfg");
+	if (IS_ERR(ai_regs.top_dvfs_regs)) {
+		dev_err_once(dev, "failed to get top_dvfs_reg\n");
+		return -EINVAL;
+	}
+
+	ai_regs.ai_sw_dvfs_regs = syscon_regmap_lookup_by_name(np, "ai_sw_dvfs_ctrl");
+	if (IS_ERR(ai_regs.ai_sw_dvfs_regs)) {
+		dev_err_once(dev, "failed to get ai_sw_dvfs_reg\n");
+		return -EINVAL;
+	}
 	return 0;
 }
 
@@ -295,7 +309,8 @@ static int vha_auto_ckg_setup(struct device *dev)
 		MASK_AI_APB_OCM_FR_AUTO_GATE_EN |
 		MASK_AI_APB_DVFS_FR_AUTO_GATE_EN;
 
-	regmap_update_bits(ai_regs.ai_apb_regs, REG_AI_APB_USER_GATE_AUTO_GATE_EN, mask, mask);
+	regmap_update_bits(ai_regs.ai_apb_regs, REG_AI_APB_USER_GATE_AUTO_GATE_EN,
+				mask, mask);
 
 	return 0;
 }
@@ -335,6 +350,30 @@ static int vha_clockdomain_setup(struct device *dev)
 	return 0;
 }
 
+#ifdef VHA_DEVFREQ
+static int vha_disable_idle_switch(struct device *dev)
+{
+	uint32_t reg, mask;
+
+	mask =  MASK_AI_DVFS_APB_AI_OCM_DFS_IDLE_DISABLE |
+		MASK_AI_DVFS_APB_AI_MAIN_MTX_DFS_IDLE_DISABLE |
+		MASK_AI_DVFS_APB_AI_POWERVR_DFS_IDLE_DISABLE;
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_AI_DFS_IDLE_DISABLE_CFG0,
+				mask, mask);
+	/* disable top_ai_sw_dvfs */
+	reg = REG_TOP_DVFS_APB_SUBSYS_SW_DVFS_EN_CFG;
+	mask = MASK_TOP_DVFS_APB_AI_SW_DVFS_EN;
+	regmap_update_bits(ai_regs.ai_sw_dvfs_regs, reg, mask, 0);
+	/* disable top_ai_sw_dvfs_ctrl */
+	reg = REG_TOP_DVFS_APB_DCDC_AI_SW_DVFS_CTRL;
+	mask = MASK_TOP_DVFS_APB_DCDC_AI_SW_TUNE_EN;
+	regmap_update_bits(ai_regs.top_dvfs_regs, reg, mask, 0);
+
+	return 0;
+}
+#endif
+
 static int vha_clockdomain_unsetup(struct device *dev)
 {
 	int num_clks = ARRAY_SIZE(clks);
@@ -370,6 +409,7 @@ int vha_chip_runtime_resume(struct device *dev)
 	vha_clockdomain_setup(dev);
 	vha_set_qos(dev);
 #ifdef VHA_DEVFREQ
+	vha_disable_idle_switch(dev);
 	vha_devfreq_resume(dev);
 #endif
 

@@ -18,6 +18,7 @@
 #include <linux/device.h>
 #include <linux/of_platform.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
@@ -54,6 +55,7 @@ struct npu_freq_info {
 struct npu_dvfs_context {
 	int npu_on;
 	int npu_dvfs_on;
+	int pvr_last_cfg, mtx_last_cfg, ocm_last_cfg;
 	struct semaphore *sem;
 
 	struct npu_freq_info *pvr_freq_list;
@@ -80,14 +82,20 @@ static struct npu_dvfs_context npu_dvfs_ctx=
 	.sem=&npu_dvfs_sem,
 };
 
-unsigned long force_freq;
+void vha_force_freq(struct device *dev, unsigned long freq);
 static ssize_t force_npu_freq_store(struct device *dev,
 				struct device_attribute *attr,
 				const char *buf, size_t count)
 {
 	int ret;
+	unsigned long force_freq;
 
 	ret = sscanf(buf, "%lu\n", &force_freq);
+	pm_runtime_get_sync(dev);
+	npu_dvfs_ctx.npu_on = 1;
+	vha_force_freq(dev, force_freq);
+	npu_dvfs_ctx.npu_on = 0;
+	pm_runtime_put(dev);
 	return count;
 }
 
@@ -149,16 +157,25 @@ static int vha_set_freq_volt(int pvr_index, int mtx_index, int ocm_index)
 {
 	if (npu_dvfs_ctx.npu_on) {
 		down(npu_dvfs_ctx.sem);
-		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr, REG_AI_DVFS_APB_POWERVR_DVFS_INDEX_CFG,
-				MASK_AI_DVFS_APB_POWERVR_DVFS_INDEX, pvr_index);
-		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr, REG_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX_CFG,
-				MASK_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX, mtx_index);
-		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr, REG_AI_DVFS_APB_OCM_DVFS_INDEX_CFG,
-				MASK_AI_DVFS_APB_OCM_DVFS_INDEX, ocm_index);
+		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr,
+					REG_AI_DVFS_APB_POWERVR_DVFS_INDEX_CFG,
+					MASK_AI_DVFS_APB_POWERVR_DVFS_INDEX,
+					pvr_index);
+		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr,
+					REG_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX_CFG,
+					MASK_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX,
+					mtx_index);
+		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr,
+					REG_AI_DVFS_APB_OCM_DVFS_INDEX_CFG,
+					MASK_AI_DVFS_APB_OCM_DVFS_INDEX,
+					ocm_index);
+		up(npu_dvfs_ctx.sem);
 		npu_dvfs_ctx.pvr_freq_cur = &npu_dvfs_ctx.pvr_freq_list[pvr_index];
 		npu_dvfs_ctx.mtx_freq_cur = &npu_dvfs_ctx.mtx_freq_list[mtx_index];
 		npu_dvfs_ctx.ocm_freq_cur = &npu_dvfs_ctx.ocm_freq_list[ocm_index];
-		up(npu_dvfs_ctx.sem);
+		npu_dvfs_ctx.pvr_last_cfg = pvr_index;
+		npu_dvfs_ctx.mtx_last_cfg = mtx_index;
+		npu_dvfs_ctx.ocm_last_cfg = ocm_index;
 	}
 	return 0;
 }
@@ -185,25 +202,25 @@ static int npu_dvfs_ctx_init(struct device *dev)
 
 	for(i=0; i< npu_dvfs_ctx.freq_list_len; i++){
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-powervr-tbl", 3*i+2,
-								   &npu_dvfs_ctx.pvr_freq_list[i].index);
+						&npu_dvfs_ctx.pvr_freq_list[i].index);
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-powervr-tbl", 3*i,
-								   &npu_dvfs_ctx.pvr_freq_list[i].freq);
+						&npu_dvfs_ctx.pvr_freq_list[i].freq);
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-powervr-tbl", 3*i+1,
-								   &npu_dvfs_ctx.pvr_freq_list[i].volt);
+						&npu_dvfs_ctx.pvr_freq_list[i].volt);
 
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-mtx-tbl", 3*i+2,
-								   &npu_dvfs_ctx.mtx_freq_list[i].index);
+						&npu_dvfs_ctx.mtx_freq_list[i].index);
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-mtx-tbl", 3*i,
-								   &npu_dvfs_ctx.mtx_freq_list[i].freq);
+						&npu_dvfs_ctx.mtx_freq_list[i].freq);
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-mtx-tbl", 3*i+1,
-								   &npu_dvfs_ctx.mtx_freq_list[i].volt);
+						&npu_dvfs_ctx.mtx_freq_list[i].volt);
 
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-ocm-tbl", 3*i+2,
-								   &npu_dvfs_ctx.ocm_freq_list[i].index);
+						&npu_dvfs_ctx.ocm_freq_list[i].index);
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-ocm-tbl", 3*i,
-								   &npu_dvfs_ctx.ocm_freq_list[i].freq);
+						&npu_dvfs_ctx.ocm_freq_list[i].freq);
 		of_property_read_u32_index(dev->of_node, "sprd,dvfs-ocm-tbl", 3*i+1,
-								   &npu_dvfs_ctx.ocm_freq_list[i].volt);
+						&npu_dvfs_ctx.ocm_freq_list[i].volt);
 	}
 
 	ret = sysfs_create_group(&(dev->kobj), &dev_attr_group);
@@ -221,6 +238,7 @@ static int npu_dvfs_ctx_init(struct device *dev)
 		dev_err(dev, "set fault failed, out of range: %d\n", i);
 		return -ERANGE;
 	}
+
 	npu_dvfs_ctx.pvr_freq_default = &npu_dvfs_ctx.pvr_freq_list[i];
 	npu_dvfs_ctx.mtx_freq_default = &npu_dvfs_ctx.mtx_freq_list[i];
 	npu_dvfs_ctx.ocm_freq_default = &npu_dvfs_ctx.ocm_freq_list[i];
@@ -359,13 +377,10 @@ static int vha_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
 	return ret;
 }
 
-void vha_devfreq_force_freq(struct vha_dev *vha, unsigned long freq)
+void vha_force_freq(struct device *dev, unsigned long freq)
 {
-	unsigned long target_freq = freq;
-	if (!vha) {
-		return ;
-	}
-	vha_devfreq_target(vha->dev, &target_freq, 0);
+	unsigned long target_freq = freq * 1000UL;
+	vha_devfreq_target(dev, &target_freq, 0);
 }
 
 static int vha_devfreq_cur_freq(struct device *dev, unsigned long *freq)
@@ -374,7 +389,9 @@ static int vha_devfreq_cur_freq(struct device *dev, unsigned long *freq)
 	return 0;
 }
 
-static void vha_get_dvfs_metrics(struct vha_dev *vha, struct vha_devfreq_metrics *last, struct vha_devfreq_metrics *diff)
+static void vha_get_dvfs_metrics(struct vha_dev *vha,
+				struct vha_devfreq_metrics *last,
+				struct vha_devfreq_metrics *diff)
 {
 	struct vha_devfreq_metrics *cur = &vha->cur_state.value;
 	unsigned long flags;
@@ -495,10 +512,6 @@ void vha_devfreq_term(struct vha_dev *vha)
 void vha_devfreq_suspend(struct device *dev)
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
-	if (!vha) {
-		dev_err(dev, "Invalid vha, failed to suspend vha_devfreq!\n");
-		return ;
-	}
 	if (vha->devfreq_init) {
 		if (npu_dvfs_ctx.npu_dvfs_on)
 			devfreq_suspend_device(vha->devfreq);
@@ -509,17 +522,18 @@ void vha_devfreq_suspend(struct device *dev)
 
 void vha_devfreq_resume(struct device *dev)
 {
+
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
-	if (!vha) {
-		dev_err(dev, "Invalid vha, failed to resume vha_devfreq!\n");
-		return ;
-	}
-	if(vha->devfreq_init) {
+	if (!vha)
+		return;
+	if (vha->devfreq_init) {
 		npu_dvfs_ctx.npu_on = 1;
-		if (npu_dvfs_ctx.npu_dvfs_on)
+		vha_set_freq_volt(npu_dvfs_ctx.pvr_last_cfg,
+				npu_dvfs_ctx.mtx_last_cfg,
+				npu_dvfs_ctx.ocm_last_cfg);
+		if (npu_dvfs_ctx.npu_dvfs_on) {
 			devfreq_resume_device(vha->devfreq);
-		else
-			vha_devfreq_force_freq(vha, force_freq*1000);
+		}
 	}
 	return ;
 }
