@@ -23,6 +23,7 @@
 #include <linux/regmap.h>
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
+#include <linux/regulator/consumer.h>
 
 #include "vha_chipdep.h"
 #include "vha_common.h"
@@ -207,6 +208,30 @@ static int vha_init_regs(struct device *dev)
 	return 0;
 }
 
+static struct regulator *vddai = NULL;
+static int vddai_enable(struct device *dev)
+{
+	int ret = 0;
+	if (!vddai) {
+		vddai = regulator_get(dev, "vddai");
+		if (IS_ERR_OR_NULL(vddai)) {
+			ret = PTR_ERR(vddai);
+			return ret;
+		}
+	}
+	if (!regulator_is_enabled(vddai)) {
+		ret = regulator_enable(vddai);
+	}
+	return ret;
+}
+
+static void vddai_disable(struct device *dev)
+{
+	if (regulator_is_enabled(vddai)) {
+		regulator_disable(vddai);
+	}
+}
+
 static int vha_power_on(struct npu_pm_domain *pd)
 {
 	uint32_t reg, mask;
@@ -236,7 +261,7 @@ static int vha_powerdomain_init(struct device *dev)
 	struct device_node *np = dev->of_node;
 	struct npu_pm_domain *pd = &pd_ai_sys;
 	dev_info(dev, "domain_np fullname %s\n", np->full_name);
-	pd->pmu_apb_regs = ai_regs.ai_pd_regs; 
+	pd->pmu_apb_regs = ai_regs.ai_pd_regs;
 
 	err = syscon_get_args_by_name(np, "pd_ai_sys", 2, pd->u.args);
 	if (err != 2) {
@@ -385,9 +410,16 @@ static int vha_clockdomain_unsetup(struct device *dev)
 
 int vha_chip_init(struct device *dev)
 {
+	int ret;
 	device_set_wakeup_capable(dev, true);
 	device_wakeup_enable(dev);
 	vha_init_regs(dev);
+	ret = vddai_enable(dev);
+	if (ret) {
+		dev_err(dev, "failed to enable vddai:%d\n", ret);
+		return ret;
+	}
+	udelay(400);
 	vha_powerdomain_init(dev);
 	vha_powerdomain_setup();
 	vha_clockdomain_init(dev);
@@ -405,6 +437,13 @@ int vha_chip_deinit(struct device *dev)
 
 int vha_chip_runtime_resume(struct device *dev)
 {
+	int ret;
+	ret = vddai_enable(dev);
+	if (ret) {
+		dev_err(dev, "failed to enable vddai:%d\n", ret);
+		return ret;
+	}
+	udelay(400);
 	vha_powerdomain_setup();
 	vha_clockdomain_setup(dev);
 	vha_set_qos(dev);
@@ -423,6 +462,7 @@ int vha_chip_runtime_suspend(struct device *dev)
 #endif
 	vha_clockdomain_unsetup(dev);
 	vha_powerdomain_unsetup();
+	vddai_disable(dev);
 
 	return 0;
 }

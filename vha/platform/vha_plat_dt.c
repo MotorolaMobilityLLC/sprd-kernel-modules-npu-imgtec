@@ -56,7 +56,6 @@
 #include <linux/pm_runtime.h>
 #include <linux/ktime.h>
 #include <linux/sched/clock.h>
-#include <linux/regulator/consumer.h>
 
 #include <img_mem_man.h>
 #include "vha_common.h"
@@ -192,30 +191,6 @@ static void dt_plat_poll_interrupt(unsigned long ctx)
 			jiffies + msecs_to_jiffies(irq_poll_interval_ms));
 }
 
-static struct regulator *vddai;
-static int vddai_enable(struct device *dev)
-{
-	int err = 0, ret = 0;
-	if (!vddai) {
-		vddai = regulator_get(dev, "vddai");
-		if (IS_ERR_OR_NULL(vddai)) {
-			err = PTR_ERR(vddai);
-			return err;
-		}
-	}
-	if (!regulator_is_enabled(vddai)) {
-		ret = regulator_enable(vddai);
-	}
-	return ret;
-}
-
-static void vddai_disable(struct device *dev)
-{
-	if (regulator_is_enabled(vddai)) {
-		regulator_disable(vddai);
-	}
-}
-
 static int vha_plat_probe(struct platform_device *ofdev)
 {
 	int ret;
@@ -258,12 +233,6 @@ static int vha_plat_probe(struct platform_device *ofdev)
 		return -ENXIO;
 	}
 
-	ret = vddai_enable(&ofdev->dev);
-	if (ret) {
-		dev_err(&ofdev->dev, "failed to enable vddai:%d\n", ret);
-		return ret;
-	}
-	udelay(400);
 	vha_chip_init(&ofdev->dev);
 
 	pm_runtime_enable(&ofdev->dev);
@@ -327,7 +296,6 @@ static int vha_plat_remove(struct platform_device *ofdev)
 	vha_plat_dt_hw_destroy(ofdev);
 	pm_runtime_disable(&ofdev->dev);
 	vha_chip_deinit(&ofdev->dev);
-	vddai_disable(&ofdev->dev);
 	return 0;
 }
 
