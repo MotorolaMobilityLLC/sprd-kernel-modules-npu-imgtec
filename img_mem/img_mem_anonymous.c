@@ -65,8 +65,8 @@ struct buffer_data {
 };
 
 static int anonymous_heap_import(struct device *device, struct heap *heap,
-			      size_t size, enum img_mem_attr attr, uint64_t buf_hnd,
-			      struct buffer *buffer)
+						size_t size, enum img_mem_attr attr, uint64_t buf_hnd,
+						struct buffer *buffer)
 {
 	struct buffer_data *data;
 	unsigned long cpu_addr = (unsigned long)buf_hnd;
@@ -290,12 +290,61 @@ static int anonymous_heap_unmap_km(struct heap *heap, struct buffer *buffer)
 }
 
 static int anonymous_get_sg_table(struct heap *heap, struct buffer *buffer,
-			       struct sg_table **sg_table)
+						 struct sg_table **sg_table)
 {
 	struct buffer_data *data = buffer->priv;
 
 	*sg_table = data->sgt;
 	return 0;
+}
+
+static void anonymous_sync_cpu_to_dev(struct heap *heap, struct buffer *buffer)
+{
+	struct buffer_data *buffer_data = buffer->priv;
+	struct sg_table *sgt = buffer_data->sgt;
+	int ret;
+	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer);
+	if (!(buffer_data->mattr & IMG_MEM_ATTR_UNCACHED)) {
+		ret = dma_map_sg(buffer->device, sgt->sgl, sgt->orig_nents, DMA_TO_DEVICE);
+		if (ret <= 0) {
+			pr_err("%s dma_map_sg failed!\n", __func__);
+			return;
+		}
+		dma_sync_sg_for_device(buffer->device,
+				sgt->sgl,
+				sgt->orig_nents,
+				DMA_TO_DEVICE);
+		dma_sync_sg_for_cpu(buffer->device,
+				sgt->sgl,
+				sgt->orig_nents,
+				DMA_FROM_DEVICE);
+		dma_unmap_sg(buffer->device, sgt->sgl, sgt->orig_nents, DMA_TO_DEVICE);
+	}
+}
+
+static void anonymous_sync_dev_to_cpu(struct heap *heap, struct buffer *buffer)
+{
+	struct buffer_data *buffer_data = buffer->priv;
+	struct sg_table *sgt = buffer_data->sgt;
+	int ret;
+	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer);
+
+	if (!(buffer_data->mattr & IMG_MEM_ATTR_UNCACHED)) {
+		ret = dma_map_sg(buffer->device, sgt->sgl, sgt->orig_nents,
+				DMA_FROM_DEVICE);
+		if (ret <= 0) {
+			pr_err("%s dma_map_sg failed!\n", __func__);
+			return;
+		}
+		dma_sync_sg_for_cpu(buffer->device,
+				sgt->sgl,
+				sgt->orig_nents,
+				DMA_FROM_DEVICE);
+		dma_unmap_sg(buffer->device, sgt->sgl,
+								 sgt->orig_nents, DMA_FROM_DEVICE);
+	}
 }
 
 static void anonymous_heap_destroy(struct heap *heap)
@@ -313,8 +362,8 @@ static struct heap_ops anonymous_heap_ops = {
 	.unmap_km = anonymous_heap_unmap_km,
 	.get_sg_table = anonymous_get_sg_table,
 	.get_page_array = NULL,
-	.sync_cpu_to_dev = NULL, 
-	.sync_dev_to_cpu = NULL, 
+	.sync_cpu_to_dev = anonymous_sync_cpu_to_dev,
+	.sync_dev_to_cpu = anonymous_sync_dev_to_cpu,
 	.set_offset = NULL,
 	.destroy = anonymous_heap_destroy,
 };
