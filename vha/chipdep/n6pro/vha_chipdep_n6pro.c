@@ -57,24 +57,31 @@ struct npu_regmap{
 };
 static struct npu_regmap ai_regs;
 
+static int get_qos_array_length(QOS_REG_T array[])
+{
+	int i = 0;
+	while (array[i].base_addr != 0) {
+		i++;
+	}
+	return i;
+}
+
+static void qos_parameters_set(QOS_REG_T array[])
+{
+	int i, length;
+	void __iomem *addr;
+	length = get_qos_array_length(array);
+	for (i = 0; i < length; i++) {
+		addr = ioremap(array[i].base_addr, 4);
+		writel(readl(addr) & (~array[i].mask_value) | array[i].set_value, addr);
+		iounmap(addr);
+	}
+}
+
 static int vha_set_qos()
 {
-	int i;
-	int length = ARRAY_SIZE(nic400_ai_main_mtx_m0_qos_list);
-	for (i = 0; i < length; i++) {
-		regmap_update_bits(ai_regs.ai_mtx_regs,
-				nic400_ai_main_mtx_m0_qos_list[i].base_addr,
-				nic400_ai_main_mtx_m0_qos_list[i].mask_value,
-				nic400_ai_main_mtx_m0_qos_list[i].set_value);
-	}
-	length = ARRAY_SIZE(ai_apb_rf_qos_list);
-	for (i = 0; i < length; i++) {
-		regmap_update_bits(ai_regs.ai_apb_regs,
-				ai_apb_rf_qos_list[i].base_addr,
-				ai_apb_rf_qos_list[i].mask_value,
-				ai_apb_rf_qos_list[i].set_value);
-	}
-
+	qos_parameters_set(nic400_ai_main_mtx_m0_qos_list);
+	qos_parameters_set(ai_apb_rf_qos_list);
 	return 0;
 }
 
