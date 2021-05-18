@@ -163,6 +163,22 @@ static void vddai_disable(struct device *dev)
 	}
 }
 
+static void aipll_force_off(uint32_t val)
+{
+	if (val) {
+		regmap_update_bits(ai_regs.ai_pd_regs,
+				REG_PMU_APB_AIPLL_REL_CFG,
+				MASK_PMU_APB_GPLL_FRC_OFF,
+				MASK_PMU_APB_GPLL_FRC_OFF);
+	}
+	else {
+		regmap_update_bits(ai_regs.ai_pd_regs,
+				REG_PMU_APB_AIPLL_REL_CFG,
+				MASK_PMU_APB_GPLL_FRC_OFF,
+				0);
+	}
+}
+
 static int vha_power_on(struct npu_pm_domain *pd)
 {
 	uint32_t reg, mask;
@@ -368,6 +384,7 @@ int vha_chip_deinit(struct device *dev)
 int vha_chip_runtime_resume(struct device *dev)
 {
 	int ret;
+	aipll_force_off(0);
 	ret = vddai_enable(dev);
 	if (ret) {
 		dev_err(dev, "failed to enable vddai:%d\n", ret);
@@ -393,6 +410,7 @@ int vha_chip_runtime_suspend(struct device *dev)
 	vha_clockdomain_unsetup(dev);
 	vha_powerdomain_unsetup();
 	vddai_disable(dev);
+	aipll_force_off(1);
 
 	return 0;
 }
