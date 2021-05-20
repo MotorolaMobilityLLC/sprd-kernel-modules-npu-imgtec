@@ -163,6 +163,7 @@ static void vddai_disable(struct device *dev)
 	}
 }
 
+#if 0
 static void aipll_force_off(uint32_t val)
 {
 	if (val) {
@@ -178,6 +179,7 @@ static void aipll_force_off(uint32_t val)
 				0);
 	}
 }
+#endif
 
 static int vha_power_on(struct npu_pm_domain *pd)
 {
@@ -223,7 +225,7 @@ static int vha_powerdomain_init(struct device *dev)
 #define  LOOP_TIME  34  // (2000us - 300 us)/50us =34 times
 static int vha_wait_power_ready(struct npu_pm_domain *pd)
 {
-	uint32_t ret, mask, reg, val, loop=0;
+	uint32_t ret, mask, reg, val=0, loop=0;
 
 	reg = REG_PMU_APB_PWR_STATUS_DBG_10;
 	mask = MASK_PMU_APB_PD_AI_STATE;
@@ -384,7 +386,7 @@ int vha_chip_deinit(struct device *dev)
 int vha_chip_runtime_resume(struct device *dev)
 {
 	int ret;
-	aipll_force_off(0);
+	//aipll_force_off(0);
 	ret = vddai_enable(dev);
 	if (ret) {
 		dev_err(dev, "failed to enable vddai:%d\n", ret);
@@ -410,7 +412,7 @@ int vha_chip_runtime_suspend(struct device *dev)
 	vha_clockdomain_unsetup(dev);
 	vha_powerdomain_unsetup();
 	vddai_disable(dev);
-	aipll_force_off(1);
+	//aipll_force_off(1);
 
 	return 0;
 }
