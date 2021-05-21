@@ -163,7 +163,6 @@ static void vddai_disable(struct device *dev)
 	}
 }
 
-#if 0
 static void aipll_force_off(uint32_t val)
 {
 	if (val) {
@@ -179,7 +178,6 @@ static void aipll_force_off(uint32_t val)
 				0);
 	}
 }
-#endif
 
 static int vha_power_on(struct npu_pm_domain *pd)
 {
@@ -386,7 +384,7 @@ int vha_chip_deinit(struct device *dev)
 int vha_chip_runtime_resume(struct device *dev)
 {
 	int ret;
-	//aipll_force_off(0);
+	aipll_force_off(0);
 	ret = vddai_enable(dev);
 	if (ret) {
 		dev_err(dev, "failed to enable vddai:%d\n", ret);
@@ -412,7 +410,7 @@ int vha_chip_runtime_suspend(struct device *dev)
 	vha_clockdomain_unsetup(dev);
 	vha_powerdomain_unsetup();
 	vddai_disable(dev);
-	//aipll_force_off(1);
+	aipll_force_off(1);
 
 	return 0;
 }
