@@ -46,6 +46,7 @@
 #include <linux/list.h>
 #include <linux/debugfs.h>
 #include <linux/uaccess.h>
+#include <linux/pm_runtime.h>
 
 #include <uapi/vha.h>
 #include "vha_common.h"
@@ -117,6 +118,25 @@ struct vha_ptedump {
 	size_t page_size;
 	size_t virt_size;
 };
+
+static uint64_t vha_io_read(struct device *dev, void __iomem *reg_base,
+				uint64_t offset)
+{
+	uint64_t io_data;
+	pm_runtime_get_sync(dev);
+	io_data = IOREAD64(reg_base, offset);
+	pm_runtime_put(dev);
+
+	return io_data;
+}
+
+static void vha_io_write(struct device *dev, void __iomem *reg_base,
+				uint64_t offset, uint64_t io_data)
+{
+	pm_runtime_get_sync(dev);
+	IOWRITE64(reg_base, offset, io_data);
+	pm_runtime_put(dev);
+}
 
 static void *vha_mmu_ptedump_start(struct seq_file *seq, loff_t *pos)
 {
@@ -780,20 +800,24 @@ void vha_dbg_destroy_hwbufs(struct vha_session *session)
 	debugfs_remove_recursive(session->dbgfs);
 }
 
+/* List of predefined registers to be shown in debugfs */
+extern const struct vha_reg vha_regs[];
+
 static int _show_vha_regset(struct seq_file *s, void *data)
 {
-	struct vha_regset *regset = s->private;
-	const struct vha_reg *reg = regset->regs;
+	struct vha_dev *vha = s->private;
+	int nregs = vha->reg_size / sizeof(uint64_t);
+	const struct vha_reg *reg = vha_regs;
 	char str[150];
 	int i;
-
-	for (i = 0; i < regset->nregs; i++, reg++) {
+	pm_runtime_get_sync(vha->dev);
+	for (i = 0; i < nregs; i++, reg++) {
 		uint64_t val;
 
 		if (reg->name == NULL)
 			break;
 
-		val = IOREAD64(regset->base, reg->offset);
+		val = IOREAD64(vha->reg_base, reg->offset);
 		sprintf(str, "%s(0x%04x) = 0x%016llx",
 				reg->name, reg->offset, val);
 		if (val & ~reg->mask)
@@ -801,6 +825,7 @@ static int _show_vha_regset(struct seq_file *s, void *data)
 		strcat(str, "\n");
 		seq_puts(s, str);
 	}
+	pm_runtime_put(vha->dev);
 	return 0;
 }
 
@@ -815,9 +840,6 @@ static const struct file_operations vha_regset_fops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
-
-/* List of predefined registers to be shown in debugfs */
-extern const struct vha_reg vha_regs[];
 
 static ssize_t vha_cnn_utilization_read(struct file *file, char __user *buf,
 			size_t count, loff_t *ppos)
@@ -903,7 +925,7 @@ static ssize_t vha_bvnc_read(struct file *file, char __user *buf, size_t len,
 	struct vha_dev *vha = file->private_data;
 	char bvnc[4*6];
 #define BVNC_OFFSET (0x20U)
-	uint64_t core_id = IOREAD64(vha->reg_base, BVNC_OFFSET);
+	uint64_t core_id = vha_io_read(vha->dev, vha->reg_base, BVNC_OFFSET);
 	size_t size = snprintf(bvnc, sizeof(bvnc), "%hu.%hu.%hu.%hu\n",
 				(unsigned short)((core_id & 0xffff000000000000ULL) >> 48),
 				(unsigned short)((core_id & 0x0000ffff00000000ULL) >> 32),
@@ -934,8 +956,9 @@ static ssize_t vha_rtm_read(struct file *file, char __user *buf, size_t len,
 	ret = mutex_lock_interruptible(&vha->lock);
 	if (!ret) {
 		size_t size;
-
+		pm_runtime_get_sync(vha->dev);
 		rtm_data = vha_dbg_rtm_read(vha, ctx->rtm_ctrl);
+		pm_runtime_put(vha->dev);
 		size = snprintf(rtm, sizeof(rtm), "%#.8llx %#.8llx\n",
 			ctx->rtm_ctrl, rtm_data);
 
@@ -973,7 +996,7 @@ static ssize_t vha_ioreg_read(struct file *file, char __user *buf, size_t len,
 		return -EINVAL;
 	}
 	/* Read the data */
-	io_data = IOREAD64(vha->reg_base, ctx->ioreg_addr);
+	io_data = vha_io_read(vha->dev, vha->reg_base, ctx->ioreg_addr);
 
 	size = snprintf(data, sizeof(data), "%#.8llx::%#.16llx\n",
 			ctx->ioreg_addr, io_data);
@@ -1000,7 +1023,7 @@ static ssize_t vha_ioreg_write(struct file *file, const char __user *buf,
 	}
 
 	/* Write the data */
-	IOWRITE64(vha->reg_base, ctx->ioreg_addr, io_data);
+	vha_io_write(vha->dev, vha->reg_base, ctx->ioreg_addr, io_data);
 
 	return len;
 }
@@ -1296,7 +1319,7 @@ void vha_dbg_init(struct vha_dev *vha)
 		ctx->regset.regs = vha_regs;
 		ctx->regset.nregs = vha->reg_size / sizeof(uint64_t);
 		ctx->regset.base = vha->reg_base;
-		CTX_DBGFS_CREATE_FILE(S_IRUGO, "regdump", regset);
+		VHA_DBGFS_CREATE_FILE(S_IRUGO, "regdump", regset);
 	}
 
 	VHA_DBGFS_CREATE_RO(u32, "core_freq_khz", freq_khz, debugfs_dir);
