@@ -971,7 +971,12 @@ static ssize_t
 BVNC_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
-	struct vha_core_props *props = &vha->core_props;
+	struct vha_core_props *props;
+	if (!vha) {
+		WARN_ON(1);
+		return sprintf(buf, "Get vha_dev failed!\n");
+	}
+	props = &vha->core_props;
 
 	return snprintf(buf, 4*6, "%hu.%hu.%hu.%hu\n",
 			(unsigned short)(props->core_id >> 48),
@@ -1868,7 +1873,7 @@ int vha_set_buf_status(struct vha_session *session,
 	 * mark that it probably needs invalidation, not necessarily,
 	 * as it can be the input for the next hw segment,
 	 * and may not be mapped by the UM */
-	if (buf->status == VHA_BUF_UNFILLED &&
+	if (buf->status != VHA_BUF_FILLED_BY_HW &&
 			status == VHA_BUF_FILLED_BY_HW) {
 		buf->inval = true;
 #ifdef KERNEL_DMA_FENCE_SUPPORT
@@ -2530,6 +2535,10 @@ int vha_suspend_dev(struct device *dev)
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	bool processing = false;
 	int ret;
+	if (!vha) {
+		WARN_ON(1);
+		return -EFAULT;
+	}
 	mutex_lock(&vha->lock);
 	dev_dbg(dev, "%s: taking a nap!\n", __func__);
 
@@ -2545,6 +2554,10 @@ int vha_suspend_dev(struct device *dev)
 int vha_resume_dev(struct device *dev)
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
+	if (!vha) {
+		WARN_ON(1);
+		return -EFAULT;
+	}
 
 	mutex_lock(&vha->lock);
 	dev_dbg(dev, "%s: waking up!\n", __func__);

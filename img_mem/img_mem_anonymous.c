@@ -159,6 +159,13 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 	data->mattr = attr;
 	buffer->priv = data;
 
+	ret = dma_map_sg(buffer->device, sgt->sgl, sgt->orig_nents,
+				DMA_BIDIRECTIONAL);
+	if (ret <= 0) {
+		pr_err("%s dma_map_sg failed!\n", __func__);
+		goto dma_mask_check_failed;
+	}
+
 	kfree(pages);
 	return 0;
 
@@ -186,6 +193,9 @@ static void anonymous_heap_free(struct heap *heap, struct buffer *buffer)
 
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		 buffer->id, buffer);
+
+	dma_unmap_sg(buffer->device, sgt->sgl, sgt->orig_nents,
+			DMA_BIDIRECTIONAL);
 
 	if (buffer->kptr) {
 		pr_debug("%s vunmap 0x%p\n", __func__, buffer->kptr);
@@ -302,15 +312,9 @@ static void anonymous_sync_cpu_to_dev(struct heap *heap, struct buffer *buffer)
 {
 	struct buffer_data *buffer_data = buffer->priv;
 	struct sg_table *sgt = buffer_data->sgt;
-	int ret;
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		buffer->id, buffer);
 	if (!(buffer_data->mattr & IMG_MEM_ATTR_UNCACHED)) {
-		ret = dma_map_sg(buffer->device, sgt->sgl, sgt->orig_nents, DMA_TO_DEVICE);
-		if (ret <= 0) {
-			pr_err("%s dma_map_sg failed!\n", __func__);
-			return;
-		}
 		dma_sync_sg_for_device(buffer->device,
 				sgt->sgl,
 				sgt->orig_nents,
@@ -319,7 +323,6 @@ static void anonymous_sync_cpu_to_dev(struct heap *heap, struct buffer *buffer)
 				sgt->sgl,
 				sgt->orig_nents,
 				DMA_FROM_DEVICE);
-		dma_unmap_sg(buffer->device, sgt->sgl, sgt->orig_nents, DMA_TO_DEVICE);
 	}
 }
 
@@ -327,23 +330,14 @@ static void anonymous_sync_dev_to_cpu(struct heap *heap, struct buffer *buffer)
 {
 	struct buffer_data *buffer_data = buffer->priv;
 	struct sg_table *sgt = buffer_data->sgt;
-	int ret;
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		buffer->id, buffer);
 
 	if (!(buffer_data->mattr & IMG_MEM_ATTR_UNCACHED)) {
-		ret = dma_map_sg(buffer->device, sgt->sgl, sgt->orig_nents,
-				DMA_FROM_DEVICE);
-		if (ret <= 0) {
-			pr_err("%s dma_map_sg failed!\n", __func__);
-			return;
-		}
 		dma_sync_sg_for_cpu(buffer->device,
 				sgt->sgl,
 				sgt->orig_nents,
 				DMA_FROM_DEVICE);
-		dma_unmap_sg(buffer->device, sgt->sgl,
-								 sgt->orig_nents, DMA_FROM_DEVICE);
 	}
 }
 
