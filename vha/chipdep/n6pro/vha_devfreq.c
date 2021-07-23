@@ -41,11 +41,6 @@
 #define VHA_DOWNDIFFERENTIAL 10
 #define VHA_PM_TIME_SHIFT 8
 
-struct npu_reg_info {
-	struct regmap *regmap_ptr;
-	u32 args[2];
-};
-
 struct npu_freq_info {
 	int index;
 	int freq;    //kHz
@@ -70,7 +65,7 @@ struct npu_dvfs_context {
 	struct npu_freq_info *ocm_freq_cur;
 	struct npu_freq_info *ocm_freq_default;
 
-	struct npu_reg_info dvfs_reg;
+	struct regmap *regmap_ptr;
 };
 
 DEFINE_SEMAPHORE(npu_dvfs_sem);
@@ -157,15 +152,15 @@ static int vha_set_freq_volt(int pvr_index, int mtx_index, int ocm_index)
 {
 	if (npu_dvfs_ctx.npu_on) {
 		down(npu_dvfs_ctx.sem);
-		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr,
+		regmap_update_bits(npu_dvfs_ctx.regmap_ptr,
 					REG_AI_DVFS_APB_POWERVR_DVFS_INDEX_CFG,
 					MASK_AI_DVFS_APB_POWERVR_DVFS_INDEX,
 					pvr_index);
-		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr,
+		regmap_update_bits(npu_dvfs_ctx.regmap_ptr,
 					REG_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX_CFG,
 					MASK_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX,
 					mtx_index);
-		regmap_update_bits(npu_dvfs_ctx.dvfs_reg.regmap_ptr,
+		regmap_update_bits(npu_dvfs_ctx.regmap_ptr,
 					REG_AI_DVFS_APB_OCM_DVFS_INDEX_CFG,
 					MASK_AI_DVFS_APB_OCM_DVFS_INDEX,
 					ocm_index);
@@ -185,17 +180,17 @@ static int npu_dvfs_ctx_init(struct device *dev)
 	unsigned int i = 0;
 	int ret;
 
-	npu_dvfs_ctx.dvfs_reg.regmap_ptr = syscon_regmap_lookup_by_name(dev->of_node,
+	npu_dvfs_ctx.regmap_ptr = syscon_regmap_lookup_by_phandle(dev->of_node,
 									"dvfs_reg");
-	ret = syscon_get_args_by_name(dev->of_node, "dvfs_reg", 2, npu_dvfs_ctx.dvfs_reg.args);
-	if (ret != 2) {
-		dev_err(dev, "Failed to get dvfs reg:%d\n", ret);
-		return ret;
-	}
-
 	npu_dvfs_ctx.freq_list_len = of_property_count_elems_of_size(dev->of_node,
 								"sprd,dvfs-powervr-tbl",
 								3*sizeof(u32));
+
+	if(npu_dvfs_ctx.freq_list_len < 0) {
+		dev_err(dev, "freq_list_len is: %d\n", npu_dvfs_ctx.freq_list_len);
+		return npu_dvfs_ctx.freq_list_len;
+	}
+
 	npu_dvfs_ctx.pvr_freq_list = vmalloc(sizeof(struct npu_freq_info)*npu_dvfs_ctx.freq_list_len);
 	npu_dvfs_ctx.mtx_freq_list = vmalloc(sizeof(struct npu_freq_info)*npu_dvfs_ctx.freq_list_len);
 	npu_dvfs_ctx.ocm_freq_list = vmalloc(sizeof(struct npu_freq_info)*npu_dvfs_ctx.freq_list_len);

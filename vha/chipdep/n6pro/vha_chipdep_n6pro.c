@@ -33,27 +33,14 @@
 #include "sprd,qogirn6pro-npu-regs.h"
 #include "ai_sys_qos.h"
 
-struct npu_pm_domain {
-	struct generic_pm_domain pd;
-	struct device *dev;
-	struct regmap *pmu_apb_regs;
-	union {
-		u32 args[2];
-		struct {
-			u32 cfg_regoff, cfg_mask;
-		} s;
-	} u;
-};
-
 struct npu_regmap{
 	struct regmap *ai_apb_regs;
 	struct regmap *ai_clock_regs;
 	struct regmap *ai_dvfs_regs;
 	struct regmap *ai_mtx_regs;
 	struct regmap *ai_busmon_regs;
-	struct regmap *ai_pd_regs;
 	struct regmap *top_dvfs_regs;
-	struct regmap *ai_sw_dvfs_regs;
+	struct regmap *pmu_apb_regs;
 };
 static struct npu_regmap ai_regs;
 
@@ -89,53 +76,48 @@ static int vha_init_regs(struct device *dev)
 {
 	struct device_node *np = dev->of_node;
 
-	ai_regs.ai_apb_regs = syscon_regmap_lookup_by_name(np, "apb_reg");
+	ai_regs.ai_apb_regs = syscon_regmap_lookup_by_phandle(np, "apb_reg");
 	if (IS_ERR(ai_regs.ai_apb_regs)) {
 		dev_err_once(dev, "failed to get apb_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.ai_clock_regs = syscon_regmap_lookup_by_name(np, "clock_reg");
+	ai_regs.ai_clock_regs = syscon_regmap_lookup_by_phandle(np, "clock_reg");
 	if (IS_ERR(ai_regs.ai_clock_regs)) {
 		dev_err_once(dev, "failed to get clock_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.ai_dvfs_regs = syscon_regmap_lookup_by_name(np, "dvfs_reg");
+	ai_regs.ai_dvfs_regs = syscon_regmap_lookup_by_phandle(np, "dvfs_reg");
 	if (IS_ERR(ai_regs.ai_dvfs_regs)) {
 		dev_err_once(dev, "failed to get dvfs_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.ai_mtx_regs = syscon_regmap_lookup_by_name(np, "mtx_reg");
+	ai_regs.ai_mtx_regs = syscon_regmap_lookup_by_phandle(np, "mtx_reg");
 	if (IS_ERR(ai_regs.ai_mtx_regs)) {
 		dev_err_once(dev, "failed to get mtx_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.ai_busmon_regs = syscon_regmap_lookup_by_name(np, "busmon");
+	ai_regs.ai_busmon_regs = syscon_regmap_lookup_by_phandle(np, "busmon_reg");
 	if (IS_ERR(ai_regs.ai_busmon_regs)) {
 		dev_err_once(dev, "failed to get busmon_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.ai_pd_regs = syscon_regmap_lookup_by_name(np, "pd_ai_sys");
-	if (IS_ERR(ai_regs.ai_pd_regs)) {
+	ai_regs.pmu_apb_regs = syscon_regmap_lookup_by_phandle(np, "pd_ai_sys");
+	if (IS_ERR(ai_regs.pmu_apb_regs)) {
 		dev_err_once(dev, "failed to get pd_ai_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.top_dvfs_regs = syscon_regmap_lookup_by_name(np, "top_dvfs_cfg");
+	ai_regs.top_dvfs_regs = syscon_regmap_lookup_by_phandle(np, "top_dvfs_cfg");
 	if (IS_ERR(ai_regs.top_dvfs_regs)) {
 		dev_err_once(dev, "failed to get top_dvfs_reg\n");
 		return -EINVAL;
 	}
 
-	ai_regs.ai_sw_dvfs_regs = syscon_regmap_lookup_by_name(np, "ai_sw_dvfs_ctrl");
-	if (IS_ERR(ai_regs.ai_sw_dvfs_regs)) {
-		dev_err_once(dev, "failed to get ai_sw_dvfs_reg\n");
-		return -EINVAL;
-	}
 	return 0;
 }
 
@@ -166,62 +148,44 @@ static void vddai_disable(struct device *dev)
 static void aipll_force_off(uint32_t val)
 {
 	if (val) {
-		regmap_update_bits(ai_regs.ai_pd_regs,
+		regmap_update_bits(ai_regs.pmu_apb_regs,
 				REG_PMU_APB_AIPLL_REL_CFG,
 				MASK_PMU_APB_GPLL_FRC_OFF,
 				MASK_PMU_APB_GPLL_FRC_OFF);
 	}
 	else {
-		regmap_update_bits(ai_regs.ai_pd_regs,
+		regmap_update_bits(ai_regs.pmu_apb_regs,
 				REG_PMU_APB_AIPLL_REL_CFG,
 				MASK_PMU_APB_GPLL_FRC_OFF,
 				0);
 	}
 }
 
-static int vha_power_on(struct npu_pm_domain *pd)
+static int vha_power_on(void)
 {
 	uint32_t reg, mask;
-	reg = pd->u.s.cfg_regoff;
-	mask = pd->u.s.cfg_mask;
+	reg = REG_PMU_APB_PD_AI_CFG_0;
+	mask = MASK_PMU_APB_PD_AI_FORCE_SHUTDOWN;
 
-	regmap_update_bits(pd->pmu_apb_regs, reg, mask, 0);
+	regmap_update_bits(ai_regs.pmu_apb_regs, reg, mask, 0);
 
 	return 0;
 }
 
-static int vha_power_off(struct npu_pm_domain *pd)
+static int vha_power_off(void)
 {
 	uint32_t reg, mask;
-	reg = pd->u.s.cfg_regoff;
-	mask = pd->u.s.cfg_mask;
+	reg = REG_PMU_APB_PD_AI_CFG_0;
+	mask = MASK_PMU_APB_PD_AI_FORCE_SHUTDOWN;
 
-	regmap_update_bits(pd->pmu_apb_regs, reg, mask, mask);
-
-	return 0;
-}
-
-static struct npu_pm_domain pd_ai_sys;
-static int vha_powerdomain_init(struct device *dev)
-{
-	int err;
-	struct device_node *np = dev->of_node;
-	struct npu_pm_domain *pd = &pd_ai_sys;
-	dev_info(dev, "domain_np fullname %s\n", np->full_name);
-	pd->pmu_apb_regs = ai_regs.ai_pd_regs;
-
-	err = syscon_get_args_by_name(np, "pd_ai_sys", 2, pd->u.args);
-	if (err != 2) {
-		dev_err_once(dev, "failed to parse domain cfg reg\n");
-		return -EINVAL;
-	}
-	pd->dev = dev;
+	regmap_update_bits(ai_regs.pmu_apb_regs, reg, mask, mask);
 
 	return 0;
 }
+
 
 #define  LOOP_TIME  34  // (2000us - 300 us)/50us =34 times
-static int vha_wait_power_ready(struct npu_pm_domain *pd)
+static int vha_wait_power_ready(struct device *dev)
 {
 	uint32_t ret, mask, reg, val=0, loop=0;
 
@@ -231,11 +195,11 @@ static int vha_wait_power_ready(struct npu_pm_domain *pd)
 	/* delay for setup power domain */
 	udelay(300);
 	/* check setup if ok*/
-	if (pd->pmu_apb_regs) {
+	if (ai_regs.pmu_apb_regs) {
 		while(loop < LOOP_TIME){
-			ret = regmap_read(pd->pmu_apb_regs,reg, &val);
+			ret = regmap_read(ai_regs.pmu_apb_regs,reg, &val);
 			if (ret){
-				dev_err_once(pd->dev, "read pmu_apb_regs error, regs 0x%x\n", reg);
+				dev_err_once(dev, "read pmu_apb_regs error, regs 0x%x\n", reg);
 				return ret;
 			}
 
@@ -248,24 +212,24 @@ static int vha_wait_power_ready(struct npu_pm_domain *pd)
 		}
 	}
 	else {
-		dev_err_once(pd->dev, "pmu_apb_regs uninit\n");
+		dev_err_once(dev, "pmu_apb_regs uninit\n");
 	}
 
-	dev_err_once(pd->dev, "check pmu_apb_regs regs 0x%x  timeout!!!\n", reg);
+	dev_err_once(dev, "check pmu_apb_regs regs 0x%x  timeout!!!\n", reg);
 	return 1;
 }
 
-static int vha_powerdomain_setup(void)
+static int vha_powerdomain_setup(struct device *dev)
 {
-	vha_power_on(&pd_ai_sys);
-	vha_wait_power_ready(&pd_ai_sys);
+	vha_power_on();
+	vha_wait_power_ready(dev);
 
 	return 0;
 }
 
 static int vha_powerdomain_unsetup(void)
 {
-	vha_power_off(&pd_ai_sys);
+	vha_power_off();
 
 	return 0;
 }
@@ -336,7 +300,7 @@ static int vha_disable_idle_switch(struct device *dev)
 	/* disable top_ai_sw_dvfs */
 	reg = REG_TOP_DVFS_APB_SUBSYS_SW_DVFS_EN_CFG;
 	mask = MASK_TOP_DVFS_APB_AI_SW_DVFS_EN;
-	regmap_update_bits(ai_regs.ai_sw_dvfs_regs, reg, mask, 0);
+	regmap_update_bits(ai_regs.top_dvfs_regs, reg, mask, 0);
 	/* disable top_ai_sw_dvfs_ctrl */
 	reg = REG_TOP_DVFS_APB_DCDC_AI_SW_DVFS_CTRL;
 	mask = MASK_TOP_DVFS_APB_DCDC_AI_SW_TUNE_EN;
@@ -367,8 +331,7 @@ int vha_chip_init(struct device *dev)
 		return ret;
 	}
 	udelay(400);
-	vha_powerdomain_init(dev);
-	vha_powerdomain_setup();
+	vha_powerdomain_setup(dev);
 	vha_clockdomain_init(dev);
 
 	return 0;
@@ -391,7 +354,7 @@ int vha_chip_runtime_resume(struct device *dev)
 		return ret;
 	}
 	udelay(400);
-	vha_powerdomain_setup();
+	vha_powerdomain_setup(dev);
 	vha_clockdomain_setup(dev);
 	vha_set_qos();
 #ifdef VHA_DEVFREQ
