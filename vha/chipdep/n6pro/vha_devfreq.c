@@ -508,8 +508,7 @@ void vha_devfreq_suspend(struct device *dev)
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	if (vha->devfreq_init) {
-		if (npu_dvfs_ctx.npu_dvfs_on)
-			devfreq_suspend_device(vha->devfreq);
+		devfreq_suspend_device(vha->devfreq);
 		npu_dvfs_ctx.npu_on = 0;
 	}
 	return ;
