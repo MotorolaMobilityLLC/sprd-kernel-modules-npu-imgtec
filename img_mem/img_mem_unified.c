@@ -352,6 +352,11 @@ static int unified_alloc(struct device *device, struct heap *heap,
 	if (attr & IMG_MEM_ATTR_MMU)
 		min_order = get_order(size);
 
+	if (min_order < 0) {
+		pr_err("min_order < 0!\n");
+		return -EINVAL;
+	}
+
 	if (min_order > max_order) {
 		pr_err("min_alloc_order > max_alloc_order !\n");
 		return -EINVAL;
