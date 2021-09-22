@@ -352,13 +352,8 @@ static int unified_alloc(struct device *device, struct heap *heap,
 	if (attr & IMG_MEM_ATTR_MMU)
 		min_order = get_order(size);
 
-	if (min_order < 0) {
-		pr_err("min_order < 0!\n");
-		return -EINVAL;
-	}
-
-	if (min_order > max_order) {
-		pr_err("min_alloc_order > max_alloc_order !\n");
+	if (min_order < 0 || min_order > max_order) {
+		pr_err("min_alloc_order is the wrong value!\n");
 		return -EINVAL;
 	}
 
@@ -459,6 +454,8 @@ static int unified_alloc(struct device *device, struct heap *heap,
 
 	sgl = sgt->sgl;
 	list_for_each_entry_safe(page, tmp_page, &pages_list, lru) {
+		if (sgl == NULL)
+			break;
 		sg_set_page(sgl, page, PAGE_SIZE, 0);
 		set_page_cache(page, attr);
 		sgl = sg_next(sgl);
