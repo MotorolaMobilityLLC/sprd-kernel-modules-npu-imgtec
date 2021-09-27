@@ -325,6 +325,27 @@ static int unified_export(struct device *device, struct heap *heap,
 	return 0;
 }
 
+static int min_max_order_init(int *min_order, int *max_order,
+			enum img_mem_attr _attr, size_t _size)
+{
+	if (*min_order == 0)
+		*min_order = IMG_MIN_ALLOC_ORDER_DEFAULT;
+
+	if (*max_order == 0)
+		*max_order = IMG_MAX_ALLOC_ORDER_DEFAULT;
+
+	/* Allocations for MMU pages are still 4k so CPU page size is enough */
+	if (_attr & IMG_MEM_ATTR_MMU)
+		*min_order = get_order(_size);
+
+	if (*min_order < 0 || *min_order > *max_order) {
+		pr_err("min_order is in the wrong value!\n");
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int unified_alloc(struct device *device, struct heap *heap,
 			size_t size, enum img_mem_attr attr,
 			struct buffer *buffer)
@@ -339,21 +360,13 @@ static int unified_alloc(struct device *device, struct heap *heap,
 	int min_order = heap->options.unified.min_order;
 	int max_order = heap->options.unified.max_order;
 
-	if (min_order == 0)
-		min_order = IMG_MIN_ALLOC_ORDER_DEFAULT;
-
-	if (max_order == 0)
-		max_order = IMG_MAX_ALLOC_ORDER_DEFAULT;
-
 	pr_debug("%s:%d buffer %d (0x%p) size:%zu attr:%x\n", __func__, __LINE__,
 		buffer->id, buffer, size, attr);
 
-	/* Allocations for MMU pages are still 4k so CPU page size is enough */
-	if (attr & IMG_MEM_ATTR_MMU)
-		min_order = get_order(size);
+	ret = min_max_order_init(&min_order, &max_order, attr, size);
 
-	if (min_order < 0 || min_order > max_order) {
-		pr_err("min_alloc_order is the wrong value!\n");
+	if (ret) {
+		pr_err("%s: min_max_order_init failed\n", __func__);
 		return -EINVAL;
 	}
 
@@ -454,12 +467,12 @@ static int unified_alloc(struct device *device, struct heap *heap,
 
 	sgl = sgt->sgl;
 	list_for_each_entry_safe(page, tmp_page, &pages_list, lru) {
-		if (sgl == NULL)
-			break;
 		sg_set_page(sgl, page, PAGE_SIZE, 0);
 		set_page_cache(page, attr);
 		sgl = sg_next(sgl);
 		list_del(&page->lru);
+		if (sgl == NULL)
+			break;
 	}
 
 	pr_debug("%s:%d buffer %d orig_nents %d\n", __func__, __LINE__,
