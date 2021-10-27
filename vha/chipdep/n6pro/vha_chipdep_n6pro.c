@@ -183,6 +183,41 @@ static int vha_power_off(void)
 	return 0;
 }
 
+static void vha_config_volt(struct device *dev)
+{
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_AI_MIN_VOLTAGE_CFG,
+				MASK_AI_DVFS_APB_AI_SYS_MIN_VOLTAGE, 2);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX0_MAP,
+			MASK_AI_DVFS_APB_POWERVR_VOL_INDEX0, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX1_MAP,
+				MASK_AI_DVFS_APB_POWERVR_VOL_INDEX1, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX2_MAP,
+				MASK_AI_DVFS_APB_POWERVR_VOL_INDEX2, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX3_MAP,
+				MASK_AI_DVFS_APB_POWERVR_VOL_INDEX3, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX0_MAP,
+				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX0, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX1_MAP,
+				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX1, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX2_MAP,
+				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX2, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX3_MAP,
+				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX3, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_OCM_INDEX0_MAP,
+				MASK_AI_DVFS_APB_OCM_VOL_INDEX0, 2 << 5);
+
+	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_OCM_INDEX1_MAP,
+				MASK_AI_DVFS_APB_OCM_VOL_INDEX1, 2 << 5);
+}
 
 #define  LOOP_TIME  34  // (2000us - 300 us)/50us =34 times
 static int vha_wait_power_ready(struct device *dev)
@@ -356,6 +391,7 @@ int vha_chip_runtime_resume(struct device *dev)
 	udelay(400);
 	vha_powerdomain_setup(dev);
 	vha_clockdomain_setup(dev);
+	vha_config_volt(dev);
 	vha_set_qos();
 #ifdef VHA_DEVFREQ
 	vha_disable_idle_switch(dev);

@@ -155,11 +155,11 @@ static int vha_set_freq_volt(int pvr_index, int mtx_index, int ocm_index)
 		regmap_update_bits(npu_dvfs_ctx.regmap_ptr,
 					REG_AI_DVFS_APB_POWERVR_DVFS_INDEX_CFG,
 					MASK_AI_DVFS_APB_POWERVR_DVFS_INDEX,
-					pvr_index);
+					pvr_index + 1);
 		regmap_update_bits(npu_dvfs_ctx.regmap_ptr,
 					REG_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX_CFG,
 					MASK_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX,
-					mtx_index);
+					mtx_index + 1);
 		regmap_update_bits(npu_dvfs_ctx.regmap_ptr,
 					REG_AI_DVFS_APB_OCM_DVFS_INDEX_CFG,
 					MASK_AI_DVFS_APB_OCM_DVFS_INDEX,
@@ -408,6 +408,8 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	struct vha_devfreq_metrics diff;
+	if (!vha)
+		return -ENODEV;
 
 	vha_get_dvfs_metrics(vha, &vha->last_devfreq_metrics, &diff);
 	state->busy_time = diff.time_busy;
@@ -507,6 +509,8 @@ void vha_devfreq_term(struct vha_dev *vha)
 void vha_devfreq_suspend(struct device *dev)
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
+	if (!vha)
+		return;
 	if (vha->devfreq_init) {
 		devfreq_suspend_device(vha->devfreq);
 		npu_dvfs_ctx.npu_on = 0;
