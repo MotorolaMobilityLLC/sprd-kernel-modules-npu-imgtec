@@ -145,19 +145,27 @@ static void vddai_disable(struct device *dev)
 	}
 }
 
-static void aipll_force_off(uint32_t val)
+static void aipll_force_off(uint8_t val)
 {
 	if (val) {
 		regmap_update_bits(ai_regs.pmu_apb_regs,
 				REG_PMU_APB_AIPLL_REL_CFG,
 				MASK_PMU_APB_GPLL_FRC_OFF,
 				MASK_PMU_APB_GPLL_FRC_OFF);
+		regmap_update_bits(ai_regs.pmu_apb_regs,
+				REG_PMU_APB_AIPLL_REL_CFG,
+				MASK_PMU_APB_GPLL_FRC_ON,
+				0);
 	}
 	else {
 		regmap_update_bits(ai_regs.pmu_apb_regs,
 				REG_PMU_APB_AIPLL_REL_CFG,
 				MASK_PMU_APB_GPLL_FRC_OFF,
 				0);
+		regmap_update_bits(ai_regs.pmu_apb_regs,
+				REG_PMU_APB_AIPLL_REL_CFG,
+				MASK_PMU_APB_GPLL_FRC_ON,
+				MASK_PMU_APB_GPLL_FRC_ON);
 	}
 }
 
