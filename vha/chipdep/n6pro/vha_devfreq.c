@@ -321,7 +321,7 @@ int vha_devfreq_init(struct vha_dev *vha)
 
 	for (i=0; i<max_state; i++) {
 		npu_dvfs_ctx.ops.opp_get(i, &freq, &volt);
-		ret = dev_pm_opp_add(vha->dev, freq, volt);
+		ret = dev_pm_opp_add(vha->dev, freq*1000, volt);
 		if (ret) {
 			dev_err(vha->dev, "failed to add dev_pm_opp: %d\n", ret);
 			goto dev_pm_opp_add_failed;
