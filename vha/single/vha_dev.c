@@ -374,8 +374,10 @@ irqreturn_t vha_handle_irq(struct device *dev)
 			vha->irq_count = count - vha->stream_count;
 		vha->stream_count = count;
 #ifdef VHA_DEVFREQ
-		now = ktime_get();
-		vha_update_dvfs_state(vha, false, &now);
+		if (vha->devfreq) {
+			now = ktime_get();
+			vha_update_dvfs_state(vha, false, &now);
+		}
 #endif
 		/* Record hw processing end timestamps */
 		vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;

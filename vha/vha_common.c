@@ -1206,7 +1206,10 @@ int vha_add_dev(struct device *dev,
 	}
 
 #ifdef VHA_DEVFREQ
-	vha_devfreq_init(vha);
+	if (vha_devfreq_init(vha)) {
+		dev_warn(dev, "%s: init devfreq failed\n", __func__);
+		vha->devfreq = NULL;
+	}
 #endif
 
 	return ret;
@@ -1268,7 +1271,8 @@ void vha_rm_dev(struct device *dev)
 #endif
 #endif
 #ifdef VHA_DEVFREQ
-	vha_devfreq_term(vha);
+	if (vha->devfreq)
+		vha_devfreq_term(vha);
 #endif
 	vha_free_common(vha);
 

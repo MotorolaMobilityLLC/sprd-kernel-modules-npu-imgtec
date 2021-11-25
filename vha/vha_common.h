@@ -499,8 +499,6 @@ struct vha_dev {
 	struct devfreq *devfreq;
 	struct vha_devfreq_metrics last_devfreq_metrics;
 	struct vha_pm_metrics_state cur_state;
-	bool devfreq_init;
-	bool cooling_device;
 };
 
 #ifdef VHA_DEVFREQ
@@ -509,7 +507,6 @@ void vha_devfreq_resume(struct device *dev);
 int vha_devfreq_init(struct vha_dev *vha);
 void vha_devfreq_term(struct vha_dev *vha);
 void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtimestamp);
-void vha_devfreq_force_freq(struct vha_dev *vha, unsigned long freq);
 #endif
 
 #ifdef CONFIG_HW_MULTICORE

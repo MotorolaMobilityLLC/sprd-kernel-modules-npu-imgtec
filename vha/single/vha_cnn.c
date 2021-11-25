@@ -332,12 +332,12 @@ hw_kick:
 	}
 
 	vha->stats.cnn_kicks++;
-
 #ifdef VHA_DEVFREQ
-	now = ktime_get();
-	vha_update_dvfs_state(vha, true, &now);
+	if (vha->devfreq) {
+		now = ktime_get();
+		vha_update_dvfs_state(vha, true, &now);
+	}
 #endif
-
 	/* notify any observers of the submit event */
 	if (vha_observers.submitted)
 		vha_observers.submitted(vha->id, cmd->user_cmd.cmd_id);

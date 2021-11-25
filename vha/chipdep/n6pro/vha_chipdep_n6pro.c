@@ -24,14 +24,14 @@
 #include <linux/clk.h>
 #include <linux/dma-mapping.h>
 #include <linux/regulator/consumer.h>
+#include <dt-bindings/soc/sprd,qogirn6pro-regs.h>
+#include <dt-bindings/soc/sprd,qogirn6pro-mask.h>
 
 #include "vha_chipdep.h"
 #include "vha_common.h"
-#include <dt-bindings/soc/sprd,qogirn6pro-regs.h>
-#include <dt-bindings/soc/sprd,qogirn6pro-mask.h>
-#include "sprd,qogirn6pro-npu-mask.h"
-#include "sprd,qogirn6pro-npu-regs.h"
 #include "ai_sys_qos.h"
+#include "sprd,qogirn6pro-npu-regs.h"
+#include "sprd,qogirn6pro-npu-mask.h"
 
 struct npu_regmap{
 	struct regmap *ai_apb_regs;
