@@ -191,42 +191,6 @@ static int vha_power_off(void)
 	return 0;
 }
 
-static void vha_config_volt(struct device *dev)
-{
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_AI_MIN_VOLTAGE_CFG,
-				MASK_AI_DVFS_APB_AI_SYS_MIN_VOLTAGE, 2);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX0_MAP,
-			MASK_AI_DVFS_APB_POWERVR_VOL_INDEX0, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX1_MAP,
-				MASK_AI_DVFS_APB_POWERVR_VOL_INDEX1, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX2_MAP,
-				MASK_AI_DVFS_APB_POWERVR_VOL_INDEX2, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_POWERVR_INDEX3_MAP,
-				MASK_AI_DVFS_APB_POWERVR_VOL_INDEX3, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX0_MAP,
-				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX0, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX1_MAP,
-				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX1, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX2_MAP,
-				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX2, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_MAIN_MTX_INDEX3_MAP,
-				MASK_AI_DVFS_APB_MAIN_MTX_VOL_INDEX3, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_OCM_INDEX0_MAP,
-				MASK_AI_DVFS_APB_OCM_VOL_INDEX0, 2 << 5);
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_OCM_INDEX1_MAP,
-				MASK_AI_DVFS_APB_OCM_VOL_INDEX1, 2 << 5);
-}
-
 #define  LOOP_TIME  34  // (2000us - 300 us)/50us =34 times
 static int vha_wait_power_ready(struct device *dev)
 {
@@ -329,29 +293,14 @@ static int vha_clockdomain_setup(struct device *dev)
 	return 0;
 }
 
-#ifdef VHA_DEVFREQ
-static int vha_disable_idle_switch(struct device *dev)
+static void set_top_volt(void)
 {
-	uint32_t reg, mask;
+	uint32_t reg, val;
 
-	mask =  MASK_AI_DVFS_APB_AI_OCM_DFS_IDLE_DISABLE |
-		MASK_AI_DVFS_APB_AI_MAIN_MTX_DFS_IDLE_DISABLE |
-		MASK_AI_DVFS_APB_AI_POWERVR_DFS_IDLE_DISABLE;
-
-	regmap_update_bits(ai_regs.ai_dvfs_regs, REG_AI_DVFS_APB_AI_DFS_IDLE_DISABLE_CFG0,
-				mask, mask);
-	/* disable top_ai_sw_dvfs */
-	reg = REG_TOP_DVFS_APB_SUBSYS_SW_DVFS_EN_CFG;
-	mask = MASK_TOP_DVFS_APB_AI_SW_DVFS_EN;
-	regmap_update_bits(ai_regs.top_dvfs_regs, reg, mask, 0);
-	/* disable top_ai_sw_dvfs_ctrl */
-	reg = REG_TOP_DVFS_APB_DCDC_AI_SW_DVFS_CTRL;
-	mask = MASK_TOP_DVFS_APB_DCDC_AI_SW_TUNE_EN;
-	regmap_update_bits(ai_regs.top_dvfs_regs, reg, mask, 0);
-
-	return 0;
+	reg = 0x608;
+	val = 0xD0 << 16 | 0xD0;
+	regmap_write(ai_regs.top_dvfs_regs, reg, val);
 }
-#endif
 
 static int vha_clockdomain_unsetup(struct device *dev)
 {
@@ -376,6 +325,7 @@ int vha_chip_init(struct device *dev)
 	udelay(400);
 	vha_powerdomain_setup(dev);
 	vha_clockdomain_init(dev);
+	set_top_volt();
 
 	return 0;
 }
@@ -399,10 +349,8 @@ int vha_chip_runtime_resume(struct device *dev)
 	udelay(400);
 	vha_powerdomain_setup(dev);
 	vha_clockdomain_setup(dev);
-	vha_config_volt(dev);
 	vha_set_qos();
 #ifdef VHA_DEVFREQ
-	vha_disable_idle_switch(dev);
 	vha_devfreq_resume(dev);
 #endif
 
