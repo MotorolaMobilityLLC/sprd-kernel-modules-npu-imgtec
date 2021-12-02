@@ -248,7 +248,6 @@ static int vha_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
 	struct dev_pm_opp *opp;
 	unsigned long nominal_freq;
 	unsigned long exact_freq;
-	int ret;
 
 	if (npu_dvfs_ctx.npu_on == 0)
 		return 0;
@@ -268,7 +267,7 @@ static int vha_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
 
 	vha_set_freq(dev, exact_freq / 1000UL);
 
-	return ret;
+	return 0;
 }
 
 static int vha_devfreq_cur_freq(struct device *dev, unsigned long *freq)
@@ -333,7 +332,7 @@ int vha_devfreq_init(struct vha_dev *vha)
 
 	for (i=0; i<max_state; i++) {
 		npu_dvfs_ctx.ops.opp_get(i, &freq_khz, &volt);
-		ret = dev_pm_opp_add(vha->dev, freq_khz*1000, volt);
+		ret = dev_pm_opp_add(vha->dev, freq_khz*1000UL, volt);
 		if (ret) {
 			dev_err(vha->dev, "failed to add dev_pm_opp: %d\n", ret);
 			goto dev_pm_opp_add_failed;
