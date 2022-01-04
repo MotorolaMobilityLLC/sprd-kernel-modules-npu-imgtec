@@ -501,14 +501,6 @@ struct vha_dev {
 	struct vha_pm_metrics_state cur_state;
 };
 
-#ifdef VHA_DEVFREQ
-void vha_devfreq_suspend(struct device *dev);
-void vha_devfreq_resume(struct device *dev);
-int vha_devfreq_init(struct vha_dev *vha);
-void vha_devfreq_term(struct vha_dev *vha);
-void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtimestamp);
-#endif
-
 #ifdef CONFIG_HW_MULTICORE
 /* WL kick id count field. */
 #define VHA_WL_KICK_ID_COUNT_MASK  0x0fff

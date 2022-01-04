@@ -30,13 +30,13 @@
 #include "vha_chipdep.h"
 #include "vha_common.h"
 #include "ai_sys_qos.h"
+#include "vha_devfreq.h"
 #include "sprd,qogirn6pro-npu-regs.h"
 #include "sprd,qogirn6pro-npu-mask.h"
 
 struct npu_regmap{
 	struct regmap *ai_apb_regs;
 	struct regmap *ai_clock_regs;
-	struct regmap *ai_dvfs_regs;
 	struct regmap *ai_mtx_regs;
 	struct regmap *ai_busmon_regs;
 	struct regmap *top_dvfs_regs;
@@ -85,12 +85,6 @@ static int vha_init_regs(struct device *dev)
 	ai_regs.ai_clock_regs = syscon_regmap_lookup_by_phandle(np, "clock_reg");
 	if (IS_ERR(ai_regs.ai_clock_regs)) {
 		dev_err_once(dev, "failed to get clock_reg\n");
-		return -EINVAL;
-	}
-
-	ai_regs.ai_dvfs_regs = syscon_regmap_lookup_by_phandle(np, "dvfs_reg");
-	if (IS_ERR(ai_regs.ai_dvfs_regs)) {
-		dev_err_once(dev, "failed to get dvfs_reg\n");
 		return -EINVAL;
 	}
 
@@ -293,15 +287,6 @@ static int vha_clockdomain_setup(struct device *dev)
 	return 0;
 }
 
-static void set_top_volt(void)
-{
-	uint32_t reg, val;
-
-	reg = 0x608;
-	val = 0xD0 << 16 | 0xD0;
-	regmap_write(ai_regs.top_dvfs_regs, reg, val);
-}
-
 static int vha_clockdomain_unsetup(struct device *dev)
 {
 	int num_clks = ARRAY_SIZE(clks);
@@ -325,13 +310,14 @@ int vha_chip_init(struct device *dev)
 	udelay(400);
 	vha_powerdomain_setup(dev);
 	vha_clockdomain_init(dev);
-	set_top_volt();
+	vha_dvfs_ctx_init(dev);
 
 	return 0;
 }
 
 int vha_chip_deinit(struct device *dev)
 {
+	vha_dvfs_ctx_deinit(dev);
 	device_wakeup_disable(dev);
 
 	return 0;

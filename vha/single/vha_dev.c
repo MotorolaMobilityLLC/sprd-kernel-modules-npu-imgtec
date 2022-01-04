@@ -48,6 +48,7 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
+#include "vha_devfreq.h"
 
 #if defined(CFG_SYS_VAGUS)
 #include <hwdefs/nn_sys_cr_vagus.h>

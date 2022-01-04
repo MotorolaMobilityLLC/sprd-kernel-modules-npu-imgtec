@@ -34,57 +34,6 @@
 #define REG_AI_CLK_CGM_OCM_SEL_CFG                                    0x004C
 #define REG_AI_CLK_CGM_DVFS_SEL_CFG                                   0x0058
 
-/*********************************** ai_dvfs_apb REGS, phy_addr=0x27008000 ************************************/
-#define REG_AI_DVFS_APB_AI_DVFS_HOLD_CTRL                             0x0000
-#define REG_AI_DVFS_APB_AI_DVFS_WAIT_WINDOW_CFG0                      0x0004
-#define REG_AI_DVFS_APB_AI_MIN_VOLTAGE_CFG                            0x0024
-#define REG_AI_DVFS_APB_AI_SW_DVFS_CTRL                               0x0038
-#define REG_AI_DVFS_APB_AI_DVFS_FREQ_UPDATE_BYPASS0                   0x0048
-#define REG_AI_DVFS_APB_CGM_AI_DVFS_CLK_GATE_CTRL                     0x0050
-#define REG_AI_DVFS_APB_AI_DVFS_VOLTAE_DBG0                           0x0054
-#define REG_AI_DVFS_APB_AI_POWERVR_DVFS_CGM_CFG_DBG                   0x0068
-#define REG_AI_DVFS_APB_AI_MAIN_MTX_DVFS_CGM_CFG_DBG                  0x006C
-#define REG_AI_DVFS_APB_AI_OCM_DVFS_CGM_CFG_DBG                       0x0070
-#define REG_AI_DVFS_APB_AI_DVFS_STATE_DBG                             0x0130
-#define REG_AI_DVFS_APB_POWERVR_INDEX0_MAP                            0x0154
-#define REG_AI_DVFS_APB_POWERVR_INDEX1_MAP                            0x0158
-#define REG_AI_DVFS_APB_POWERVR_INDEX2_MAP                            0x015C
-#define REG_AI_DVFS_APB_POWERVR_INDEX3_MAP                            0x0160
-#define REG_AI_DVFS_APB_POWERVR_INDEX4_MAP                            0x0164
-#define REG_AI_DVFS_APB_POWERVR_INDEX5_MAP                            0x0168
-#define REG_AI_DVFS_APB_POWERVR_INDEX6_MAP                            0x016C
-#define REG_AI_DVFS_APB_POWERVR_INDEX7_MAP                            0x0170
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX0_MAP                           0x0174
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX1_MAP                           0x0178
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX2_MAP                           0x017C
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX3_MAP                           0x0180
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX4_MAP                           0x0184
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX5_MAP                           0x0188
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX6_MAP                           0x018C
-#define REG_AI_DVFS_APB_MAIN_MTX_INDEX7_MAP                           0x0190
-#define REG_AI_DVFS_APB_OCM_INDEX0_MAP                                0x0194
-#define REG_AI_DVFS_APB_OCM_INDEX1_MAP                                0x0198
-#define REG_AI_DVFS_APB_OCM_INDEX2_MAP                                0x019C
-#define REG_AI_DVFS_APB_OCM_INDEX3_MAP                                0x01A0
-#define REG_AI_DVFS_APB_OCM_INDEX4_MAP                                0x01A4
-#define REG_AI_DVFS_APB_OCM_INDEX5_MAP                                0x01A8
-#define REG_AI_DVFS_APB_OCM_INDEX6_MAP                                0x01AC
-#define REG_AI_DVFS_APB_OCM_INDEX7_MAP                                0x01B0
-#define REG_AI_DVFS_APB_POWERVR_DVFS_INDEX_CFG                        0x0794
-#define REG_AI_DVFS_APB_POWERVR_DVFS_INDEX_IDLE_CFG                   0x0798
-#define REG_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX_CFG                       0x079C
-#define REG_AI_DVFS_APB_MAIN_MTX_DVFS_INDEX_IDLE_CFG                  0x07A0
-#define REG_AI_DVFS_APB_OCM_DVFS_INDEX_CFG                            0x07A4
-#define REG_AI_DVFS_APB_OCM_DVFS_INDEX_IDLE_CFG                       0x07A8
-#define REG_AI_DVFS_APB_AI_FREQ_UPD_STATE0                            0x0924
-#define REG_AI_DVFS_APB_AI_GFREE_WAIT_DELAY_CFG0                      0x0944
-#define REG_AI_DVFS_APB_AI_FREQ_UPD_TYPE_CFG0                         0x09AC
-#define REG_AI_DVFS_APB_AI_DFS_IDLE_DISABLE_CFG0                      0x09B4
-#define REG_AI_DVFS_APB_AI_DVFS_RESERVED_REG_CFG0                     0x0A58
-#define REG_AI_DVFS_APB_AI_DVFS_RESERVED_REG_CFG1                     0x0A5C
-#define REG_AI_DVFS_APB_AI_DVFS_RESERVED_REG_CFG2                     0x0A60
-#define REG_AI_DVFS_APB_AI_DVFS_RESERVED_REG_CFG3                     0x0A64
-
 /*********************************** ai_mtx REGS, phy_addr=0x2700C000 ************************************/
 #define REG_AI_MTX_REGU_OT_CTRL_EN                                    0x0000
 #define REG_AI_MTX_REGU_OT_CTRL_AW_CFG                                0x0004

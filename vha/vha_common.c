@@ -55,6 +55,7 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include <vha_regs.h>
+#include "vha_devfreq.h"
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 #include <linux/dma-fence.h>

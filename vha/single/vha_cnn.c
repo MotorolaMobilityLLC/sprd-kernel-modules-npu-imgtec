@@ -49,6 +49,7 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
+#include "vha_devfreq.h"
 
 static uint32_t cnn_pdump_poll_count = 10000000;
 module_param(cnn_pdump_poll_count, uint, 0444);
