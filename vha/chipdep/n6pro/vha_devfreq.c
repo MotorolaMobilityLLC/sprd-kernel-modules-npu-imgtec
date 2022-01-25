@@ -21,23 +21,26 @@
 #include <linux/sprd_npu_cooling.h>
 #include <linux/sprd_sip_svc.h>
 #include <linux/kernel.h>
+#include <linux/thermal.h>
 
 #include "vha_common.h"
 #include "vha_chipdep.h"
 #include "vha_devfreq.h"
 
-#define VHA_POLL_MS 100
-#define VHA_UPTHRESHOLD 85
-#define VHA_DOWNDIFFERENTIAL 10
-#define VHA_PM_TIME_SHIFT 8
-#define NNA_DEFAULT_FREQ 307200
+#define VHA_POLL_MS           100
+#define VHA_UPTHRESHOLD       85
+#define VHA_DOWNDIFFERENTIAL  10
+#define VHA_PM_TIME_SHIFT     8
+#define NNA_DEFAULT_FREQ      307200
+#define HIGH_TEMPERATURE      65000
+#define LOW_TEMPERATURE       60000
 
 struct vha_ops {
 	int (*freq_set) (u32 freq_khz);
 	int (*disable_idle) (void);
 	int (*max_state_get) (u32 *max_state);
 	int (*opp_get) (u32 index, u32 *freq_khz, u32 *volt);
-	int (*volts_set) (void);
+	int (*volts_set) (u32 high_temp);
 };
 
 struct npu_dvfs_context {
@@ -46,6 +49,7 @@ struct npu_dvfs_context {
 	int max_on;
 	bool dvfs_init;
 	bool cooling_device;
+	bool high_temp;
 	struct semaphore *sem;
 	struct vha_ops ops;
 	uint32_t last_freq_khz;
@@ -63,6 +67,7 @@ static struct npu_dvfs_context npu_dvfs_ctx=
 	.cooling_device = false,
 	.max_freq_khz = 0,
 	.max_state = 0,
+	.high_temp = false,
 
 	.sem=&npu_dvfs_sem,
 };
@@ -219,7 +224,7 @@ int vha_dvfs_ctx_init(struct device *dev)
 
 	ret = npu_dvfs_ctx.ops.max_state_get(&npu_dvfs_ctx.max_state);
 
-	npu_dvfs_ctx.ops.volts_set();
+	npu_dvfs_ctx.ops.volts_set(0);
 
 	return ret;
 }
@@ -340,14 +345,38 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	struct vha_devfreq_metrics diff;
+	struct thermal_zone_device *npu_tz;
+	int temp;
+
 	if (!vha)
-		return 0;
+		goto out;
 
 	vha_get_dvfs_metrics(vha, &vha->last_devfreq_metrics, &diff);
 	state->busy_time = diff.time_busy;
 	state->total_time = diff.time_busy + diff.time_idle;
 	state->current_frequency = npu_dvfs_ctx.last_freq_khz * 1000UL;
 	state->private_data = NULL;
+
+	npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
+	if (!npu_tz)
+		goto out;
+
+	npu_tz->ops->get_temp(npu_tz, &temp);
+	dev_dbg(dev, "cur_temp = %d\n", temp);
+	down(npu_dvfs_ctx.sem);
+	if (temp >= HIGH_TEMPERATURE) {
+		if (!npu_dvfs_ctx.high_temp) {
+			npu_dvfs_ctx.ops.volts_set(1);
+			npu_dvfs_ctx.high_temp = true;
+		}
+	} else if (temp <= LOW_TEMPERATURE) {
+		if (npu_dvfs_ctx.high_temp) {
+			npu_dvfs_ctx.ops.volts_set(0);
+			npu_dvfs_ctx.high_temp = false;
+		}
+	}
+	up(npu_dvfs_ctx.sem);
+out:
 	return 0;
 }
 
