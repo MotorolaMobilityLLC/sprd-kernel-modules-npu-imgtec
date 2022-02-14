@@ -328,7 +328,10 @@ static int vha_release(struct inode *inode, struct file *file)
 		__func__, task_pid_nr(current), vha, session);
 
 	vha_session_pm_get(session);
-
+	if (vha->cur_session) {
+		free_pagetabs(session->pages);
+		vha->cur_session = NULL;
+	}
 	vha_rm_session(session);
 	img_mem_destroy_proc_ctx(session->mem_ctx);
 

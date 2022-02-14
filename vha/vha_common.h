@@ -499,6 +499,7 @@ struct vha_dev {
 	struct devfreq *devfreq;
 	struct vha_devfreq_metrics last_devfreq_metrics;
 	struct vha_pm_metrics_state cur_state;
+	struct vha_session *cur_session;
 };
 
 #ifdef CONFIG_HW_MULTICORE
@@ -616,6 +617,7 @@ struct vha_session {
 	/* Unisoc add for pm_runtime management */
 	struct mutex pm_lock;
 	u32 pm_count;
+	struct pages_info *pages;
 };
 
 /* pdump cache info structure used for LDB commands */
