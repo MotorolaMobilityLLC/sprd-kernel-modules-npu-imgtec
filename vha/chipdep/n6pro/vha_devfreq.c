@@ -117,15 +117,7 @@ static ssize_t npu_max_on_store(struct device *dev,
 
 	sscanf(buf, "%u\n", &max_on);
 
-	down(npu_dvfs_ctx.sem);
-	npu_dvfs_ctx.max_on = max_on;
-	if (max_on == 1) {
-		npu_dvfs_ctx.npu_dvfs_on = 0;
-		vha_set_freq(npu_dvfs_ctx.max_freq_khz);
-	} else {
-		npu_dvfs_ctx.npu_dvfs_on = 1;
-	}
-	up(npu_dvfs_ctx.sem);
+	vha_set_max_freq(max_on);
 
 	return count;
 }
@@ -186,6 +178,24 @@ static struct attribute *dev_entries[] = {
 static struct attribute_group dev_attr_group = {
 	.attrs  = dev_entries,
 };
+
+int vha_set_max_freq(int max)
+{
+	down(npu_dvfs_ctx.sem);
+	if (npu_dvfs_ctx.max_on == max)
+		goto out;
+	npu_dvfs_ctx.max_on = max;
+
+	if (max == 1) {
+		npu_dvfs_ctx.npu_dvfs_on = 0;
+		vha_set_freq(npu_dvfs_ctx.max_freq_khz);
+	} else {
+		npu_dvfs_ctx.npu_dvfs_on = 1;
+	}
+out:
+	up(npu_dvfs_ctx.sem);
+	return 0;
+}
 
 int vha_dvfs_ctx_init(struct device *dev)
 {

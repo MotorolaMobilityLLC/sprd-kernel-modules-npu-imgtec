@@ -369,6 +369,7 @@ enum vha_device_state {
 #define VHA_IOC_CANCEL            _IOW(VHA_IOC_MAGIC,  12, struct vha_cancel_data)
 #define VHA_IOC_CLK_CTRL          _IOW(VHA_IOC_MAGIC,  13, struct vha_clk_ctrl_data)
 #define VHA_IOC_DEVICE_STATE      _IOR(VHA_IOC_MAGIC,  14, enum vha_device_state)
+#define VHA_IOC_MAX_FREQ          _IOW(VHA_IOC_MAGIC,  15, int)
 
 #define VHA_SCOPE_DEV_NAME "vha_scope"
 

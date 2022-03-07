@@ -14,6 +14,7 @@ int vha_dvfs_ctx_deinit(struct device *dev);
 int vha_devfreq_init(struct vha_dev *vha);
 void vha_devfreq_term(struct vha_dev *vha);
 void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtimestamp);
+int vha_set_max_freq(int max);
 #endif
 
 #endif

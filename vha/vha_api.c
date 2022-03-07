@@ -58,6 +58,7 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_chipdep.h"
+#include "vha_devfreq.h"
 
 static uint32_t default_mem_heap = IMG_MEM_MAN_HEAP_ID_INVALID;
 module_param(default_mem_heap, uint, 0444);
@@ -790,6 +791,22 @@ static long vha_ioctl_state(struct vha_session *session, void __user *buf)
 	return 0;
 }
 
+static long vha_ioctl_max_freq(struct vha_session *session, void __user *buf)
+{
+	int ret = 0;
+	int max;
+	struct vha_dev *vha = session->vha;
+
+	if (copy_from_user(&max, buf, sizeof(max))) {
+		dev_err(vha->dev, "copy from user failed!\n", __func__);
+		return -EFAULT;
+	}
+
+	ret = vha_set_max_freq(max);
+
+	return ret;
+}
+
 static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 {
 	struct vha_session *session = (struct vha_session *)file->private_data;
@@ -836,6 +853,8 @@ static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 		return vha_ioctl_clk_ctrl(session, (void __user *)value);
 	case VHA_IOC_DEVICE_STATE:
 		return vha_ioctl_state(session, (void __user*)value);
+	case VHA_IOC_MAX_FREQ:
+		return vha_ioctl_max_freq(session, (void __user*)value);
 	default:
 		dev_err(miscdev->this_device, "%s: code %#x unknown\n",
 			__func__, code);
