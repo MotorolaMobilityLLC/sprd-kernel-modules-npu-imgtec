@@ -713,9 +713,6 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 		vha_chk_cmd_queues(vha, false);
 	}
 	vha->stats.cnn_kicks_completed += count;
-	if (vha->cur_session && vha->cur_session->pages)
-		cmp_pagetabs(vha->cur_session->mmu_ctxs[0].ctx, vha->cur_session->pages);
-
 	mutex_unlock(&vha->lock);
 
 	return ret;
@@ -890,15 +887,6 @@ void vha_scheduler_loop(struct vha_dev *vha)
 
 				/* Attempt to schedule command for execution. */
 				cmd_status = vha_do_cmd(cmd);
-				if (!vha->cur_session) {
-					session->pages = kmalloc(sizeof(struct pages_info), GFP_KERNEL | __GFP_ZERO);
-					if (!session->pages) {
-						dev_err(vha->dev, "alloc pages_info failed\n");
-						break;
-					}
-					save_pagetabs(session->mmu_ctxs[0].ctx, session->pages);
-					vha->cur_session = session;
-				}
 				if (cmd_status == CMD_NOTIFIED) {
 					continue;
 				}

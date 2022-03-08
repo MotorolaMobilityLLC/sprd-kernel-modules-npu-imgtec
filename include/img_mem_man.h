@@ -277,20 +277,6 @@ int __img_pdump_printf(struct device* dev, const char *fmt, ...) __printf(2, 3);
 void img_pdump_destroy(struct pdump_descr* pdump);
 bool img_pdump_enabled(struct pdump_descr* pdump);
 
-/*
- * UNISOC mmu debug
- */
-
-struct pages_info {
-	void *dir_pages;
-	void *tab_pages;
-	void *cat_page;
-};
-
-void save_pagetabs(struct mmu_ctx *mmu_ctx, struct pages_info *pages);
-void free_pagetabs(struct pages_info *pages);
-void cmp_pagetabs(struct mmu_ctx *mmu_ctx, struct pages_info *pages);
-
 #endif /* IMG_MEM_MAN_H */
 
 /*
