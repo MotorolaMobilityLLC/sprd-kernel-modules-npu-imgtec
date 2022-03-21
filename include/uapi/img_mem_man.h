@@ -99,17 +99,20 @@ enum img_mem_heap_attrs {
 #define IMG_MEM_MAN_MIN_BUFFER 1
 #define IMG_MEM_MAN_MAX_BUFFER 2000
 
-/* Definition of VA guard gap */
+/* Definition of VA guard gap between allocations */
 #define IMG_MEM_VA_GUARD_GAP 0x1000
 
 /* Virtual memory space for buffers allocated
  * in the kernel - OCM & device debug buffers */
 #define IMG_MEM_VA_HEAP1_BASE 0x8000000ULL
-#define IMG_MEM_VA_HEAP1_SIZE (0x40000000ULL - IMG_MEM_VA_GUARD_GAP)
+#define IMG_MEM_VA_HEAP1_SIZE 0x40000000ULL
+
+/* Definition of VA guard gap between heaps - 2MB (size of MMU PD) */
+#define IMG_MEM_HEAP_GUARD_GAP 0x200000
 
 /* Virtual memory space for buffers allocated in the user space */
 #define IMG_MEM_VA_HEAP2_BASE ( \
-		IMG_MEM_VA_HEAP1_BASE + IMG_MEM_VA_HEAP1_SIZE + IMG_MEM_VA_GUARD_GAP)
+		IMG_MEM_VA_HEAP1_BASE + IMG_MEM_VA_HEAP1_SIZE + IMG_MEM_HEAP_GUARD_GAP)
 #define IMG_MEM_VA_HEAP2_SIZE 0x3C0000000ULL
 
 #endif /* IMG_MEM_MAN_UAPI_H */

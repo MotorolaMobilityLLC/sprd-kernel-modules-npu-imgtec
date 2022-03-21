@@ -1,5 +1,5 @@
 #
-# npu_img_vha.ko
+# npu_img_mem.ko
 #
 # Kbuild: for kernel building external module
 #
@@ -14,28 +14,30 @@
 KO_MODULE_NAME := npu_img_vha
 KO_MODULE_PATH := $(src)
 KO_MODULE_SRC  :=
-
 KO_MODULE_SRC += \
 	$(shell find $(KO_MODULE_PATH) -name "*.c")
 
 #
 # Build Options
 #
-subdir-ccflags-y         += -I$(KO_MODULE_PATH)/../include
-subdir-ccflags-y         += -I$(KO_MODULE_PATH)/chipdep/n6pro
-ccflags-y                += -I$(KO_MODULE_PATH)/platform
-subdir-ccflags-y         += -I$(KO_MODULE_PATH)
-subdir-ccflags-y         += -I$(KO_MODULE_PATH)/single
+subdir-ccflags-y += -I$(KO_MODULE_PATH)/img_mem/imgmmu/mmulib
+subdir-ccflags-y += -I$(KO_MODULE_PATH)/include
+subdir-ccflags-y += -I$(KO_MODULE_PATH)/vha/chipdep/n6pro
+subdir-ccflags-y += -I$(KO_MODULE_PATH)/vha/single
+subdir-ccflags-y += -I$(KO_MODULE_PATH)/vha
+subdir-ccflags-y += -I$(KO_MODULE_PATH)/vha/platform
+
 ccflags-y                += -DCFG_SYS_AURA
 ccflags-y                += -DHW_AX3
-ccflags-y                += -DDEFAULT_SYMBOL_NAMESPACE=VHA_CORE
 ccflags-y                += -DVHA_MMU_MIRRORED_CTX_SUPPORT
 ccflags-y                += -DOSID=0
 ccflags-y                += -DVHA_DEVFREQ
-
+ccflags-y                += -DVHA_USE_LO_PRI_SUB_SEGMENTS
+ccflags-y                += -DDEFAULT_SYMBOL_NAMESPACE=VHA_CORE
 #
 # Final Objects
 #
-obj-m := $(KO_MODULE_NAME).o
 # Comment it if the only object file has the same name with module
+obj-m := $(KO_MODULE_NAME).o
 $(KO_MODULE_NAME)-y := $(patsubst $(src)/%.c,%.o,$(KO_MODULE_SRC))
+

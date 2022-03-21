@@ -310,14 +310,18 @@ int vha_chip_init(struct device *dev)
 	udelay(400);
 	vha_powerdomain_setup(dev);
 	vha_clockdomain_init(dev);
+#ifdef VHA_DEVFREQ
 	vha_dvfs_ctx_init(dev);
+#endif
 
 	return 0;
 }
 
 int vha_chip_deinit(struct device *dev)
 {
+#ifdef VHA_DEVFREQ
 	vha_dvfs_ctx_deinit(dev);
+#endif
 	device_wakeup_disable(dev);
 
 	return 0;

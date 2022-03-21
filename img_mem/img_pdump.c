@@ -85,6 +85,9 @@ struct pdump_buf *img_pdump_create(struct pdump_descr* pdump, uint32_t pdump_num
 		pr_err("%s: failed to create pdump %d\n", __func__, pdump_num);
 		return NULL;
 	}
+
+	mutex_init(&pdump->lock);
+
 	return pbuf;
 }
 EXPORT_SYMBOL(img_pdump_create);

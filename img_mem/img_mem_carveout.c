@@ -87,13 +87,15 @@ static int trace_mmap_fault;
 static struct sg_table *carveout_map_dmabuf(struct dma_buf_attachment *attach,
 		enum dma_data_direction dir)
 {
-	struct buffer_data *buffer_data = attach->dmabuf->priv;
+	struct buffer *buffer = attach->dmabuf->priv;
+	struct buffer_data *buffer_data;
 
-	if (!buffer_data)
+	if (!buffer)
 		return NULL;
 
 	pr_debug("%s\n", __func__);
 
+	buffer_data = buffer->priv;
 	sg_dma_address(buffer_data->sgt->sgl) = buffer_data->dma_base;
 	sg_dma_len(buffer_data->sgt->sgl) = buffer_data->dma_size;
 
@@ -104,12 +106,15 @@ static void carveout_unmap_dmabuf(struct dma_buf_attachment *attach,
 					struct sg_table *sgt,
 					enum dma_data_direction dir)
 {
-	struct buffer_data *buffer_data = attach->dmabuf->priv;
+	struct buffer *buffer = attach->dmabuf->priv;
+	struct buffer_data *buffer_data;
 
-	if (!buffer_data)
+	if (!buffer)
 		return;
 
 	pr_debug("%s\n", __func__);
+
+	buffer_data = buffer->priv;
 	sg_dma_address(buffer_data->sgt->sgl) = (~(dma_addr_t)0);
 	sg_dma_len(buffer_data->sgt->sgl) = 0;
 }
@@ -117,8 +122,13 @@ static void carveout_unmap_dmabuf(struct dma_buf_attachment *attach,
 /* Called when when ref counter reaches zero! */
 static void carveout_release_dmabuf(struct dma_buf *buf)
 {
-	struct buffer_data *buffer_data = buf->priv;
+	struct buffer *buffer = buf->priv;
+	struct buffer_data *buffer_data;
 
+	if (!buffer)
+		return;
+
+	buffer_data = buffer->priv;
 	pr_debug("%s %p\n", __func__, buffer_data);
 	if (!buffer_data)
 		return;
@@ -129,25 +139,100 @@ static void carveout_release_dmabuf(struct dma_buf *buf)
 /* Called on file descriptor mmap */
 static int carveout_mmap_dmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
 {
-	struct buffer_data *buffer_data = buf->priv;
+	struct buffer *buffer = buf->priv;
+	struct buffer_data *buffer_data;
+	struct scatterlist *sgl;
+	unsigned long addr;
 
-	if (!buffer_data)
+	if (!buffer)
 		return -EINVAL;
 
-	pr_debug("%s\n", __func__);
+	buffer_data = buffer->priv;
+
+	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer);
+	pr_debug("%s:%d vm_start %#lx vm_end %#lx size %#lx\n",
+		__func__, __LINE__,
+		vma->vm_start, vma->vm_end, vma->vm_end - vma->vm_start);
 
 	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
 
-	return remap_pfn_range(vma, vma->vm_start,
-						 page_to_pfn(sg_page(buffer_data->sgt->sgl)),
-						 buffer_data->sgt->sgl->length,
-						 vma->vm_page_prot);
+	sgl = buffer_data->sgt->sgl;
+	addr = vma->vm_start;
+	while (sgl) {
+		dma_addr_t phys = sg_phys(sgl);
+		unsigned long pfn = phys >> PAGE_SHIFT;
+		unsigned int len = sgl->length;
+		int ret;
+
+		if (vma->vm_end < (addr + len)) {
+			unsigned long size = vma->vm_end - addr;
+			pr_debug("%s:%d buffer %d (0x%p) truncating len=%#x to size=%#lx\n",
+				__func__, __LINE__,
+				buffer->id, buffer, len, size);
+			WARN(round_up(size, PAGE_SIZE) != size,
+				"VMA size %#lx not page aligned\n", size);
+			len = size;
+			if (!len) /* VM space is smaller than allocation */
+				break;
+		}
+
+		ret = remap_pfn_range(vma, addr, pfn, len, vma->vm_page_prot);
+		if (ret)
+			return ret;
+
+		addr += len;
+		sgl = sg_next(sgl);
+	}
+
+	return 0;
 }
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
 static void *carveout_kmap_dmabuf(struct dma_buf *buf, unsigned long page)
 {
 	pr_err("%s not supported\n", __func__);
 	return NULL;
+}
+#endif
+
+static int carveout_heap_map_km(struct heap *heap, struct buffer *buffer);
+static int carveout_heap_unmap_km(struct heap *heap, struct buffer *buffer);
+
+static void *carveout_vmap_dmabuf(struct dma_buf *buf)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer)
+		return NULL;
+
+	heap = buffer->heap;
+
+	if (carveout_heap_map_km(heap, buffer))
+		return NULL;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p\n", __func__, __LINE__,
+		buffer->id, buffer->kptr);
+
+	return buffer->kptr;
+}
+
+static void carveout_vunmap_dmabuf(struct dma_buf *buf, void *kptr)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer)
+		return;
+
+	heap = buffer->heap;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer->kptr, kptr);
+
+	if (buffer->kptr == kptr)
+		carveout_heap_unmap_km(heap, buffer);
 }
 
 static const struct dma_buf_ops carveout_dmabuf_ops = {
@@ -157,13 +242,15 @@ static const struct dma_buf_ops carveout_dmabuf_ops = {
 	.mmap = carveout_mmap_dmabuf,
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
 	.kmap_atomic = carveout_kmap_dmabuf,
-	.kmap = carveout_kmap_dmabuf
+	.kmap = carveout_kmap_dmabuf,
 #else
 #if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
 	.map_atomic = carveout_kmap_dmabuf,
-#endif
 	.map = carveout_kmap_dmabuf,
 #endif
+#endif
+	.vmap = carveout_vmap_dmabuf,
+	.vunmap = carveout_vunmap_dmabuf,
 };
 
 static int carveout_heap_export(struct device *device, struct heap *heap,
@@ -227,7 +314,7 @@ static int carveout_heap_export(struct device *device, struct heap *heap,
 	exp_info.ops = &carveout_dmabuf_ops;
 	exp_info.size = size;
 	exp_info.flags = O_RDWR;
-	exp_info.priv = buffer_data;
+	exp_info.priv = buffer;
 	exp_info.resv = NULL;
 	dma_buf = dma_buf_export(&exp_info);
 #endif
@@ -297,7 +384,7 @@ static int carveout_heap_alloc(struct device *device, struct heap *heap,
 	page = 0;
 	while (page < pages) {
 		if (trace_physical_pages)
-			pr_debug("%s phys %llx\n",
+			pr_info("%s phys %llx\n",
 				__func__, (unsigned long long)phys_addr);
 		buffer_data->addrs[page++] = phys_addr;
 		phys_addr += PAGE_SIZE;
@@ -322,8 +409,10 @@ static void carveout_heap_free(struct heap *heap, struct buffer *buffer)
 		buffer->id, buffer);
 
 	/* If forgot to unmap */
-	if (heap->options.carveout.put_kptr && buffer->kptr)
+	if (heap->options.carveout.put_kptr && buffer->kptr) {
 		heap->options.carveout.put_kptr(buffer->kptr);
+		buffer->kptr = NULL;
+	}
 
 	if (buffer_data->dma_buf) {
 		dma_buf_put(buffer_data->dma_buf);
@@ -344,7 +433,7 @@ static void carveout_heap_free(struct heap *heap, struct buffer *buffer)
 	kfree(buffer_data);
 }
 
-static void _mmap_open(struct vm_area_struct *vma)
+static void carveout_mmap_open(struct vm_area_struct *vma)
 {
 	struct buffer *buffer = vma->vm_private_data;
 	struct buffer_data *buffer_data = buffer->priv;
@@ -355,7 +444,7 @@ static void _mmap_open(struct vm_area_struct *vma)
 			__func__, __LINE__, buffer->id, buffer, vma);
 }
 
-static void _mmap_close(struct vm_area_struct *vma)
+static void carveout_mmap_close(struct vm_area_struct *vma)
 {
 	struct buffer *buffer = vma->vm_private_data;
 	struct buffer_data *buffer_data;
@@ -371,22 +460,18 @@ static void _mmap_close(struct vm_area_struct *vma)
 }
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
-static vm_fault_t _mmap_fault(struct vm_fault *vmf)
+static vm_fault_t carveout_mmap_fault(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 #else
-static int _mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
+static int carveout_mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 #endif
 	struct buffer *buffer = vma->vm_private_data;
 	struct buffer_data *buffer_data = buffer->priv;
 	phys_addr_t phys_addr;
-	pgoff_t offset;
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 10, 0)
-	unsigned long addr = vmf->address;
-#else
-	unsigned long addr = (unsigned long)vmf->virtual_address;
-#endif
+	size_t pages, page;
+	unsigned long addr;
 
 	if (trace_mmap_fault) {
 		pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",
@@ -397,39 +482,44 @@ static int _mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 			vma->vm_end - vma->vm_start);
 	}
 
-	offset = (addr - vma->vm_start) >> PAGE_SHIFT;
-
-	if (offset > (buffer->actual_size / PAGE_SIZE)) {
-		pr_err("%s:%d offs:%ld\n",
-			__func__, __LINE__, offset);
-		return VM_FAULT_SIGBUS;
-	}
-
-	phys_addr = buffer_data->addrs[0] + (offset * PAGE_SIZE);
-
-	if (trace_mmap_fault)
-		pr_debug("%s:%d vmf pgoff %#lx vmf addr %lx offs :%ld phys:%#llx\n",
-			__func__, __LINE__, vmf->pgoff, addr, offset, phys_addr);
-
+	page = 0;
+	pages = buffer->actual_size / PAGE_SIZE;
+	addr = vma->vm_start;
+	while (page < pages && addr < vma->vm_end) {
+		phys_addr = buffer_data->addrs[page++];
+		if (trace_mmap_fault)
+			pr_info("%s:%d vmf addr %lx phys:%#llx\n",
+				__func__, __LINE__, addr,
+				(unsigned long long)phys_addr);
+		{
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
-	return vmf_insert_pfn(vma, addr, phys_addr >> PAGE_SHIFT);
+			{
+				vm_fault_t err = vmf_insert_pfn(vma, addr, phys_addr >> PAGE_SHIFT);
+				if (err != VM_FAULT_NOPAGE)
+					return err;
+			}
 #else
-	{
-		int err = vm_insert_pfn(vma, addr, phys_addr >> PAGE_SHIFT);
-		switch (err) {
-		case 0:
-		case -EAGAIN:
-		case -ERESTARTSYS:
-		case -EINTR:
-		case -EBUSY:
-			return VM_FAULT_NOPAGE;
-		case -ENOMEM:
-			return VM_FAULT_OOM;
-		}
-
-		return VM_FAULT_SIGBUS;
-	}
+			{
+				int err = vm_insert_pfn(vma, addr, phys_addr >> PAGE_SHIFT);
+				switch (err) {
+				case 0:
+				case -EAGAIN:
+				case -ERESTARTSYS:
+				case -EINTR:
+				case -EBUSY:
+					break; // passthrough
+				case -ENOMEM:
+					return VM_FAULT_OOM;
+				default:
+					return VM_FAULT_SIGBUS;
+				}
+			}
 #endif
+		}
+		addr += PAGE_SIZE;
+	}
+
+	return VM_FAULT_NOPAGE;
 }
 
 /* vma ops->fault handler is used to track user space mappings
@@ -449,9 +539,9 @@ static int _mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
  *  unmap() -> .close -> flush buffer cache
  */
 static struct vm_operations_struct carveout_mmap_vm_ops = {
-	.open = _mmap_open,
-	.close = _mmap_close,
-	.fault = _mmap_fault,
+	.open = carveout_mmap_open,
+	.close = carveout_mmap_close,
+	.fault = carveout_mmap_fault,
 };
 
 static int carveout_heap_map_um(struct heap *heap, struct buffer *buffer,
@@ -476,7 +566,7 @@ static int carveout_heap_map_um(struct heap *heap, struct buffer *buffer,
 	vma->vm_private_data = buffer;
 	vma->vm_pgoff = 0;
 
-	_mmap_open(vma);
+	carveout_mmap_open(vma);
 
 	return 0;
 }
@@ -496,14 +586,17 @@ static int carveout_heap_map_km(struct heap *heap, struct buffer *buffer)
 				buffer_data->addrs[0],
 				buffer->actual_size,
 				buffer_data->mattr);
+	else if (heap->options.carveout.kptr)
+		buffer->kptr = heap->options.carveout.kptr +
+				(buffer_data->addrs[0] - heap->options.carveout.phys);
 	else
 		return -ENOMEM;
 
 	if (!buffer->kptr)
 		return -ENOMEM;
 
-	pr_debug("%s:%d buffer %d (0x%p) kptr 0x%p\n", __func__, __LINE__,
-		buffer->id, buffer, buffer->kptr);
+	pr_debug("%s:%d buffer %d (0x%p) kptr 0x%p size:%zu\n", __func__, __LINE__,
+		buffer->id, buffer, buffer->kptr, buffer->actual_size);
 
 	return 0;
 }
@@ -622,11 +715,26 @@ int img_mem_carveout_init(const struct heap_config *config, struct heap *heap)
 		return -EINVAL;
 	}
 
-	pr_debug("%s phys base:%#llx (offs:%llx) size:%zu order:%d\n", __func__,
+	pr_debug("%s phys base:%#llx kptr %p (offs:%llx) size:%zu order:%d\n", __func__,
 		 (unsigned long long)heap->options.carveout.phys,
+		 heap->options.carveout.kptr,
 		 (unsigned long long)heap->options.carveout.offs,
 		 heap->options.carveout.size,
 		 pool_order);
+
+	if (config->options.carveout.kptr &&
+			(heap->options.carveout.put_kptr || heap->options.carveout.get_kptr)) {
+		pr_err("%s can't use static & dynamic kernel mapping at the same time!\n",
+				__func__);
+		return -EINVAL;
+	}
+
+	if (!config->options.carveout.kptr &&
+			!(heap->options.carveout.put_kptr && heap->options.carveout.get_kptr)) {
+		pr_warn("%s no kernel mapping method available!\n",
+				__func__);
+		return -EINVAL;
+	}
 
 	if (heap->options.carveout.phys & ((1ULL<<pool_order)-1)) {
 		pr_err("%s phys addr (%#llx) is not aligned to allocation order!\n",

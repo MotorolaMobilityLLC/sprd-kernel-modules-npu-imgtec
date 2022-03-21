@@ -46,10 +46,10 @@
 #include <linux/delay.h>
 
 #include <uapi/vha.h>
+#include <uapi/vha_errors.h>
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
-#include "vha_devfreq.h"
 
 static uint32_t cnn_pdump_poll_count = 10000000;
 module_param(cnn_pdump_poll_count, uint, 0444);
@@ -85,10 +85,11 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 	struct vha_onchip_map *onchip_map = NULL;
 	int ret = -EINVAL;
 	uint64_t alt_addrs_used = 0;
+	size_t user_cmd_size;
 #ifdef VHA_DEVFREQ
 	ktime_t now;
 #endif
-
+	
 	if (vha->hw_bypass) {
 		ret = -EAGAIN;
 		dev_info(vha->dev, "%s skip\n", __func__);
@@ -113,7 +114,10 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 		goto out_error;
 	}
 
-	if (cmd->size != sizeof(*user_cmd)) {
+	user_cmd_size = sizeof(*user_cmd);
+	if (user_cmd->subseg_num > 0)
+		user_cmd_size += (user_cmd->subseg_num - 1) * sizeof(struct vha_subseg_info);
+	if (cmd->size != user_cmd_size) {
 		dev_err(vha->dev, "%s: command buffer wrong size: %zu/%zu",
 			__func__, cmd->size, sizeof(*user_cmd));
 		goto out_error;
@@ -124,10 +128,8 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 		goto out_error;
 	}
 
-	/* at least CMD and IN */
+	/* at least CMD and (IN or OUT)*/
 	if (user_cmd->msg.num_inbufs < 2 ||
-		/* at least OUT */
-		(user_cmd->msg.num_bufs - user_cmd->msg.num_inbufs) < 1 ||
 		/* and maybe TMP and others */
 		user_cmd->msg.num_bufs > VHA_CORE_MAX_ALT_ADDRS) {
 		dev_err(vha->dev, "%s: wrong number of bufs: %u,%u\n",
@@ -165,8 +167,12 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 		}
 		if (buf->id == user_cmd->cmdbuf) {
 			/* cmdstream always starts at offset 0 */
-			size = cmd->stream_size = buf->size;
-			offset = 0;
+			if (user_cmd->subseg_info[cmd->subseg_current].cmdbuf_size)
+				size = cmd->stream_size = user_cmd->subseg_info[cmd->subseg_current].cmdbuf_size;
+			else
+				size = cmd->stream_size = buf->size;
+
+			offset = user_cmd->subseg_info[cmd->subseg_current].cmdbuf_offset;
 			if (size == 0) {
 				dev_err(vha->dev,
 					"%s: invalid cmdstream size\n",
@@ -231,6 +237,7 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 					buf, offset, size,
 					buf->status == VHA_BUF_FILLED_BY_SW);
 
+		vha_dump_digest(session, buf, cmd);
 		/*
 		 * write to all of the index registers.
 		 * in no-MMU mode, write phys address of a contig buffer.
@@ -258,10 +265,13 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 	if (vha->pendcmd[VHA_CNN_CMD].cmd) {
 		vha->queuedcmd[VHA_CNN_CMD].cmd = cmd;
 		cmd->queued = true;
-		vha->stats.cnn_queued_kicks++;
+		vha->stats.cnn_kicks_queued++;
 		img_pdump_printf("-- CNN already kicked queueing!\n");
-		dev_dbg(vha->dev, "%s: -> kicked:%p queueing:%p\n",
-					__func__, vha->pendcmd[VHA_CNN_CMD].cmd, cmd);
+		dev_dbg(vha->dev, "%s: -> kicked:0x%08x/%u queueing:0x%08x/%u\n",
+					__func__,
+					vha->pendcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id,
+					vha->pendcmd[VHA_CNN_CMD].cmd->session->id,
+					cmd->user_cmd.cmd_id, cmd->session->id);
 		if (vha->low_latency == VHA_LL_SW_KICK)
 			return ret;
 	}
@@ -277,7 +287,7 @@ hw_kick:
 	vha_dev_mh_setup(vha, session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].hw_id, NULL);
 
 	/* Prepare debug buffer registers */
-	vha_dbg_prepare_hwbufs(session, 0, NULL);
+	vha_dbg_prepare_hwbufs(session, cmd, NULL);
 
 	/* Setup cnn hw watchdog before kicking the hw */
 	{
@@ -304,6 +314,10 @@ hw_kick:
 	cmd->dummy_kicked = true;
 #endif
 
+	/* Consider this cmd as kicked. */
+	vha->pri_q_counters[cmd->user_cmd.priority]--;
+	cmd->subseg_current++;
+
 	ret = 0;
 	/* Setup kick info */
 	val32 = vha_dev_kick_prepare(vha, cmd,
@@ -312,7 +326,7 @@ hw_kick:
 	img_pdump_printf("-- CNN_SETUP_END\n");
 
 	/* Remember the time cnn is kicked */
-	getnstimeofday(&cmd->hw_proc_start);
+	GETNSTIMEOFDAY(&cmd->hw_proc_start);
 	vha->stats.hw_proc_start = cmd->hw_proc_start;
 	/* Need to generate proper pdump */
 	if (cmd->queued &&
@@ -320,15 +334,16 @@ hw_kick:
 		/* Do not write to pdump
 		 * this needs to be done after irq POL*/
 		IOWRITE64(vha->reg_base, VHA_CR_OS(CNN_CONTROL), val32);
-		dev_dbg(vha->dev, "%s: CNN kick queued (%p)!\n",
-					__func__, cmd);
+		dev_dbg(vha->dev, "%s: CNN kick queued (0x%08x/%u)!\n",
+				__func__, cmd->user_cmd.cmd_id, cmd->session->id);
 		cmd->queued = false;
 	} else {
 		img_pdump_printf("-- CNN_KICK_BEGIN\n");
 		img_pdump_printf("-- CNN kick!\n");
 		IOWRITE64_PDUMP(val32, VHA_CR_OS(CNN_CONTROL));
-		dev_dbg(vha->dev, "%s: CNN kick %s (%p)!\n",
-					__func__, cmd->queued ? "queued" : "", cmd);
+		dev_dbg(vha->dev, "%s: CNN kick %s (0x%08x/%u)!\n",
+				__func__, cmd->queued ? "queued" : "",
+				cmd->user_cmd.cmd_id, cmd->session->id);
 		img_pdump_printf("-- CNN_KICK_END\n");
 	}
 
@@ -341,9 +356,16 @@ hw_kick:
 #endif
 	/* notify any observers of the submit event */
 	if (vha_observers.submitted)
-		vha_observers.submitted(vha->id, cmd->user_cmd.cmd_id);
+		vha_observers.submitted(vha->id, session->id, cmd->user_cmd.cmd_id,
+								(cmd->subseg_current == VHA_CMD_SUBSEG_NUM(cmd)),
+								cmd->user_cmd.priority);
 
 out_error:
+	if (ret != 0) {
+		/* Consider this cmd as kicked for errors too. */
+		vha->pri_q_counters[cmd->user_cmd.priority]--;
+		cmd->subseg_current++;
+	}
 	return ret;
 }
 
@@ -390,13 +412,17 @@ void vha_cnn_start_calib(struct vha_dev *vha)
 	/* To be sure the cmd clock has switched off*/
 	udelay(100);
 
+	/* Enable MMU bypass */
+	IOWRITE64_PDUMP(VHA_CR_OS(MMU_CTRL_BYPASS_EN),
+		VHA_CR_OS(MMU_CTRL));
+
 	/* Set minimal command stream size */
 	start = (2048/32-1) << VHA_CR_OS(CNN_CONTROL_CMD_SIZE_MIN1_SHIFT);
 	start |= VHA_CR_OS(CNN_CONTROL_START_EN);
 	/* write the START bit */
 	IOWRITE64(vha->reg_base, VHA_CR_OS(CNN_CONTROL), start);
 	/* Remember the time cnn is kicked */
-	getnstimeofday(&vha->stats.hw_proc_start);
+	GETNSTIMEOFDAY(&vha->stats.hw_proc_start);
 }
 
 void vha_cnn_update_stats(struct vha_dev *vha)
@@ -449,7 +475,7 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 	switch (user_cmd->cmd_type) {
 	case VHA_CMD_CNN_SUBMIT:
 	{
-		size_t mem_usage = img_mem_get_usage_current(session->mem_ctx);
+		size_t mem_usage;
 		/* allocate sufficient space for the response */
 		size_t sz = sizeof(*rsp)
 			+ sizeof(struct vha_user_cnn_submit_rsp)
@@ -475,7 +501,7 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 		/* Ignore PARITY when waiting for status change */
 		status_mask &= VHA_CR_OS(VHA_EVENT_STATUS_PARITY_CLRMSK);
 #ifdef VHA_SCF
-		if (session->vha->core_props.supported.parity &&
+		if (session->vha->hw_props.supported.parity &&
 				!session->vha->parity_disable) {
 			/* If complete bit is set then parity bit must be set as well ! */
 			cmpl_val |= VHA_CR_OS(VHA_EVENT_STATUS_PARITY_EN);
@@ -518,7 +544,7 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 				cmpl_val,
 				ready_mask);
 #ifdef VHA_SCF
-		if (session->vha->core_props.supported.parity &&
+		if (session->vha->hw_props.supported.parity &&
 				!session->vha->parity_disable) {
 			/* Check CNN_STATUS parity */
 			uint32_t cnn_status = VHA_CR_SETBITS_OS(CNN_STATUS,
@@ -530,6 +556,13 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 					VHA_CR_OS(CNN_STATUS), cnn_status);
 		}
 #endif
+		/* quick pdump POL for AXI errors:
+		 * count=1, delay=10cycles
+		 */
+		img_pdump_printf("-- Post check of AXI status\n"
+				"POL :REG:%#x 0 0xffffffff 0 1 10\n",
+				VHA_CR_ACE_STATUS);
+
 		/* We do clear interrupts in the irq handler,
 		 * but this is not recorded into pdump because
 		 * of the irq context, so do it here */
@@ -572,7 +605,10 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 			vha_pdump_sab_buf(session, PDUMP_RES,
 					buf, offset, size);
 
-			vha_set_buf_status(session, buf->id, VHA_BUF_FILLED_BY_HW, VHA_SYNC_NONE);
+			/* Update status, do not signal fence yet,
+			 * it's is done explicitly below, after cache invalidation */
+			vha_set_buf_status(session, buf->id, VHA_BUF_FILLED_BY_HW,
+					VHA_SYNC_NONE, false);
 
 			if (vha_buf_needs_inval(session, buf->id) && !status)
 				img_mem_sync_device_to_cpu(session->mem_ctx, buf->id);
@@ -580,6 +616,7 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 			img_mem_signal_fence(session->mem_ctx, buf->id);
 #endif
+			vha_dump_digest(session, buf, cmd);
 		}
 
 		if (session->vha->low_latency == VHA_LL_SW_KICK) {
@@ -597,14 +634,17 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 		}
 		img_pdump_printf("-- CNN_WAIT_END\n");
 
+		img_mem_get_usage(session->mem_ctx, NULL, &mem_usage);
 		/* send out an event when submit is complete */
 		if (vha_observers.completed)
 			vha_observers.completed(
 				session->vha->id,
+				session->id,
 				user_cmd->cmd_id,
 				status,
 				session->vha->stats.cnn_last_cycles,
-				mem_usage);
+				mem_usage,
+				user_cmd->priority);
 
 		/* post some metrics about the hw to user space */
 #ifdef MEM_USAGE_LAST_METRICS_ARE_AVAILABLE
@@ -612,9 +652,8 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 #else
 		cnn_submit_rsp->mem_usage = ~0;
 #endif
-		cnn_submit_rsp->last_proc_us = session->vha->stats.cnn_last_proc_us;
-		cnn_submit_rsp->hw_cycles = session->vha->stats.cnn_last_cycles;
-		cnn_submit_rsp->clock_freq = session->vha->freq_khz;
+		cnn_submit_rsp->last_proc_us = cmd->proc_us;
+		cnn_submit_rsp->hw_cycles = cmd->hw_cycles;
 		dev_dbg(session->vha->dev, "%s: %p, hw_cycles %llx\n", __func__,
 				cmd, session->vha->stats.cnn_last_cycles);
 
@@ -639,8 +678,10 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 
 	if (user_cmd->flags & VHA_CMDFLAG_NOTIFY) {
 		rsp->user_rsp.cmd_id = cmd->user_cmd.cmd_id;
-		rsp->user_rsp.err_no = session->vha->hw_bypass ? 0 : status;
-
+		if (!session->vha->hw_bypass) {
+			rsp->user_rsp.err_no = status;
+			VHA_RSP_SET_ERROR(rsp->user_rsp.rsp_err_flags);
+		}
 		cmd->rsp = rsp;
 	} else
 		kfree(rsp);
@@ -657,11 +698,13 @@ enum do_cmd_status vha_do_cnn_cmd(struct vha_cmd *cmd)
 	int status = -EINVAL;
 
 	dev_dbg(session->vha->dev,
-		"CNN command: id:%x type:%x nin:%x nbufs:%x\n",
-		user_cmd->cmd_id, user_cmd->cmd_type,
+		"CNN command: id:0x%08x/%u type:%x nin:%x nbufs:%x\n",
+		user_cmd->cmd_id, session->id, user_cmd->cmd_type,
 		user_cmd->num_inbufs, user_cmd->num_bufs);
+#if 0
 	print_hex_dump_debug("VHA CMD: ", DUMP_PREFIX_NONE, 4, 4,
 				user_cmd, ALIGN(cmd->size, 4), false);
+#endif
 
 	switch (user_cmd->cmd_type) {
 	case VHA_CMD_CNN_SUBMIT:

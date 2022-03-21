@@ -67,6 +67,11 @@ module_param(pte_cache_mode, int, 0444);
 MODULE_PARM_DESC(pte_cache_mode,
     "PTE ax_cache signals. Acceptable values:<0-15>, refer to MMUv3 spec.");
 
+static bool pte_rb_check = true;
+module_param(pte_rb_check, bool, 0444);
+MODULE_PARM_DESC(pte_rb_check,
+    "Enables PTE read-back checks");
+
 /** variable page shift */
 static size_t g_mmupageshift = IMGMMU_PAGE_SHIFT;
 
@@ -650,7 +655,7 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 		return (uint64_t)-1;
 
 	addr = cat->config.page_read(
-			cat->page, cat_entry, &flags);
+			cat->page, cat_entry, NULL, &flags);
 
 	if (dir->page == NULL)
 		return (uint64_t)-1;
@@ -665,7 +670,7 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 		return (uint64_t)-1;
 
 	addr = dir->config.page_read(
-			dir->page, dir_entry, &flags);
+			dir->page, dir_entry, NULL, &flags);
 	/* Check consistency of PDE */
 	if (addr != tab->page->phys_addr) {
 		mmu_log_err("PDE entry inconsistent!\n");
@@ -673,7 +678,7 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 	}
 
 	addr = dir->config.page_read(
-			tab->page, tab_entry, &flags);
+			tab->page, tab_entry, NULL, &flags);
 
 	return addr|flags;
 }
@@ -704,7 +709,7 @@ uint64_t imgmmu_cat_override_phys_addr(struct imgmmu_cat *cat,
 		return (uint64_t)-1;
 
 	(void)dir->config.page_read(
-		dir->page_map[dir_entry]->page, tab_entry, &flags);
+		dir->page_map[dir_entry]->page, tab_entry, NULL, &flags);
 
 	if (!(flags & MMU_FLAG_VALID))
 		return (uint64_t)-1;
@@ -805,18 +810,18 @@ static struct imgmmu_dirmap *mmu_dir_map(struct imgmmu_dir *dir,
 
 		/* if dir->page_map[dir_offs] == NULL not yet allocated it
 		   means all entries are available */
-		if (dir->page_map[dir_offs] != NULL) {
+		if (pte_rb_check &&
+				dir->page_map[dir_offs] != NULL) {
 			/*
 			 * inside a pagetable
 			 * verify that the required offset is invalid
 			 */
-			uint32_t *page_mem = (uint32_t *)
-			    dir->page_map[dir_offs]->page->
-			    cpu_addr;
+			unsigned flags = 0;
+			(void)dir->config.page_read(
+					dir->page_map[dir_offs]->page, page_offs, priv, &flags);
 
-			/* PTE is 64 bit value, so calculate proper offset */
-			if ((page_mem[(page_offs*2)+1] & MMU_FLAG_VALID) != 0) {
-				mmu_log_err("page is currently in use\n");
+			if (flags & MMU_FLAG_VALID) {
+				mmu_log_err("PTE is currently in use\n");
 				ret = -EBUSY;
 				break;
 			}
@@ -921,13 +926,13 @@ static struct imgmmu_dirmap *mmu_dir_map(struct imgmmu_dir *dir,
 				dir_update = true;
 			}
 
-			{
+			if (pte_rb_check) {
 				unsigned flags = 0;
 				(void)dir->config.page_read(
-				dir->page_map[dir_offs]->page, page_offs, &flags);
+						dir->page_map[dir_offs]->page, page_offs, priv, &flags);
 
 				if (flags & MMU_FLAG_VALID) {
-					mmu_log_err("page is currently in use (2)\n");
+					mmu_log_err("PTE is currently in use (2)\n");
 					kfree(map);
 					kfree(pages_to_update);
 					*res = -EFAULT;
@@ -947,6 +952,22 @@ static struct imgmmu_dirmap *mmu_dir_map(struct imgmmu_dir *dir,
 					(uint64_t)pte_cache_mode << MMU_PTE_AXCACHE_SHIFT,
 				map->flags | MMU_FLAG_VALID, priv);
 			dir->page_map[dir_offs]->valid_entries++;
+
+			if (pte_rb_check) {
+				unsigned flags = 0;
+
+				uint64_t phys = dir->config.page_read(
+						dir->page_map[dir_offs]->page, page_offs, priv, &flags);
+
+				if (flags != (map->flags | MMU_FLAG_VALID) ||
+						(phys != (curr_phy_addr + d * imgmmu_get_page_size())) ) {
+					mmu_log_err("PTE read back failed\n");
+					kfree(map);
+					kfree(pages_to_update);
+					*res = -EFAULT;
+					return NULL;
+				}
+			}
 
 			page_offs++;
 		} /* for duplicate */
@@ -1102,21 +1123,39 @@ error:
 struct sg_phys_iter {
 	struct scatterlist *sgl;
 	unsigned int offset;
+	bool use_sg_dma;
 };
 
 static int sg_phys_iter_next(void *arg, uint64_t *next)
 {
 	struct sg_phys_iter *iter = arg;
+	phys_addr_t phys;
+	unsigned int len;
 
-	if (!iter->sgl)
+	if (!iter->sgl) {
+		mmu_log_err("No sgl!\n");
 		return -EFAULT;
+	}
 
-	/* phys_addr to dma_addr? */
-	*next = sg_phys(iter->sgl) + iter->offset;
+	if (iter->use_sg_dma) {
+		if (sg_dma_address(iter->sgl) == ~(dma_addr_t)0 ||
+				!sg_dma_len(iter->sgl)) {
+			mmu_log_err("No sg dma!\n");
+			return -EFAULT;
+		}
+
+		phys = sg_dma_address(iter->sgl);
+		len = sg_dma_len(iter->sgl);
+	} else {
+		phys = sg_phys(iter->sgl);
+		len = iter->sgl->length;
+	}
+
+	*next = phys + iter->offset;
 	iter->offset += IMGMMU_GET_MAX_PAGE_SIZE();
 
-	if (iter->offset >= iter->sgl->length) {
-		int advance = iter->offset/iter->sgl->length;
+	if (iter->offset >= len) {
+		int advance = iter->offset/len;
 		while (iter->sgl) {
 			iter->sgl = sg_next(iter->sgl);
 			advance--;
@@ -1132,13 +1171,14 @@ static int sg_phys_iter_next(void *arg, uint64_t *next)
 struct imgmmu_map *imgmmu_cat_map_sg(
 	struct imgmmu_cat *cat,
 	struct scatterlist *phys_page_sg,
+	bool use_sg_dma,
 	const struct imgmmu_halloc *virt_mem,
 	unsigned int map_flag,
 	void *priv,
 	int *res)
 {
 	uint16_t idx;
-	struct sg_phys_iter arg = { phys_page_sg, 0 };
+	struct sg_phys_iter arg = { phys_page_sg, 0, use_sg_dma};
 	struct imgmmu_map *map = NULL;
 	struct imgmmu_dirmap *dir_map = NULL;
 	struct imgmmu_halloc virt_mem_range;
@@ -1308,7 +1348,6 @@ static int mmu_dir_unmap(struct imgmmu_dirmap *map)
 int imgmmu_cat_unmap(struct imgmmu_map *map)
 {
 	WARN_ON(map == NULL);
-	WARN_ON(list_empty(&map->dir_maps));
 
 	while (!list_empty(&map->dir_maps)) {
 		struct imgmmu_dirmap *dir_map;

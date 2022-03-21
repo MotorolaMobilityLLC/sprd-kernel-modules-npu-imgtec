@@ -26,3 +26,4 @@ modules_install:
 clean:
 	@#$(MAKE) -C $(BSP_KERNEL_PATH) M=$(KO_MODULE_OUT) src=$(CURDIR) $@
 	rm -rf $(KO_MODULE_OUT)
+

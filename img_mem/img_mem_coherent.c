@@ -101,7 +101,7 @@ static int coherent_heap_alloc(struct device *device, struct heap *heap,
 	phys_addr = buffer_data->dma_handle;
 	while (page < pages) {
 		if (trace_physical_pages)
-			pr_debug("%s phys %llx\n",
+			pr_info("%s phys %llx\n",
 				 __func__, (unsigned long long)phys_addr);
 		buffer_data->addrs[page++] = phys_addr;
 		phys_addr += PAGE_SIZE;

@@ -57,7 +57,7 @@
 
 static uint32_t pdump_sizes_kB[PDUMP_MAX];
 module_param_array(pdump_sizes_kB, int, NULL, 0444);
-MODULE_PARM_DESC(pdump_sizes_kB, "sizes of buffers reserved for pdump TXT,PRM,RES,DBG,CRC");
+MODULE_PARM_DESC(pdump_sizes_kB, "sizes of buffers reserved for pdump TXT,PRM,RES,DBG,CRC,CMB_CRC");
 
 static bool no_pdump_cache = true;
 module_param(no_pdump_cache, bool, 0444);
@@ -69,6 +69,10 @@ MODULE_PARM_DESC(pdump_chunk_size_kB, "maximum size of pdump chunk to be stored 
 
 static const char *pdump_filenames[PDUMP_MAX] = {
 	"pdump.txt", "pdump.prm", "pdump.res", "pdump.dbg", "pdump.crc", "pdump.crc_cmb",
+};
+
+static bool pdump_file_enabled[PDUMP_MAX] = {
+	true, true, true, true, true, true,
 };
 
 /* read one of the pdump buffers */
@@ -110,6 +114,11 @@ static const struct file_operations reset_fops = {
 	.open = simple_open,
 };
 
+static void config_pdump_files(struct vha_dev *vha) {
+	if (!vha->cnn_combined_crc_enable)
+		pdump_file_enabled[PDUMP_CRC_CMB] = false;
+}
+
 int vha_pdump_init(struct vha_dev *vha, struct pdump_descr* pdump)
 {
 	int i;
@@ -118,15 +127,20 @@ int vha_pdump_init(struct vha_dev *vha, struct pdump_descr* pdump)
 	if (pdump_sizes_kB[PDUMP_TXT] == 0)
 		return -EINVAL;
 
-	if (!vha->core_props.dummy_dev) {
+	if (!vha->hw_props.dummy_dev) {
 		dev_err(vha->dev, "%s: PDUMPing not supported with real hardware!\n",
 				__func__);
 		return -EPERM;
 	}
 
+	config_pdump_files(vha);
+
 	/* and map the buffers into debugfs */
 	for (i = 0; i < PDUMP_MAX; i++) {
 		struct pdump_buf *pbuf = NULL;
+
+		if (!pdump_file_enabled[i])
+			continue;
 
 		if (pdump_sizes_kB[i]) {
 			if (pdump_sizes_kB[i] == UINT_MAX) {
@@ -214,6 +228,8 @@ void vha_pdump_ldb_buf(struct vha_session *session, uint32_t pdump_num,
 {
 	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(session->vha->dev);
 	struct vha_dev* vha = session->vha;
+	if (!pdump)
+		return;
 
 	if (pdump_num >= PDUMP_MAX ||
 		 pdump->pbufs[PDUMP_TXT].ptr == NULL)
@@ -276,6 +292,8 @@ void vha_pdump_sab_buf(struct vha_session *session, uint32_t pdump_num,
 	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(session->vha->dev);
 	struct vha_dev* vha = session->vha;
 	struct pdump_buf* pbuf;
+	if (!pdump)
+		return;
 
 	if (pdump_num >= PDUMP_MAX ||
 		 pdump->pbufs[PDUMP_TXT].ptr == NULL)

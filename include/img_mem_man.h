@@ -77,7 +77,7 @@ enum {
 #define IMG_MMU_ENTRY_FLAGS_MASK 0xf
 
 /* Each entry can store 40bit physical address */
-#define IMG_MMU_PHY_ADDR_MASK ((1UL<<40)-1)
+#define IMG_MMU_PHY_ADDR_MASK ((1ULL<<40)-1)
 
 struct mmu_config {
 	uint32_t addr_width; /* physical */
@@ -102,6 +102,8 @@ union heap_options {
 #endif
 #ifdef CONFIG_GENERIC_ALLOCATOR
 	struct {
+		void *kptr; /* static pointer to kernel mapping of memory */
+		/* Optional hooks to obtain kernel mapping dynamically */
 		void* (*get_kptr)(
 				phys_addr_t addr,
 				size_t size,
@@ -115,6 +117,9 @@ union heap_options {
 		int pool_order;  /* allocation order */
 	} carveout;
 #endif
+	struct {
+		bool use_sg_dma;  /* Forces sg_dma physical address instead of CPU physical address*/
+	} dmabuf;
 	struct {
 		gfp_t gfp_flags; /* for buffer allocations */
 	} coherent;
@@ -148,6 +153,8 @@ enum img_mmu_callback_type {
 struct mem_ctx;
 struct mmu_ctx;
 
+int img_mem_init(void);
+void img_mem_exit(void);
 int img_mem_add_heap(const struct heap_config *heap_cfg, int *heap_id);
 void img_mem_del_heap(int heap_id);
 int img_mem_get_heap_info(int heap_id, uint8_t *type, uint32_t *attrs);
@@ -162,8 +169,8 @@ void img_mem_destroy_proc_ctx(struct mem_ctx *ctx);
 int img_mem_alloc(struct device *device, struct mem_ctx *ctx, int heap_id,
 			size_t size, enum img_mem_attr attributes, int *buf_id);
 int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
-			 size_t size, enum img_mem_attr attributes, uint64_t buf_hnd,
-			 int *buf_id);
+			 size_t size, enum img_mem_attr attributes, uint64_t buf_fd,
+			 uint64_t cpu_ptr, int *buf_id);
 int img_mem_export(struct device *device, struct mem_ctx *ctx, int buf_id,
 			 size_t size, enum img_mem_attr attributes, uint64_t *buf_hnd);
 void img_mem_free(struct mem_ctx *ctx, int buf_id);
@@ -183,8 +190,8 @@ phys_addr_t img_mem_get_dev_addr(struct mem_ctx *mem_ctx, int buf_id,
 int img_mem_sync_cpu_to_device(struct mem_ctx *ctx, int buf_id);
 int img_mem_sync_device_to_cpu(struct mem_ctx *ctx, int buf_id);
 
-size_t img_mem_get_usage_max(const struct mem_ctx *ctx);
-size_t img_mem_get_usage_current(const struct mem_ctx *ctx);
+int img_mem_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr);
+int img_mmu_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr);
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 struct dma_fence * img_mem_add_fence(struct mem_ctx *ctx, int buf_id);
@@ -215,6 +222,7 @@ phys_addr_t img_mmu_get_paddr(const struct mmu_ctx *ctx,
 
 int img_mmu_init_cache(struct mmu_ctx *mmu_ctx,	unsigned long cache_phys_start,
 		uint32_t cache_size);
+int img_mmu_clear_cache(struct mmu_ctx *mmu_ctx);
 int img_mmu_move_pg_to_cache(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx,
 		int buf_id, uint64_t virt_addr, uint32_t page_size, uint32_t page_idx);
 /*

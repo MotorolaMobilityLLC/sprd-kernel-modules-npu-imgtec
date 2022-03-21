@@ -65,60 +65,23 @@ struct buffer_data {
 };
 
 static int anonymous_heap_import(struct device *device, struct heap *heap,
-						size_t size, enum img_mem_attr attr, uint64_t buf_hnd,
-						struct buffer *buffer)
+						size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+						struct page **pages, struct buffer *buffer)
 {
 	struct buffer_data *data;
-	unsigned long cpu_addr = (unsigned long)buf_hnd;
 	struct sg_table *sgt;
-	struct page **pages;
 	struct scatterlist *sgl;
 	int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
 	int ret;
 	int i;
 
-	pr_debug("%s:%d buffer %d (0x%p) cpu_addr %#lx for PID:%d\n",
+	pr_debug("%s:%d buffer %d (0x%p) for PID:%d\n",
 			__func__, __LINE__, buffer->id, buffer,
-			cpu_addr, task_pid_nr(current));
-
-	/* Check alignment */
-	if (cpu_addr & (PAGE_SIZE-1)) {
-		pr_err("%s wrong alignment of %#lx address!\n",
-				__func__, cpu_addr);
-		return -EFAULT;
-	}
-
-	pages = kmalloc_array(num_pages, sizeof(struct page *),
-			GFP_KERNEL | __GFP_ZERO);
-	if (!pages) {
-		pr_err("%s failed to allocate memory for pages\n", __func__);
-		return -ENOMEM;
-	}
-
-	down_read(&current->mm->mmap_sem);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
-	ret = get_user_pages(
-			cpu_addr, num_pages,
-			FOLL_WRITE,
-			pages, NULL);
-#else
-	pr_err("%s get_user_pages not supported for this kernel version\n",
-				__func__);
-	ret = -1;
-#endif
-	up_read(&current->mm->mmap_sem);
-	if (ret != num_pages) {
-		pr_err("%s failed to get_user_pages count:%d for %#lx address\n",
-				__func__, num_pages, cpu_addr);
-		ret = -EFAULT;
-		goto get_user_pages_failed;
-	}
+			task_pid_nr(current));
 
 	sgt = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
-	if (!sgt) {
-		ret = -ENOMEM;
-		goto alloc_sgt_failed;
-	}
+	if (!sgt) 
+		return -ENOMEM;
 
 	ret = sg_alloc_table(sgt, num_pages, GFP_KERNEL);
 	if (ret) {
@@ -142,12 +105,12 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 			pr_err("%s physical address is out of dma_mask,"
 					" and probably won't be accessible by the core!\n",
 					__func__);
-			ret = -EFAULT;
+			ret = -ERANGE;
 			goto dma_mask_check_failed;
 		}
 
 		if (trace_physical_pages)
-			pr_debug("%s:%d phys %#llx length %d\n",
+			pr_info("%s:%d phys %#llx length %d\n",
 				 __func__, __LINE__,
 				 (unsigned long long)sg_phys(sgl), sgl->length);
 	}
@@ -166,7 +129,11 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 		goto dma_mask_check_failed;
 	}
 
-	kfree(pages);
+	/* Increase ref count for each page used */
+	for (i = 0; i < num_pages; i++)
+		if (pages[i])
+			get_page(pages[i]);
+
 	return 0;
 
 dma_mask_check_failed:
@@ -175,12 +142,7 @@ alloc_priv_failed:
 	sg_free_table(sgt);
 alloc_sgt_pages_failed:
 	kfree(sgt);
-get_user_pages_failed:
-	for (i = 0; i < num_pages; i++)
-		if (pages[i])
-			put_page(pages[i]);
-alloc_sgt_failed:
-	kfree(pages);
+
 	return ret;
 }
 
@@ -246,7 +208,11 @@ static int anonymous_heap_map_km(struct heap *heap, struct buffer *buffer)
 	}
 
 	prot = PAGE_KERNEL;
-	prot = pgprot_noncached(prot);
+	/* CACHED by default */
+	if (buffer_data->mattr & IMG_MEM_ATTR_WRITECOMBINE)
+		prot = pgprot_writecombine(prot);
+	else if (buffer_data->mattr & IMG_MEM_ATTR_UNCACHED)
+		prot = pgprot_noncached(prot);
 
 	i = 0;
 	while (sgl) {
@@ -300,11 +266,12 @@ static int anonymous_heap_unmap_km(struct heap *heap, struct buffer *buffer)
 }
 
 static int anonymous_get_sg_table(struct heap *heap, struct buffer *buffer,
-						 struct sg_table **sg_table)
+						 struct sg_table **sg_table, bool *use_sg_dma)
 {
 	struct buffer_data *data = buffer->priv;
 
 	*sg_table = data->sgt;
+	*use_sg_dma = false;
 	return 0;
 }
 

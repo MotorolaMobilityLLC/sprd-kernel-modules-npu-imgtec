@@ -168,11 +168,12 @@ typedef void (*imgmmu_page_write) (struct imgmmu_page *page,
  *
  * @param page physical page - asserts it is not NULL
  * @param offset in entries (32b word)
+ * @param priv private data passed with map call
 
  * @return physical address at given offset and flags
  */
 typedef uint64_t(*imgmmu_page_read) (struct imgmmu_page *page,
-					 unsigned int offset,
+					 unsigned int offset, void *priv,
 					 unsigned int *flags);
 
 /**
@@ -380,6 +381,7 @@ struct imgmmu_map *imgmmu_cat_map_arr(
 struct imgmmu_map *imgmmu_cat_map_sg(
 	struct imgmmu_cat *cat,
 	struct scatterlist *phys_page_sg,
+	bool use_sg_dma,
 	const struct imgmmu_halloc *virt_mem,
 	unsigned int map_flags,
 	void *priv,

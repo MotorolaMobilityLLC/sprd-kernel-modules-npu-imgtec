@@ -59,7 +59,7 @@
 
 #include <img_mem_man.h>
 #include "vha_common.h"
-#include "version.h"
+#include "uapi/version.h"
 #include "vha_plat.h"
 #include "vha_plat_dt.h"
 #include "vha_chipdep.h"
@@ -226,8 +226,13 @@ static int vha_plat_probe(struct platform_device *ofdev)
 	}
 
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 6, 0)
 	reg_addr = devm_ioremap_nocache(&ofdev->dev, res.start +
 			_REG_START, core_size);
+#else
+	reg_addr = devm_ioremap(&ofdev->dev, res.start +
+			_REG_START, core_size);
+#endif
 	if (!reg_addr) {
 		dev_err(&ofdev->dev, "failed to map core registers\n");
 		return -ENXIO;
@@ -333,7 +338,10 @@ static struct dev_pm_ops vha_pm_plat_ops = {
 
 static ssize_t info_show(struct device_driver *drv, char *buf)
 {
-	return sprintf(buf, "VHA DT driver version : " VERSION_STRING "\n");
+	return snprintf(buf, PAGE_SIZE,
+			"VHA DT driver version: NNA_API_%u.%u.%u_DDK_%u.%u@%s\n",
+			DDK_API_MAJOR_NUMBER, DDK_API_MINOR_NUMBER, DDK_API_PATCH_NUMBER,
+			DDK_MAJOR_NUMBER, DDK_MINOR_NUMBER, VERSION_STRING);
 }
 
 static DRIVER_ATTR_RO(info);

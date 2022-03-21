@@ -42,6 +42,7 @@
 #include <linux/device.h>
 #include <linux/moduleparam.h>
 
+#include <linux/delay.h>
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
@@ -61,6 +62,10 @@ MODULE_PARM_DESC(hl_wdt_cycles, "High level watchdog cycles");
 static uint32_t hl_wdt_mode = 1;
 module_param(hl_wdt_mode, uint, 0444);
 MODULE_PARM_DESC(hl_wdt_mode, "High level watchdog mode: 1-pass; 2-layer group. See TRM");
+
+static uint32_t vha_ready_count = 1000000;
+module_param(vha_ready_count, uint, 0444);
+MODULE_PARM_DESC(vha_ready_count, "Poll count for the ready bit of the core status register.");
 
 void vha_dev_mh_setup(struct vha_dev *vha, int ctx_id, struct vha_mh_config_regs *regs)
 {
@@ -104,9 +109,9 @@ int vha_dev_prepare(struct vha_dev *vha)
 {
 	/* Enable core events */
 	img_pdump_printf("-- Enable CORE events\n");
-	IOWRITE64_PDUMP(VHA_CORE_EVNTS, VHA_CR_OS(VHA_EVENT_ENABLE));
+	IOWRITE64_PDUMP(VHA_CORE_EVNTS | VHA_EVENT_TYPE(READY), VHA_CR_OS(VHA_EVENT_ENABLE));
 	img_pdump_printf("-- Clear CORE events\n");
-	IOWRITE64_PDUMP(VHA_CORE_EVNTS, VHA_CR_OS(VHA_EVENT_CLEAR));
+	IOWRITE64_PDUMP(VHA_CORE_EVNTS | VHA_EVENT_TYPE(READY), VHA_CR_OS(VHA_EVENT_CLEAR));
 
 	return 0;
 }
@@ -150,7 +155,7 @@ void vha_dev_wait(struct vha_dev *vha)
 	uint32_t status_mask = VHA_CR_OS(VHA_EVENT_STATUS_PARITY_CLRMSK);
 
 #ifdef VHA_SCF
-		if (vha->core_props.supported.parity &&
+		if (vha->hw_props.supported.parity &&
 				!vha->parity_disable) {
 			/* If READY bit is set then parity bit must be set as well ! */
 			ready_val |= VHA_CR_OS(VHA_EVENT_STATUS_PARITY_EN);
@@ -184,6 +189,31 @@ void vha_dev_wait(struct vha_dev *vha)
 			 VHA_CR_OS(VHA_EVENT_CLEAR_VHA_READY_EN) |
 			 VHA_CR_OS(VHA_EVENT_CLEAR_VHA_ERROR_EN) |
 			 VHA_CR_OS(VHA_EVENT_CLEAR_VHA_HL_WDT_EN));
+
+#ifndef CONFIG_VHA_DUMMY
+	/* Poll only the READY bit, ignore all the others */
+	IOPOLL64(VHA_CR_OS(VHA_EVENT_STATUS_VHA_READY_EN),
+						1000000, 100,
+						VHA_CR_OS(VHA_EVENT_STATUS_VHA_READY_EN),
+						VHA_CR_OS(VHA_EVENT_STATUS));
+
+#ifdef VHA_SCF
+	{
+		uint64_t event_status = IOREAD64(vha->reg_base, VHA_CR_OS(VHA_EVENT_STATUS));
+
+		if (vha->hw_props.supported.parity &&
+				!vha->parity_disable) {
+			bool par_bit = img_mem_calc_parity(event_status &
+					~VHA_CR_BITMASK(VHA_EVENT_STATUS_TYPE, PARITY));
+			if (par_bit !=
+					VHA_CR_GETBITS(VHA_EVENT_STATUS_TYPE, PARITY,
+							event_status)) {
+				dev_err(vha->dev, "Event status register parity error!\n");
+			}
+		}
+	}
+#endif /* VHA_SCF */
+#endif /* CONFIG_VHA_DUMMY */
 }
 
 uint32_t vha_dev_kick_prepare(struct vha_dev *vha,

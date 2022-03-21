@@ -67,7 +67,7 @@ struct mem_man {
 	struct idr mem_ctxs;
 	struct mutex mutex;
 
-	bool cache_initialized;
+	unsigned cache_usage;
 };
 /* define like this, so it is easier to convert to a function argument later */
 static struct mem_man mem_man_data;
@@ -450,7 +450,7 @@ static int _img_mem_alloc(struct device *device, struct mem_ctx *ctx,
 	}
 
 	if (heap->type != IMG_MEM_HEAP_TYPE_OCM) {
-		__img_pdump_printf(device, "-- Allocating zeroed buffer id:%d  size:%zu\n",
+		__img_pdump_printf(device, "-- Allocating zeroed buffer id:%d size:%zu\n",
 				buffer->id, buffer->actual_size);
 		__img_pdump_printf(device, "CALLOC "_PMEM_":BLOCK_%d %#zx %#zx 0x0\n",
 				buffer->id, buffer->actual_size, align);
@@ -511,8 +511,8 @@ EXPORT_SYMBOL(img_mem_alloc);
 
 static int _img_mem_import(struct device *device,
 				struct mem_ctx *ctx, struct heap *heap,
-				size_t size, enum img_mem_attr attr, uint64_t buf_hnd,
-				struct buffer **buffer_new)
+				size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+				struct page **pages, struct buffer **buffer_new)
 {
 	struct mem_man *mem_man = &mem_man_data;
 	struct buffer *buffer;
@@ -569,7 +569,7 @@ static int _img_mem_import(struct device *device,
 		pr_err("%s: original buffer size is not MMU page size aligned!\n",
 				__func__);
 		ret = -EINVAL;
-		goto idr_alloc_failed;
+		goto heap_import_failed;
 	}
 
 	/* Check if heap has been registered using an alternative cache attributes */
@@ -583,11 +583,16 @@ static int _img_mem_import(struct device *device,
 	}
 
 	ret = heap->ops->import(device, heap, buffer->actual_size, attr,
-				buf_hnd, buffer);
+				buf_fd, pages, buffer);
 	if (ret) {
 		pr_err("%s: heap %d import failed\n", __func__, heap->id);
 		goto heap_import_failed;
 	}
+
+	__img_pdump_printf(device, "-- Allocating zeroed buffer id:%d size:%zu for imported data\n",
+			buffer->id, buffer->actual_size);
+	__img_pdump_printf(device, "CALLOC "_PMEM_":BLOCK_%d %#zx %#zx 0x0\n",
+			buffer->id, buffer->actual_size, align);
 
 	ctx->mem_usage_curr += buffer->actual_size;
 	if (ctx->mem_usage_curr > ctx->mem_usage_max)
@@ -603,41 +608,132 @@ idr_alloc_failed:
 	return ret;
 }
 
+static void _img_mem_put_pages(size_t size, struct page **pages)
+{
+	int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+	int i;
+
+	for (i = 0; i < num_pages; i++)
+		if (pages[i])
+			put_page(pages[i]);		
+	kfree(pages);
+}
+
+static int _img_mem_get_user_pages(size_t size, uint64_t cpu_ptr,
+				struct page **pages[])
+{
+	struct page **tmp_pages = NULL;
+	int num_pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+	int ret;
+
+	/* Check alignment */
+	if (cpu_ptr & (PAGE_SIZE-1)) {
+		pr_err("%s wrong alignment of %#llx address!\n",
+				__func__, cpu_ptr);
+		return -EFAULT;
+	}
+
+	tmp_pages = kmalloc_array(num_pages, sizeof(struct page *),
+			GFP_KERNEL | __GFP_ZERO);
+	if (!tmp_pages) {
+		pr_err("%s failed to allocate memory for pages\n", __func__);
+		return -ENOMEM;
+	}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+	down_read(&current->mm->mmap_sem);
+#else
+	mmap_read_lock(current->mm);
+#endif
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
+	ret = get_user_pages(
+			cpu_ptr, num_pages,
+			FOLL_WRITE,
+			tmp_pages, NULL);
+#else
+	pr_err("%s get_user_pages not supported for this kernel version\n",
+					__func__);
+	ret = -1;
+#endif
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
+	up_read(&current->mm->mmap_sem);
+#else
+	mmap_read_unlock(current->mm);
+#endif
+	if (ret != num_pages) {
+		pr_err("%s failed to get_user_pages count:%d for %#llx address\n",
+				__func__, num_pages, cpu_ptr);
+		ret = -ENOMEM;
+		goto out_get_user_pages;
+	}
+
+	*pages = tmp_pages;
+
+	return 0;
+
+out_get_user_pages:
+	_img_mem_put_pages(size, tmp_pages);
+
+	return ret;	
+}
+
 int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
-			size_t size, enum img_mem_attr attr, uint64_t buf_hnd,
-			int *buf_id)
+			size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+			uint64_t cpu_ptr, int *buf_id)
 {
 	struct mem_man *mem_man = &mem_man_data;
 	struct heap *heap;
 	struct buffer *buffer;
+	struct page **pages = NULL;
 	int ret;
 
-	pr_debug("%s heap %d ctx %p hnd %#llx\n", __func__, heap_id, ctx, buf_hnd);
+	pr_debug("%s heap %d ctx %p hnd %#llx\n", __func__, heap_id, ctx, buf_fd);
+
+	if (cpu_ptr) {
+		ret = _img_mem_get_user_pages(size, cpu_ptr, &pages);
+		if (ret) {
+			pr_err("%s:%d getting user pages failed\n", __func__, __LINE__);
+			return ret;
+		}
+	}
 
 	ret = mutex_lock_interruptible(&mem_man->mutex);
-	if (ret)
-		return ret;
+	if (ret) {
+		pr_err("%s:%d lock interrupted: mem_man->mutex\n", __func__, __LINE__);
+		goto lock_interrupted;
+	}
 
 	heap = idr_find(&mem_man->heaps, heap_id);
 	if (!heap) {
 		pr_err("%s: heap id %d not found\n", __func__, heap_id);
-		mutex_unlock(&mem_man->mutex);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto idr_find_failed;
 	}
 
-	ret = _img_mem_import(device, ctx, heap, size, attr, buf_hnd, &buffer);
-	if (ret) {
-		mutex_unlock(&mem_man->mutex);
-		return ret;
-	}
+	ret = _img_mem_import(device, ctx, heap, size, attr, buf_fd, pages, &buffer);
+	if (ret)
+		goto mem_import_failed;
 
 	*buf_id = buffer->id;
 	mutex_unlock(&mem_man->mutex);
 
-	pr_info("%s buf_hnd %#llx heap %d (%s) buffer %d size %zu\n", __func__,
-		buf_hnd, heap_id, get_heap_name(heap->type), *buf_id, size);
+	if (cpu_ptr)
+		_img_mem_put_pages(size, pages);
+
+	pr_info("%s buf_fd %#llx heap %d (%s) buffer %d size %zu\n", __func__,
+		buf_fd, heap_id, get_heap_name(heap->type), *buf_id, size);
 	pr_debug("%s heap %d ctx %p created buffer %d (%p) size %zu\n",
 		__func__, heap_id, ctx, *buf_id, buffer, size);
+
+	return 0;
+
+mem_import_failed:
+idr_find_failed:
+	mutex_unlock(&mem_man->mutex);
+lock_interrupted:
+	if (cpu_ptr)
+		_img_mem_put_pages(size, pages);
+
 	return ret;
 }
 EXPORT_SYMBOL(img_mem_import);
@@ -943,7 +1039,6 @@ int img_mem_map_um(struct mem_ctx *ctx, int buf_id, struct vm_area_struct *vma)
 		_img_mem_sync_device_to_cpu(buffer, false);
 
 	mutex_unlock(&mem_man->mutex);
-
 	return ret;
 }
 EXPORT_SYMBOL(img_mem_map_um);
@@ -1125,8 +1220,9 @@ uint64_t img_mem_get_single_page(struct mem_ctx *mem_ctx, int buf_id,
 		struct sg_table *sgt;
 		struct scatterlist *sgl;
 		int offs = offset;
+		bool use_sg_dma = false;
 
-		ret = heap->ops->get_sg_table(heap, buffer, &sgt);
+		ret = heap->ops->get_sg_table(heap, buffer, &sgt, &use_sg_dma);
 		if (ret) {
 			pr_err("%s: heap %d buffer %d no sg_table!\n",
 						__func__, heap->id, buffer->id);
@@ -1134,17 +1230,25 @@ uint64_t img_mem_get_single_page(struct mem_ctx *mem_ctx, int buf_id,
 		}
 		sgl = sgt->sgl;
 		while (sgl) {
-			offs -= sgl->length;
+			if (use_sg_dma)
+				offs -= sg_dma_len(sgl);
+			else
+				offs -= sgl->length;
+
 			if (offs <= 0)
 				break;
 			sgl = sg_next(sgl);
 		}
 		if (!sgl) {
 			pr_err("%s: heap %d buffer %d wrong offset %d!\n",
-						__func__, heap->id, buffer->id, offset);
+					__func__, heap->id, buffer->id, offset);
 			return -1;
 		}
-		addr = sg_phys(sgl);
+
+		if (use_sg_dma)
+			addr = sg_dma_address(sgl);
+		else
+			addr = sg_phys(sgl);
 
 	} else if (heap->ops && heap->ops->get_page_array) {
 		uint64_t *addrs;
@@ -1223,19 +1327,41 @@ int img_mmu_init_cache(struct mmu_ctx *mmu_ctx,	unsigned long cache_phys_start,
 	mmu_ctx->cache_phys_start = cache_phys_start;
 	mmu_ctx->cache_size = cache_size;
 
-
-	if (img_pdump_enabled(pdump) && cache_size && !mem_man->cache_initialized) {
+	if (img_pdump_enabled(pdump) && cache_size && !mem_man->cache_usage) {
 		__img_pdump_printf(mmu_ctx->device, "-- Allocating img mem cache buffer size:%u\n", cache_size);
-		__img_pdump_printf(mmu_ctx->device, "CALLOC :OCM:BLOCK_CACHE %#lx %#zx 0x0\n",
-			cache_size + sizeof(uint32_t), IMGMMU_GET_MAX_PAGE_SIZE());
+		__img_pdump_printf(mmu_ctx->device, "CALLOC :OCM:BLOCK_CACHE %#x %#zx 0x0\n",
+			cache_size, IMGMMU_GET_MAX_PAGE_SIZE());
 	}
-	mem_man->cache_initialized = true;
+
+	mem_man->cache_usage++;
 
 	mutex_unlock(&mem_man->mutex);
 
 	return 0;
 }
 EXPORT_SYMBOL(img_mmu_init_cache);
+
+int img_mmu_clear_cache(struct mmu_ctx *mmu_ctx)
+{
+	struct mem_man *mem_man = &mem_man_data;
+	struct pdump_descr* pdump = vha_pdump_dev_get_drvdata(mmu_ctx->device);
+
+	mutex_lock(&mem_man->mutex);
+
+	if (mem_man->cache_usage)
+		mem_man->cache_usage--;
+
+	if (img_pdump_enabled(pdump) && mmu_ctx->cache_size && !mem_man->cache_usage) {
+		__img_pdump_printf(mmu_ctx->device, "-- Freeing img mem cache buffer size:%u\n",
+				mmu_ctx->cache_size);
+		__img_pdump_printf(mmu_ctx->device, "FREE :OCM:BLOCK_CACHE\n");
+	}
+
+	mutex_unlock(&mem_man->mutex);
+
+	return 0;
+}
+EXPORT_SYMBOL(img_mmu_clear_cache);
 
 int img_mmu_move_pg_to_cache(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx,
 		int buf_id, uint64_t virt_addr, uint32_t page_size, uint32_t page_idx)
@@ -1384,31 +1510,35 @@ int img_mem_sync_device_to_cpu(struct mem_ctx *ctx, int buf_id)
 }
 EXPORT_SYMBOL(img_mem_sync_device_to_cpu);
 
-size_t img_mem_get_usage_max(const struct mem_ctx *ctx)
+int img_mem_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr)
 {
 	struct mem_man *mem_man = &mem_man_data;
-	size_t mem_usage_max;
 
 	mutex_lock(&mem_man->mutex);
-	mem_usage_max = ctx->mem_usage_max;
+	if (max)
+		*max = ctx->mem_usage_max;
+	if (curr)
+		*curr = ctx->mem_usage_curr;
 	mutex_unlock(&mem_man->mutex);
 
-	return mem_usage_max;
+	return 0;
 }
-EXPORT_SYMBOL(img_mem_get_usage_max);
+EXPORT_SYMBOL(img_mem_get_usage);
 
-size_t img_mem_get_usage_current(const struct mem_ctx *ctx)
+int img_mmu_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr)
 {
 	struct mem_man *mem_man = &mem_man_data;
-	size_t mem_usage_curr;
 
 	mutex_lock(&mem_man->mutex);
-	mem_usage_curr = ctx->mem_usage_curr;
+	if (max)
+		*max = ctx->mmu_usage_max;
+	if (curr)
+		*curr = ctx->mmu_usage_curr;
 	mutex_unlock(&mem_man->mutex);
 
-	return mem_usage_curr;
+	return 0;
 }
-EXPORT_SYMBOL(img_mem_get_usage_current);
+EXPORT_SYMBOL(img_mmu_get_usage);
 
 static int  img_mmu_cache_get_offset(struct mem_ctx *mem_ctx,
 	unsigned long addr, unsigned int *offset)
@@ -1444,8 +1574,9 @@ static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
 		if (heap->ops && heap->ops->get_sg_table) {
 			struct sg_table *sgt;
 			struct scatterlist *sgl;
+			bool use_sg_dma = false;
 
-			ret = heap->ops->get_sg_table(heap, buffer, &sgt);
+			ret = heap->ops->get_sg_table(heap, buffer, &sgt, &use_sg_dma);
 			if (ret) {
 				pr_err("%s: heap %d buffer %d no sg_table!\n",
 							__func__, heap->id, buffer->id);
@@ -1461,23 +1592,24 @@ static int imgmmu_find_buffer(struct mem_ctx *ctx, uint64_t addr,
 			}
 
 			while (sgl) {
+				phys_addr_t phys = use_sg_dma ?
+						sg_dma_address(sgl) : sg_phys(sgl);
+				unsigned int len = use_sg_dma ?
+						sg_dma_len(sgl) : sgl->length;
 #if 0
-				pr_err("%s: sgl_phys %llx len:%d addr:%llx\n",
-						__func__,
-						sg_phys(sgl),
-						sgl->length,
-						addr);
+					pr_err("%s: phys %llx len:%d addr:%llx\n",
+							__func__, phys,  len, addr);
 #endif
-				if (sg_phys(sgl) == addr) {
+				if (phys == addr) {
 #if 0
-					pr_err("%s: match @addr:%llx buf:%d offs:%d sgl_len:%d\n",
-						__func__, addr, buffer->id, buff_offset, sgl->length);
+					pr_err("%s: match @addr:%llx buf:%d offs:%d len:%d\n",
+						__func__, addr, buffer->id, buf_offset, len);
 #endif
 					*buffer_id = buffer->id;
 					*buffer_offset = buf_offset;
 					return 0;
 				}
-				buffer->pcache.last_offset = buf_offset += sgl->length;
+				buffer->pcache.last_offset = buf_offset += len;
 				buffer->pcache.last_sgl = sgl = sg_next(sgl);
 			}
 		} else if (heap->ops && heap->ops->get_page_array) {
@@ -1557,21 +1689,27 @@ static struct imgmmu_page *_page_alloc(void *arg, unsigned char type)
 	page->type = type;
 	page->buffer = buffer;
 	page->page.cpu_addr = (uintptr_t)buffer->kptr;
+	memset((void *)page->page.cpu_addr, 0, imgmmu_get_cpu_page_size());
 	if (type == IMGMMU_PTYPE_PT)
 		page->use_parity = mmu_ctx->config.use_pte_parity;
 
 	heap = buffer->heap;
 	if (heap->ops && heap->ops->get_sg_table) {
 		struct sg_table *sgt;
+		bool use_sg_dma = false;
 
-		ret = heap->ops->get_sg_table(heap, buffer, &sgt);
+		ret = heap->ops->get_sg_table(heap, buffer, &sgt, &use_sg_dma);
 		if (ret) {
 			pr_err("%s: heap %d buffer %d no sg_table!\n",
 						__func__, heap->id, buffer->id);
 			ret = -EINVAL;
 			goto free_buffer;
 		}
-		page->page.phys_addr = sg_phys(sgt->sgl);
+
+		if (use_sg_dma)
+			page->page.phys_addr = sg_dma_address(sgt->sgl);
+		else
+			page->page.phys_addr = sg_phys(sgt->sgl);
 	} else if (heap->ops && heap->ops->get_page_array) {
 		uint64_t *addrs;
 
@@ -1589,6 +1727,10 @@ static struct imgmmu_page *_page_alloc(void *arg, unsigned char type)
 		ret = -EINVAL;
 		goto free_buffer;
 	}
+
+	mmu_ctx->mem_ctx->mmu_usage_curr += buffer->actual_size;
+	if (mmu_ctx->mem_ctx->mmu_usage_curr > mmu_ctx->mem_ctx->mmu_usage_max)
+		mmu_ctx->mem_ctx->mmu_usage_max = mmu_ctx->mem_ctx->mmu_usage_curr;
 
 	pr_debug("%s:%d virt addr %#lx type:%d\n", __func__, __LINE__,
 		page->page.cpu_addr, type);
@@ -1614,6 +1756,11 @@ static void _page_free(struct imgmmu_page *arg)
 
 	pr_debug("%s:%d buffer %u\n", __func__, __LINE__, page->buffer->id);
 
+	if (page->buffer->mem_ctx->mmu_usage_curr >= page->buffer->actual_size)
+		page->buffer->mem_ctx->mmu_usage_curr -= page->buffer->actual_size;
+	else
+		WARN_ON(1);
+
 	_img_mem_free(page->buffer);
 	kfree(page);
 }
@@ -1626,8 +1773,9 @@ static inline void __pdump_apply_parity(struct device* dev, uint64_t virt,
 	__img_pdump_printf(dev,
 			"WRW "_PMEM_":$1 %#llx -- Calculate parity bit\n"
 			"WRW "_PMEM_":$2 %s:%#x\n"
+			"SHR "_PMEM_":$2 "_PMEM_":$2 %d\n"
 			"XOR "_PMEM_":$1 "_PMEM_":$1 "_PMEM_":$2\n",
-			virt, block, offset);
+			virt >> MIN_PAGE_SIZE_BITS, block, offset, MIN_PAGE_SIZE_BITS);
 	for (bits = 16; bits >= 1; bits>>=1)
 		/* XOR 'bits' pair of previous result */
 		__img_pdump_printf(dev,
@@ -1646,8 +1794,8 @@ static void _page_write(struct imgmmu_page *page,
 						unsigned int offset, uint64_t entry,
 						unsigned int flags, void *priv)
 {
-	uint32_t *mem32 = (uint32_t *)page->cpu_addr;
-	uint64_t *mem64 = (uint64_t *)mem32;
+	uint64_t *mem64 = (uint64_t *)page->cpu_addr;
+	uint32_t *mem32 = (uint32_t *)mem64;
 	struct mmu_page *mmu_page;
 	struct heap *heap = NULL;
 	struct buffer *buf = (struct buffer*)priv;
@@ -1682,6 +1830,10 @@ static void _page_write(struct imgmmu_page *page,
 			!mmu_page->bypass_addr_trans)
 		paddr = heap->to_dev_addr(&heap->options, paddr);
 
+	WARN(paddr & ~dma_get_mask(mmu_page->buffer->device),
+			"%s: Physical address is out of dma mask, "\
+			"Set proper dma mask to avoid cache problems, ", __func__);
+
 	WARN(paddr & ~IMG_MMU_PHY_ADDR_MASK,
 		"%s: Physical address exceeds hardware capabilities, "\
 		"MMU mapping will be likely invalid", __func__);
@@ -1689,11 +1841,11 @@ static void _page_write(struct imgmmu_page *page,
 
 	if (trace_physical_pages && flags) {
 		if (mmu_page->type == IMGMMU_PTYPE_PC)
-			pr_info("%s: off %#03x paddr %#016llx flags %#x type:PC\n",
-					__func__, offset, paddr, flags);
+			pr_info("%s: sid:%d off %#03x paddr %#016llx flags %#x type:PC\n",
+					__func__, buf ? buf->mem_ctx->id : -1, offset, paddr, flags);
 		else
-			pr_info("%s: off %#03x paddr %#016llx flags %#x type:%s virt:%llx\n",
-					__func__, offset, paddr, flags,
+			pr_info("%s: sid:%d off %#03x paddr %#016llx flags %#x type:%s virt:%llx\n",
+					__func__, buf ? buf->mem_ctx->id : -1, offset, paddr, flags,
 					mmu_page->type == IMGMMU_PTYPE_PD ? "PD" :
 					mmu_page->type == IMGMMU_PTYPE_PT ? "PT" :
 					"???", virt);
@@ -1727,6 +1879,7 @@ static void _page_write(struct imgmmu_page *page,
 						par_bit ? "odd parity" : "even parity");
 		}
 	}
+
 	pdump = vha_pdump_dev_get_drvdata(mmu_page->buffer->device);
 	if (img_pdump_enabled(pdump) && flags) {
 		/* skip when flags are zero, assuming address is invalid */
@@ -1816,21 +1969,31 @@ static void _page_write(struct imgmmu_page *page,
 }
 
 static uint64_t _page_read(struct imgmmu_page *page,
-					unsigned int offset,
+					unsigned int offset, void *priv,
 					unsigned int *flags)
 {
-	uint32_t *mem32 = (uint32_t *)page->cpu_addr;
-	uint64_t *mem64 = (uint64_t *)mem32;
+	uint64_t *mem64 = (uint64_t *)page->cpu_addr;
+	uint32_t *mem32 = (uint32_t *)mem64;
 	struct mmu_page *mmu_page;
-	struct heap *heap;
+	struct heap *heap = NULL;
 	uint32_t entry_shift = 0;
 	uint64_t entry = 0;
 	uint64_t paddr;
 	uint64_t virt = page->virt_base;
+	struct buffer *buf = (struct buffer*)priv;
 
 	mmu_page = container_of(page, struct mmu_page, page);
 	virt += ((1<<imgmmu_get_entry_shift(mmu_page->type))) * offset;
-	heap = mmu_page->buffer->heap;
+
+	if (mmu_page->type == IMGMMU_PTYPE_PC ||
+		mmu_page->type == IMGMMU_PTYPE_PD)
+		heap = mmu_page->buffer->heap;
+	else {
+		/* PT entries are pointing to buffer which may have been allocated
+		 * using different heap than the one used for mmu allocations */
+		if (buf)
+			heap = buf->heap;
+	}
 
 	if (mmu_page->type == IMGMMU_PTYPE_PC) {
 		/* Offset of PD physical base address(12)-4(PCE flags) */
@@ -1850,49 +2013,56 @@ static uint64_t _page_read(struct imgmmu_page *page,
 	}
 
 	*flags = entry & IMG_MMU_ENTRY_FLAGS_MASK;
-	paddr = (entry & ~IMG_MMU_ENTRY_FLAGS_MASK) << entry_shift;
+	paddr = entry & ~IMG_MMU_ENTRY_FLAGS_MASK;
 
-	paddr &= IMG_MMU_PHY_ADDR_MASK;
+	if (mmu_page->type == IMGMMU_PTYPE_PT) {
+		/* Mask parity and special cache bits */
+		paddr &= ~(1ULL<<imgmmu_get_pte_parity_shift());
+		paddr &= ~imgmmu_get_pte_cache_bits(entry);
+	}
 
+	paddr <<= entry_shift;
+
+	/* Check if physical address set in PTE is within correct range */
+	if (paddr & ~IMG_MMU_PHY_ADDR_MASK) {
+		pr_err("%s: mmu page entry (%llx) corruption detected (phys)!\n",
+				__func__, paddr);
+		*flags = IMG_MMU_ENTRY_FLAGS_MASK;
+		goto exit;
+	}
+
+	/* Check parity */
 	if (*flags && mmu_page->type == IMGMMU_PTYPE_PT &&
 			mmu_page->use_parity) {
 		uint64_t par_pair = (virt >> MIN_PAGE_SIZE_BITS) |
-				(paddr << (sizeof(uint32_t)*8 - (2 * MIN_PAGE_SIZE_BITS)));
+				((paddr >> MIN_PAGE_SIZE_BITS) << (sizeof(uint32_t)*8));
 		bool par_bit = img_mem_calc_parity(par_pair);
 
 		if (trace_physical_pages)
 			pr_info("%s: [%llx]: %s\n", __func__, entry,
 					par_bit ? "odd parity" : "even parity");
 		if ((entry >> imgmmu_get_pte_parity_shift()) != par_bit) {
-			pr_err("%s: mmu page entry corruption detected (parity)!\n",
-					__func__);
-			*flags = ~0;
+			pr_err("%s: mmu page entry (%llx) corruption detected (parity)!\n",
+					__func__, entry);
+			*flags = IMG_MMU_ENTRY_FLAGS_MASK;
 			goto exit;
 		}
 	}
 
 	/* skip translation when flags are zero, assuming address is invalid */
-	if (*flags && heap->to_host_addr && !mmu_page->bypass_addr_trans)
-		/* NOTE: When reading page tables we assume the addresses comes
-		 * from the same memory heap as the mmu allocations.
-		 * This is ok for PC & PD entries, but for PT entries it may not,
-		 * because when memory heap differs,
-		 * to_host_addr callback may return different DUT base.
-		 */
+	if (*flags && heap && heap->to_host_addr &&
+			!mmu_page->bypass_addr_trans)
 		paddr = heap->to_host_addr(&heap->options, paddr);
 
-	/* Check if physical address is correct */
-	if (!heap->to_host_addr &&
-			!mmu_page->bypass_addr_trans &&
-				!pfn_valid(paddr>>PAGE_SHIFT)) {
-		if (paddr) {
-			pr_err("%s: mmu page entry (%llx) corruption detected (pfn_valid)!\n",
+	/* Check if physical address matches dma mask */
+	if (paddr & ~dma_get_mask(mmu_page->buffer->device)) {
+		pr_err("%s: mmu page entry (%llx) physical address is out of dma mask!\n"
+				"Set proper dma mask to avoid cache problems\n",
 				__func__, paddr);
-			*flags = ~0;
-		} else /* Ignore empty entry (paddr) */
-			*flags = 0;
+		*flags = IMG_MMU_ENTRY_FLAGS_MASK;
 		goto exit;
 	}
+
 	/* Sanity check for MMU flags - different on each level */
 	if (((mmu_page->type == IMGMMU_PTYPE_PC ||
 		mmu_page->type == IMGMMU_PTYPE_PD) &&
@@ -1901,17 +2071,17 @@ static uint64_t _page_read(struct imgmmu_page *page,
 			(*flags & ~(IMG_MMU_PTE_FLAG_VALID|IMG_MMU_PTE_FLAG_READ_ONLY)))) {
 		pr_err("%s: mmu page entry corruption detected (flags)!\n",
 				__func__);
-		*flags = ~0;
+		*flags = IMG_MMU_ENTRY_FLAGS_MASK;
 	}
 
 exit:
 	if (trace_physical_pages && *flags) {
 		if (mmu_page->type == IMGMMU_PTYPE_PC)
-			pr_info("%s: off %#03x paddr %#016llx flags %#x type:PC\n",
-					__func__, offset, paddr, *flags);
+			pr_info("%s: sid:%d off %#03x paddr %#016llx flags %#x type:PC\n",
+					__func__, buf ? buf->mem_ctx->id : -1, offset, paddr, *flags);
 		else
-			pr_info("%s: off %#03x paddr %#016llx flags %#x type:%s virt:%llx\n",
-					__func__, offset, paddr, *flags,
+			pr_info("%s: sid:%d off %#03x paddr %#016llx flags %#x type:%s virt:%llx\n",
+					__func__, buf ? buf->mem_ctx->id : -1, offset, paddr, *flags,
 					mmu_page->type == IMGMMU_PTYPE_PD ? "PD" :
 					mmu_page->type == IMGMMU_PTYPE_PT ? "PT" :
 					"???", virt);
@@ -2109,8 +2279,9 @@ int img_mmu_map(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx, int buf_id,
 	heap = buffer->heap;
 	if (heap->ops && heap->ops->get_sg_table) {
 		struct sg_table *sgt;
+		bool use_sg_dma = false;
 
-		ret = heap->ops->get_sg_table(heap, buffer, &sgt);
+		ret = heap->ops->get_sg_table(heap, buffer, &sgt, &use_sg_dma);
 		if (ret) {
 			pr_err("%s: heap %d buffer %d no sg_table!\n",
 						__func__, heap->id, buffer->id);
@@ -2121,6 +2292,7 @@ int img_mmu_map(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx, int buf_id,
 			mapping->map = imgmmu_cat_map_sg(
 						mmu_ctx->mmu_cat,
 						sgt->sgl,
+						use_sg_dma,
 						&heap_alloc,
 						map_flags, buffer,
 						&res);
@@ -2240,8 +2412,10 @@ EXPORT_SYMBOL(img_mmu_unmap);
 
 int img_mmu_get_conf(size_t *page_size, size_t *virt_size)
 {
-	*page_size = imgmmu_get_page_size();
-	*virt_size = imgmmu_get_virt_size();
+	if (page_size)
+		*page_size = imgmmu_get_page_size();
+	if (virt_size)
+		*virt_size = imgmmu_get_virt_size();
 
 	return 0;
 }
@@ -2315,8 +2489,9 @@ EXPORT_SYMBOL(img_mmu_get_paddr);
 int img_mmu_vaa_create(struct device *device,
 		uint32_t base, size_t size, struct mmu_vaa **vaa)
 {
+	struct mem_man *mem_man = &mem_man_data;
 	struct mmu_vaa *ctx;
-	int res;
+	int ret = 0;
 
 	if (!size)
 		return -EINVAL;
@@ -2325,26 +2500,35 @@ int img_mmu_vaa_create(struct device *device,
 	if (!ctx)
 		return -ENOMEM;
 
+	mutex_lock(&mem_man->mutex);
+
 	ctx->heap = imgmmu_hcreate(base, imgmmu_get_page_size(),
-			size, true, &res);
-	if (res) {
-		pr_err("%s: imgmmu_hcreate failed (%d)!\n", __func__, res);
+			size, true, &ret);
+	if (ret) {
+		pr_err("%s: imgmmu_hcreate failed (%d)!\n", __func__, ret);
 		kfree(ctx);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto exit;
 	}
 
 	INIT_LIST_HEAD(&ctx->entries);
 	ctx->device = device;
 	*vaa = ctx;
 
-	return 0;
+exit:
+	mutex_unlock(&mem_man->mutex);
+	return ret;
 }
 EXPORT_SYMBOL(img_mmu_vaa_create);
 
 int img_mmu_vaa_destroy(struct mmu_vaa *vaa)
 {
+	struct mem_man *mem_man = &mem_man_data;
+
 	if (!vaa)
 		return -EINVAL;
+
+	mutex_lock(&mem_man->mutex);
 
 	while (!list_empty(&vaa->entries)) {
 		struct vaa_entry *entry;
@@ -2365,17 +2549,20 @@ int img_mmu_vaa_destroy(struct mmu_vaa *vaa)
 		/* If some attachments are still active */
 		WARN_ON(1);
 	}
-
 	kfree(vaa);
+
+	mutex_unlock(&mem_man->mutex);
+
 	return 0;
 }
 EXPORT_SYMBOL(img_mmu_vaa_destroy);
 
 int img_mmu_vaa_alloc(struct mmu_vaa *vaa, size_t size, uint32_t *addr)
 {
+	struct mem_man *mem_man = &mem_man_data;
 	struct imgmmu_halloc *alloc;
 	struct vaa_entry *entry;
-	int res;
+	int ret = 0;
 
 	if (!vaa || !addr || !size)
 		return -EINVAL;
@@ -2384,12 +2571,15 @@ int img_mmu_vaa_alloc(struct mmu_vaa *vaa, size_t size, uint32_t *addr)
 	if (!entry)
 		return -ENOMEM;
 
-	alloc = imgmmu_hallocate(vaa->heap, size, &res);
-	if (!alloc || res) {
+	mutex_lock(&mem_man->mutex);
+
+	alloc = imgmmu_hallocate(vaa->heap, size, &ret);
+	if (!alloc || ret) {
 		pr_err("%s: imgmmu_hallocate failed (%zu)!\n",
 			__func__, size);
 		kfree(entry);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto exit;
 	}
 
 	entry->alloc = alloc;
@@ -2397,16 +2587,22 @@ int img_mmu_vaa_alloc(struct mmu_vaa *vaa, size_t size, uint32_t *addr)
 
 	*addr = alloc->vaddr;
 
-	return 0;
+exit:
+	mutex_unlock(&mem_man->mutex);
+	return ret;
 }
 EXPORT_SYMBOL(img_mmu_vaa_alloc);
 
 int img_mmu_vaa_free(struct mmu_vaa *vaa, uint32_t addr, size_t size)
 {
+	struct mem_man *mem_man = &mem_man_data;
 	struct vaa_entry *entry;
+	int ret = 0;
 
 	if (!vaa || !size)
 		return -EINVAL;
+
+	mutex_lock(&mem_man->mutex);
 
 	entry = list_first_entry(&vaa->entries,
 		struct vaa_entry, mmu_vaa_entry);
@@ -2421,17 +2617,21 @@ int img_mmu_vaa_free(struct mmu_vaa *vaa, uint32_t addr, size_t size)
 	if (!entry) {
 		pr_err("%s: allocation not found (0x%x:%zu)!\n",
 				__func__, addr, size);
-		return -EINVAL;
+		ret = -EINVAL;
+		goto exit;
 	}
 	if (imgmmu_hfree(entry->alloc)) {
 		pr_err("%s: imgmmu_hfree failed (0x%x:%zu)!\n",
 			__func__, addr, size);
-		return -EFAULT;
+		ret = -EFAULT;
+		goto exit;
 	}
 	list_del(&entry->mmu_vaa_entry);
 	kfree(entry);
 
-	return 0;
+exit:
+	mutex_unlock(&mem_man->mutex);
+	return ret;
 }
 EXPORT_SYMBOL(img_mmu_vaa_free);
 
@@ -2472,21 +2672,21 @@ static unsigned int _parity_lut_[256] =
 
 bool img_mem_calc_parity(unsigned long long input)
 {
-		// Split by half as number is considered to be of 64 bits
-		int bits;
+	// Split by half as number is considered to be of 64 bits
+	int bits;
 
-		// Dividing the number into 8-bit chunks while performing X-OR
-		for (bits = 32; bits >= 8; bits>>=1)
-				input = input ^ (input >> bits);
+	// Dividing the number into 8-bit chunks while performing X-OR
+	for (bits = 32; bits >= 8; bits>>=1)
+		input = input ^ (input >> bits);
 
-		return _parity_lut_[input & 0xff] ? true : false;
+	return _parity_lut_[input & 0xff] ? true : false;
 }
 EXPORT_SYMBOL(img_mem_calc_parity);
 
 /*
  * Initialisation
  */
-static int __init img_mem_init(void)
+int img_mem_init(void)
 {
 	struct mem_man *mem_man = &mem_man_data;
 
@@ -2495,12 +2695,12 @@ static int __init img_mem_init(void)
 	idr_init(&mem_man->heaps);
 	idr_init(&mem_man->mem_ctxs);
 	mutex_init(&mem_man->mutex);
-	mem_man->cache_initialized = false;
+	mem_man->cache_usage = 0;
 
 	return 0;
 }
 
-static void __exit img_mem_exit(void)
+void img_mem_exit(void)
 {
 	struct mem_man *mem_man = &mem_man_data;
 	struct heap *heap;
@@ -2539,11 +2739,6 @@ static void __exit img_mem_exit(void)
 
 	mutex_destroy(&mem_man->mutex);
 }
-
-module_init(img_mem_init);
-module_exit(img_mem_exit);
-
-MODULE_LICENSE("GPL");
 
 /*
  * coding style for emacs

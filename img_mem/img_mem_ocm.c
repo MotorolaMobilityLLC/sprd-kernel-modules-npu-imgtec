@@ -92,7 +92,7 @@ static int ocm_heap_alloc(struct device *device, struct heap *heap,
 	page = 0;
 	while (page < pages) {
 		if (trace_physical_pages)
-			pr_debug("%s phys %llx\n",
+			pr_info("%s phys %llx\n",
 				__func__, (unsigned long long)phys_addr);
 		buffer_data->addrs[page++] = phys_addr;
 		phys_addr += PAGE_SIZE;

@@ -36,11 +36,11 @@
 #define LOW_TEMPERATURE       60000
 
 struct vha_ops {
-	int (*freq_set) (u32 freq_khz);
+	int (*set_freq) (u32 freq_khz);
 	int (*disable_idle) (void);
-	int (*max_state_get) (u32 *max_state);
-	int (*opp_get) (u32 index, u32 *freq_khz, u32 *volt);
-	int (*volts_set) (u32 high_temp);
+	int (*get_max_state) (u32 *max_state);
+	int (*get_opp) (u32 index, u32 *freq_khz, u32 *volt);
+	int (*set_volts) (u32 high_temp);
 };
 
 struct npu_dvfs_context {
@@ -55,6 +55,7 @@ struct npu_dvfs_context {
 	uint32_t last_freq_khz;
 	uint32_t max_freq_khz;
 	uint32_t max_state;
+	struct thermal_zone_device *npu_tz;
 };
 
 DEFINE_SEMAPHORE(npu_dvfs_sem);
@@ -77,7 +78,7 @@ static struct devfreq_simple_ondemand_data *data;
 static void vha_set_freq(unsigned long freq_khz)
 {
 	if (npu_dvfs_ctx.npu_on)
-		npu_dvfs_ctx.ops.freq_set(freq_khz);
+		npu_dvfs_ctx.ops.set_freq(freq_khz);
 	npu_dvfs_ctx.last_freq_khz = freq_khz > npu_dvfs_ctx.max_freq_khz ?
 					npu_dvfs_ctx.max_freq_khz : freq_khz;
 }
@@ -116,9 +117,9 @@ static ssize_t npu_max_on_store(struct device *dev,
 	int max_on = 0;
 
 	sscanf(buf, "%u\n", &max_on);
-
+#ifdef VHA_DEVFREQ
 	vha_set_max_freq(max_on);
-
+#endif
 	return count;
 }
 
@@ -212,11 +213,11 @@ int vha_dvfs_ctx_init(struct device *dev)
 
 	ops = &sip->npu_ops;
 
-	npu_dvfs_ctx.ops.freq_set = ops->freq_set;
+	npu_dvfs_ctx.ops.set_freq = ops->set_freq;
 	npu_dvfs_ctx.ops.disable_idle = ops->disable_idle;
-	npu_dvfs_ctx.ops.max_state_get = ops->max_state_get;
-	npu_dvfs_ctx.ops.opp_get = ops->opp_get;
-	npu_dvfs_ctx.ops.volts_set = ops->volts_set;
+	npu_dvfs_ctx.ops.get_max_state = ops->get_max_state;
+	npu_dvfs_ctx.ops.get_opp = ops->get_opp;
+	npu_dvfs_ctx.ops.set_volts = ops->set_volts;
 
 	ret = sysfs_create_group(&(dev->kobj), &dev_attr_group);
 	if (ret) {
@@ -232,9 +233,9 @@ int vha_dvfs_ctx_init(struct device *dev)
 
 	npu_dvfs_ctx.last_freq_khz = default_freq_khz;
 
-	ret = npu_dvfs_ctx.ops.max_state_get(&npu_dvfs_ctx.max_state);
+	ret = npu_dvfs_ctx.ops.get_max_state(&npu_dvfs_ctx.max_state);
 
-	npu_dvfs_ctx.ops.volts_set(0);
+	npu_dvfs_ctx.ops.set_volts(0);
 
 	return ret;
 }
@@ -355,10 +356,9 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	struct vha_devfreq_metrics diff;
-	struct thermal_zone_device *npu_tz;
 	int temp;
 
-	if (!vha)
+	if (!vha || !npu_dvfs_ctx.npu_tz)
 		goto out;
 
 	vha_get_dvfs_metrics(vha, &vha->last_devfreq_metrics, &diff);
@@ -367,21 +367,17 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 	state->current_frequency = npu_dvfs_ctx.last_freq_khz * 1000UL;
 	state->private_data = NULL;
 
-	npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
-	if (!npu_tz)
-		goto out;
-
-	npu_tz->ops->get_temp(npu_tz, &temp);
+	npu_dvfs_ctx.npu_tz->ops->get_temp(npu_dvfs_ctx.npu_tz, &temp);
 	dev_dbg(dev, "cur_temp = %d\n", temp);
 	down(npu_dvfs_ctx.sem);
 	if (temp >= HIGH_TEMPERATURE) {
 		if (!npu_dvfs_ctx.high_temp) {
-			npu_dvfs_ctx.ops.volts_set(1);
+			npu_dvfs_ctx.ops.set_volts(1);
 			npu_dvfs_ctx.high_temp = true;
 		}
 	} else if (temp <= LOW_TEMPERATURE) {
 		if (npu_dvfs_ctx.high_temp) {
-			npu_dvfs_ctx.ops.volts_set(0);
+			npu_dvfs_ctx.ops.set_volts(0);
 			npu_dvfs_ctx.high_temp = false;
 		}
 	}
@@ -401,7 +397,7 @@ int vha_devfreq_init(struct vha_dev *vha)
 	npu_dvfs_ctx.npu_on = true;
 
 	for (i = 0; i < npu_dvfs_ctx.max_state; i++) {
-		npu_dvfs_ctx.ops.opp_get(i, &freq_khz, &volt);
+		npu_dvfs_ctx.ops.get_opp(i, &freq_khz, &volt);
 		ret = dev_pm_opp_add(vha->dev, freq_khz * 1000UL, volt);
 		if (ret) {
 			dev_err(vha->dev, "failed to add dev_pm_opp: %d\n", ret);
@@ -445,11 +441,20 @@ int vha_devfreq_init(struct vha_dev *vha)
 		dev_err(vha->dev, "Failed to register npu cooling device\n", ret);
 		goto npu_cooling_device_register_failed;
 	}
+	npu_dvfs_ctx.npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
+	if (!npu_dvfs_ctx.npu_tz) {
+		dev_err(vha->dev, "Failed to get ai thermal zone\n");
+		ret = -EFAULT;
+		goto get_ai_thermal_zone_failed;
+	}
+
 	npu_dvfs_ctx.cooling_device = true;
 	npu_dvfs_ctx.dvfs_init = true;
 
 	return ret;
 
+get_ai_thermal_zone_failed:
+	npu_cooling_device_unregister();
 npu_cooling_device_register_failed:
 	devfreq_unregister_opp_notifier(vha->dev, vha->devfreq);
 devfreq_register_opp_notifier_failed:

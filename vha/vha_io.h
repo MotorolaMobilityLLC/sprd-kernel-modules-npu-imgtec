@@ -66,42 +66,43 @@
 #define ADDR_CAST __force void *
 
 /* IO access macros */
-#define IOREAD64(b, o) vha_plat_read64((ADDR_CAST)b + (o))
+#define IOREAD64(b, o)     vha_plat_read64((ADDR_CAST)b + (o))
 #define IOWRITE64(b, o, v) vha_plat_write64((ADDR_CAST)b + (o), v)
 
-#define IOREAD64_REGIO(r)     vha_plat_read64((ADDR_CAST)vha->reg_base + (r))
+#define IOREAD64_REGIO(r)        vha_plat_read64((ADDR_CAST)vha->reg_base + (r))
 #define IOREAD64_CR_REGIO(r)     vha_plat_read64((ADDR_CAST)vha->reg_base + (VHA_CR_##r))
-#define IOWRITE64_REGIO(v, r) vha_plat_write64((ADDR_CAST)vha->reg_base + (r), v)
+#define IOWRITE64_REGIO(v, r)    vha_plat_write64((ADDR_CAST)vha->reg_base + (r), v)
 #define IOWRITE64_CR_REGIO(v, r) vha_plat_write64((ADDR_CAST)vha->reg_base + (VHA_CR_##r), v)
 
 /* write value to register and log into pdump file using specified reg namespace */
-#define IOWRITE64_PDUMP_REGIO(v, o, r, s) do {				\
-		uint64_t _val_ = v;					\
+#define IOWRITE64_PDUMP_REGIO(v, o, r, s)							\
+	do {															\
+		uint64_t _val_ = v;											\
 		vha_plat_write64((ADDR_CAST)vha->reg_base + o + r, _val_);	\
-		img_pdump_printf("WRW64 :%s:%#x %#llx\n",	\
-				 s, (r), _val_);		\
+		img_pdump_printf("WRW64 :%s:%#x %#llx\n", s, (r), _val_);	\
 	} while (0)
 
 /* write value to register and log into pdump file using default regspace */
-#define IOWRITE64_PDUMP(v, r) 	\
+#define IOWRITE64_PDUMP(v, r)	\
 		IOWRITE64_PDUMP_REGIO(v, 0, r, "REG")
-#define IOWRITE64_CR_PDUMP(v, r) 	\
+#define IOWRITE64_CR_PDUMP(v, r)	\
 		IOWRITE64_PDUMP_REGIO(v, 0, VHA_CR_##r, "REG")
 
 /* read value from register and log into pdump file using specified reg namespace */
-#define IOREAD64_PDUMP_REGIO(o, r, s) ({	\
-		uint64_t _val_;		\
-		do {		\
+#define IOREAD64_PDUMP_REGIO(o, r, s)									\
+	({																	\
+		uint64_t _val_;													\
+		do {															\
 			_val_ = vha_plat_read64((ADDR_CAST)vha->reg_base + o + r);	\
-			img_pdump_printf("RDW64 :%s:%#x\n",	s, (r));	\
-		} while (0);	\
-		_val_;	\
+				img_pdump_printf("RDW64 :%s:%#x\n",	s, (r));			\
+		} while (0);													\
+		_val_;															\
 	})
 
 /* read value from register and log into pdump file using default regspace */
-#define IOREAD64_PDUMP(r) 	\
+#define IOREAD64_PDUMP(r)	\
 		IOREAD64_PDUMP_REGIO(0, r, "REG")
-#define IOREAD64_CR_PDUMP(r) 	\
+#define IOREAD64_CR_PDUMP(r)	\
 		IOREAD64_PDUMP_REGIO(0, VHA_CR_##r, "REG")
 
 #ifdef CONFIG_FUNCTION_ERROR_INJECTION
@@ -110,22 +111,132 @@ int __IOPOLL64_RET(int ret);
 #define __IOPOLL64_RET(ret) ret
 #endif
 
+#define __WARN_ONLY(...) __WARN_ONLY_PRIV(false, ## __VA_ARGS__, false)
+#define __WARN_ONLY_PRIV(aux, wo, ...) wo
+
 /* poll c-times for the exact register value(v) masked with m,
  * using d-cycles delay between polls and log into pdump file
  * using specified reg namespace */
 #ifdef CONFIG_VHA_DUMMY
-#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s) \
-	({   img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
-					s, (r), v & m, m, c, d); \
-			__IOPOLL64_RET(0); \
+#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s, ...)			\
+	({	img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n",	\
+						s, (r), v & m, m, c, d); 				\
+		__IOPOLL64_RET(0); 										\
 	})
 /* Question: shall we generate pdump script to calculate parity in runtime? */
-#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s) \
-	IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s)
+#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s, ...)	\
+	IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s, ## __VA_ARGS__)
 
 #else /* CONFIG_VHA_DUMMY */
 
-#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s) \
+#define IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s, ...) 					\
+	({ int _ret_ = -EIO;												\
+		do {															\
+			uint64_t _req_ = v & m;										\
+			uint64_t _val_ = ~_req_;									\
+			int _count_ = (c < 1 ? 1 : c);								\
+			while (--_count_ >= 0) {									\
+				_val_ = vha_plat_read64(								\
+						(ADDR_CAST)vha->reg_base + ((o + r))) & m;		\
+				if (_val_ == _req_) {									\
+					_ret_ = 0;											\
+					break;												\
+				}														\
+				if (vha->freq_khz > 0) {								\
+					ndelay(d*1000000/vha->freq_khz); 					\
+				} else													\
+					udelay(100);										\
+			}															\
+			if (__WARN_ONLY(__VA_ARGS__)) {								\
+				if (_val_ != _req_ && !vha->hw_props.dummy_dev)			\
+					dev_warn(vha->dev,									\
+						"%s: WARNING: Failed polling for " #r "!\n",	\
+						__func__);										\
+			} else														\
+				WARN_ON(_val_ != _req_ && !vha->hw_props.dummy_dev);	\
+			img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", 	\
+							s, (r), _req_, m, c, d);					\
+		} while (0); 													\
+		__IOPOLL64_RET(_ret_); 											\
+	})
+
+#ifdef VHA_SCF
+
+#define _PARITY_CHECKS 4
+
+#define _PARITY_CHECK_VAL_IMP(val) \
+	if((_parity_ok = !img_mem_calc_parity(val))) { \
+		_parity_count=_PARITY_CHECKS; \
+	} else { \
+		if(--_parity_count==0) { \
+			_ret_ = -EIO; \
+			break; \
+		} \
+	}
+
+#ifdef VHA_EVENT_INJECT
+#define _PARITY_CHECK_VAL(val, reg) \
+	if((vha->injection.parity_poll_err_reg == reg) && __EVENT_INJECT()) { \
+		_parity_ok = false;	\
+	} else { \
+		_PARITY_CHECK_VAL_IMP(val) \
+		WARN_ON(!_parity_ok); \
+	}
+#else
+#define _PARITY_CHECK_VAL(val, reg) _PARITY_CHECK_VAL_IMP(val)
+#endif
+/* poll c-times for the exact register value(v) masked with m,
+ * using d-cycles delay between polls and log into pdump file
+ * using specified reg namespace
+ * return error if parity calculated from 4 consecutive reads
+ * is wrong
+ * */
+#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s, ...)				\
+	({ int _ret_ = -EIO;													\
+		if (vha->hw_props.supported.parity && !vha->parity_disable) {		\
+			do {															\
+				bool _parity_ok = false;									\
+				int _parity_count=_PARITY_CHECKS;							\
+				uint64_t _req_ = (v) & (m);									\
+				uint64_t _val_ = ~_req_;									\
+				int _count_ = (c) < _PARITY_CHECKS ? _PARITY_CHECKS : (c);	\
+				while (_count_-- > 0) {										\
+					_val_ = vha_plat_read64(								\
+							(ADDR_CAST)vha->reg_base + ((o + r)));			\
+					_PARITY_CHECK_VAL(_val_, r);							\
+					_val_ &= m;												\
+					if (_parity_ok && _val_ == _req_) {						\
+						_ret_ = 0;											\
+						break;												\
+					}														\
+					if (vha->freq_khz > 0)									\
+						ndelay(d*1000000/vha->freq_khz);					\
+					else													\
+						udelay(100);										\
+				}															\
+				if (__WARN_ONLY(__VA_ARGS__)) {								\
+					if (_val_ != _req_)										\
+						dev_warn(vha->dev,									\
+							"%s: WARNINIG: Failed polling for " #r "!\n",	\
+							__func__);										\
+				} else														\
+					WARN_ON(_val_ != _req_);								\
+				img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", 	\
+								s, (r), _req_, m, c, d);					\
+			} while (0);													\
+		} else {															\
+			_ret_ = IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s);				\
+		}																	\
+		__IOPOLL64_RET(_ret_);												\
+	})
+
+#else /* VHA_SCF */
+#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s, ...)	\
+	IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s, ## __VA_ARGS__)
+#endif /* VHA_SCF */
+#endif /* CONFIG_VHA_DUMMY */
+
+#define IOPOLL64_REGIO(v, c, d, m, o, r, s) \
 	({ int _ret_ = -EIO;						\
 		do {													\
 			uint64_t _req_ = v & m;			\
@@ -143,133 +254,76 @@ int __IOPOLL64_RET(int ret);
 				} else										\
 					udelay(100);						\
 			}							\
-			WARN_ON(_val_ != _req_ && !vha->core_props.dummy_dev);	\
-				img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
-					s, (r), _req_, m, c, d);			\
+			WARN_ON(_val_ != _req_ && !vha->hw_props.dummy_dev);	\
 		} while (0); \
 		__IOPOLL64_RET(_ret_); \
 	})
 
-#ifdef VHA_SCF
-
-#define _PARITY_CHECKS 4
-
-#define _PARITY_CHECK_VAL(val) \
-	if((_parity_ok = !img_mem_calc_parity(val))) { \
-		_parity_count=_PARITY_CHECKS; \
-	} else { \
-		if(--_parity_count==0) { \
-			_ret_ = -EIO; \
-			break; \
-		} \
-	}
-
-/* poll c-times for the exact register value(v) masked with m,
- * using d-cycles delay between polls and log into pdump file
- * using specified reg namespace
- * return error if parity calculated from 4 consecutive reads
- * is wrong
- * */
-#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s) \
-	({ int _ret_ = -EIO;              \
-		if (vha->core_props.supported.parity && !vha->parity_disable) { \
-			do {                          \
-				bool _parity_ok = false;    \
-				int _parity_count=_PARITY_CHECKS; \
-				uint64_t _req_ = (v) & (m); \
-				uint64_t _val_ = ~_req_;    \
-				int _count_ = (c) < _PARITY_CHECKS ? _PARITY_CHECKS : (c); \
-				while (_count_-- > 0) {    \
-					_val_ = vha_plat_read64(  \
-							(ADDR_CAST)vha->reg_base + ((o + r))); \
-					_PARITY_CHECK_VAL(_val_); \
-					_val_ &= m;               \
-					if (_parity_ok && _val_ == _req_) { \
-						_ret_ = 0;              \
-						break;                  \
-					}                         \
-					if (vha->freq_khz > 0) {  \
-						ndelay(d*1000000/vha->freq_khz); \
-					} else                    \
-						udelay(100);            \
-				}                           \
-				WARN_ON(!_parity_ok);       \
-				WARN_ON(_val_ != _req_);    \
-				img_pdump_printf("POL64 :%s:%#x %#llx %#llx 0 %d %d\n", \
-						s, (r), _req_, m, c, d);      \
-			} while (0); \
-		} else { \
-			_ret_ = IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s); \
-		} \
-		__IOPOLL64_RET(_ret_); \
-	})
-
-#else /* VHA_SCF */
-#define IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, o, r, s) \
-	IOPOLL64_PDUMP_REGIO(v, c, d, m, o, r, s)
-#endif /* VHA_SCF */
-#endif /* CONFIG_VHA_DUMMY */
-
 /* poll c-times for the exact register value(v) masked with m,
  * using d-cycles delay between polls and log into pdump file
  * using specified reg namespace */
-#define IOPOLL64_PDUMP(v, c, d, m, r)   \
-	IOPOLL64_PDUMP_REGIO(v, c, d, m, 0, r, "REG")
-#define IOPOLL64_CR_PDUMP(v, c, d, m, r)  \
-	IOPOLL64_PDUMP_REGIO(v, c, d, m, 0, VHA_CR_##r, "REG")
+#define IOPOLL64_PDUMP(v, c, d, m, r, ...)   \
+	IOPOLL64_PDUMP_REGIO(v, c, d, m, 0, r, "REG", ## __VA_ARGS__)
+#define IOPOLL64_CR_PDUMP(v, c, d, m, r, ...)  \
+	IOPOLL64_PDUMP_REGIO(v, c, d, m, 0, VHA_CR_##r, "REG", ## __VA_ARGS__)
+#define IOPOLL64(v, c, d, m, r)   \
+	IOPOLL64_REGIO(v, c, d, m, 0, r, "REG")
 
-#define IOPOLL64_PDUMP_PARITY(v, c, d, m, r)   \
-	IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, 0, r, "REG")
-#define IOPOLL64_CR_PDUMP_PARITY(v, c, d, m, r)  \
-	IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, 0, VHA_CR_##r, "REG")
+#define IOPOLL64_PDUMP_PARITY(v, c, d, m, r, ...)   \
+	IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, 0, r, "REG", ## __VA_ARGS__)
+#define IOPOLL64_CR_PDUMP_PARITY(v, c, d, m, r, ...)  \
+	IOPOLL64_PDUMP_REGIO_PARITY(v, c, d, m, 0, VHA_CR_##r, "REG", ## __VA_ARGS__)
 
 /* write phys address of buffer to register, and log into pdump */
-#define IOWRITE_PDUMP_PHYS(buf, offset, reg) do {			\
+#define IOWRITE_PDUMP_PHYS(buf, offset, reg)							\
+	do {																\
 		uint64_t __maybe_unused _addr_ = vha_buf_addr(session, buf);	\
-		vha_plat_write64(	\
-				(ADDR_CAST)session->vha->reg_base + reg,\
-				_addr_ + offset);	\
-		img_pdump_printf(					\
-			"WRW64 :REG:%#x "_PMEM_":BLOCK_%d:%#x -- '%s%s'\n",	\
-			reg, buf->id, offset, buf->name,		\
-				buf->pcache.valid ? "_cached" : "");	\
+		vha_plat_write64(												\
+				(ADDR_CAST)session->vha->reg_base + reg,				\
+				_addr_ + offset);										\
+		img_pdump_printf(												\
+			"WRW64 :REG:%#x "_PMEM_":BLOCK_%d:%#x -- '%s%s'\n",			\
+			reg, buf->id, offset, buf->name,							\
+				buf->pcache.valid ? "_cached" : "");					\
 	} while (0)
 
 /* write virt address of buffer to register, and log into pdump */
-#define IOWRITE_PDUMP_VIRT(buf, offset, reg) \
+#define IOWRITE_PDUMP_VIRT(buf, offset, reg)	\
 		IOWRITE64_PDUMP(buf->devvirt + offset, reg)
 
 /* write address of buffer to register and log into pdump file */
-#define IOWRITE_PDUMP_BUFADDR(session, buf, offset, reg) do {		\
-		if (session->vha->mmu_mode)				\
-			IOWRITE_PDUMP_VIRT(buf, offset, reg);		\
-		else if (buf->attr & IMG_MEM_ATTR_OCM) {		\
-				IOWRITE_PDUMP_VIRT(buf, offset, reg);	\
-		} else {					\
-			IOWRITE_PDUMP_PHYS(buf, offset, reg);	\
-		}						\
+#define IOWRITE_PDUMP_BUFADDR(session, buf, offset, reg)	\
+	do {													\
+		if (session->vha->mmu_mode)							\
+			IOWRITE_PDUMP_VIRT(buf, offset, reg);			\
+		else if (buf->attr & IMG_MEM_ATTR_OCM)				\
+			IOWRITE_PDUMP_VIRT(buf, offset, reg);			\
+		else												\
+			IOWRITE_PDUMP_PHYS(buf, offset, reg);			\
 	} while (0)
 
 
 /* write phys address of buffer to register, and log into pdump */
-#define SET_PHYS(buf, offset, addr) do {			\
+#define SET_PHYS(buf, offset, addr)						\
+	do {												\
 		uint64_t _addr_ = vha_buf_addr(session, buf);	\
-		*addr = _addr_ + offset;	\
+		*addr = _addr_ + offset;						\
 	} while (0)
 
 /* write virt address of buffer to register, and log into pdump */
-#define SET_VIRT(buf, offset, addr) do {			\
-		*addr = buf->devvirt + offset;					\
+#define SET_VIRT(buf, offset, addr) 	\
+	do {								\
+		*addr = buf->devvirt + offset;	\
 	} while (0)
 
-#define SET_BUFADDR(session, buf, offset, addr) do {		\
-		if (session->vha->mmu_mode)								\
-			SET_VIRT(buf, offset, addr);					\
-		else if (buf->attr & IMG_MEM_ATTR_OCM) {				\
-			SET_VIRT(buf, offset, addr);				\
-		} else {											\
-			SET_PHYS(buf, offset, addr);				\
-		}													\
+#define SET_BUFADDR(session, buf, offset, addr)		\
+	do {											\
+		if (session->vha->mmu_mode)					\
+			SET_VIRT(buf, offset, addr);			\
+		else if (buf->attr & IMG_MEM_ATTR_OCM)		\
+			SET_VIRT(buf, offset, addr);			\
+		else										\
+			SET_PHYS(buf, offset, addr);			\
 	} while (0)
 
 
@@ -290,74 +344,70 @@ uint64_t _set_bits(uint64_t val, uint32_t shift, uint64_t mask)
 
 /* utility macros for manipulating fields within registers */
 /* apply bitmask */
-#define VHA_CR_BITMASK(reg, field)			\
+#define VHA_CR_BITMASK(reg, field)	\
 	(~VHA_CR_##reg##_##field##_CLRMSK)
 /* get field from register */
-#define VHA_CR_GETBITS(reg, field, val)			\
-	_get_bits(val,					\
+#define VHA_CR_GETBITS(reg, field, val)		\
+	_get_bits(val,							\
 		 VHA_CR_##reg##_##field##_SHIFT,	\
 		 VHA_CR_BITMASK(reg, field))
 /* get value of a field in a register, taking alignment into account */
-#define VHA_CR_ALIGN_GETBITS(reg, field, val)		\
-	(VHA_CR_GETBITS(reg, field, val)		\
+#define VHA_CR_ALIGN_GETBITS(reg, field, val)	\
+	(VHA_CR_GETBITS(reg, field, val)			\
 	 << VHA_CR_##reg##_##field##_ALIGNSHIFT)
 
 /* apply bitmask - OS dependent */
-#define VHA_CR_BITMASK_OS(reg, field)			\
+#define VHA_CR_BITMASK_OS(reg, field)	\
 	~OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _CLRMSK)
 /* get field from register - OS dependent */
-#define VHA_CR_GETBITS_OS(reg, field, val)			\
-	_get_bits(val,					\
-		 OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT), \
+#define VHA_CR_GETBITS_OS(reg, field, val)									\
+	_get_bits(val,															\
+		 OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT),	\
 		 VHA_CR_BITMASK_OS(reg, field))
 /* get value of a field in a register, taking alignment into account - OS */
-#define VHA_CR_ALIGN_GETBITS_OS(reg, field, val)		\
-	(VHA_CR_GETBITS_OS(reg, field, val)		\
-	 << OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _ALIGNSHIFT)) \
+#define VHA_CR_ALIGN_GETBITS_OS(reg, field, val)								\
+	(VHA_CR_GETBITS_OS(reg, field, val)											\
+	 << OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _ALIGNSHIFT))
 
 /* max value of a field */
-#define VHA_CR_MAX(reg, field)				\
+#define VHA_CR_MAX(reg, field)	\
 	VHA_CR_GETBITS(reg, field, ~0ULL)
 /* max value of an field taking alignment into account */
-#define VHA_CR_ALIGN_MAX(reg, field)			\
-	(VHA_CR_MAX(reg, field)				\
-	 << VHA_CR_##reg##_##field##_SHIFT)
+#define VHA_CR_ALIGN_MAX(reg, field)	\
+	(VHA_CR_MAX(reg, field) << VHA_CR_##reg##_##field##_SHIFT)
 
 /* max value of a field - OS dependent */
-#define VHA_CR_MAX_OS(reg, field)				\
+#define VHA_CR_MAX_OS(reg, field)	\
 	VHA_CR_GETBITS_OS(reg, field, ~0ULL)
 /* max value of an field taking alignment into account - OS dependent */
-#define VHA_CR_ALIGN_MAX_OS(reg, field)			\
-	(VHA_CR_MAX_OS(reg, field)				\
-	 << OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT)) \
+#define VHA_CR_ALIGN_MAX_OS(reg, field)									\
+	(VHA_CR_MAX_OS(reg, field)											\
+	 << OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT))
 
 /* set value of a field within a register */
-#define VHA_CR_SETBITS(reg, field, val)			\
-	_set_bits(val,					\
+#define VHA_CR_SETBITS(reg, field, val)		\
+	_set_bits(val,							\
 		 VHA_CR_##reg##_##field##_SHIFT,	\
 		 VHA_CR_BITMASK(reg, field))
 /* set value of a field within a register reducing value by alignment */
-#define VHA_CR_ALIGN_SETBITS(reg, field, val)		\
-	VHA_CR_SETBITS(					\
-		reg, field, (val)			\
-	 >> VHA_CR_##reg##_##field##_ALIGNSHIFT)
+#define VHA_CR_ALIGN_SETBITS(reg, field, val)	\
+	VHA_CR_SETBITS(reg, field, (val) >> VHA_CR_##reg##_##field##_ALIGNSHIFT)
 
 /* set value of a field within a register - OS dependent */
-#define VHA_CR_SETBITS_OS(reg, field, val)			\
-	_set_bits(val,					\
-		 OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT), \
+#define VHA_CR_SETBITS_OS(reg, field, val)									\
+	_set_bits(val,															\
+		 OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _SHIFT),	\
 		 VHA_CR_BITMASK_OS(reg, field))
 /* set value of a field within a register reducing value by alignment - OS */
-#define VHA_CR_ALIGN_SETBITS_OS(reg, field, val)		\
-	VHA_CR_SETBITS_OS(			\
-		reg, field, (val)		\
-	 >> OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _ALIGNSHIFT)) \
+#define VHA_CR_ALIGN_SETBITS_OS(reg, field, val)								\
+	VHA_CR_SETBITS_OS(reg, field, (val)											\
+	 >> OSID_TOKEN(VHA_CR_OS, _OSID_, _ ## reg ## _ ## field ## _ALIGNSHIFT))	\
 
 /* clear bits of a field within a register */
-#define VHA_CR_CLEARBITS(val, reg, field)			\
+#define VHA_CR_CLEARBITS(val, reg, field)	\
 	(val &= ~VHA_CR_BITMASK(reg, field))
 /* clear bits of a field within a register - OS dependent */
-#define VHA_CR_CLEARBITS_OS(val, reg, field)			\
+#define VHA_CR_CLEARBITS_OS(val, reg, field)	\
 	(val &= ~VHA_CR_BITMASK_OS(reg, field))
 
 #endif /* VHA_IO_H */

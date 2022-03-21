@@ -61,7 +61,7 @@ static void mmu_flush(const struct device *dev,
 	{
 		uint64_t pend = VHA_CR_OS(MMU_CTRL_INVAL_STATUS_PENDING_EN);
 #ifdef VHA_SCF
-		if (vha->core_props.supported.parity &&
+		if (vha->hw_props.supported.parity &&
 				!vha->parity_disable) {
 			/* If pending bit is set then parity bit must be set as well ! */
 			pend |= VHA_CR_OS(MMU_CTRL_INVAL_STATUS_PARITY_EN);

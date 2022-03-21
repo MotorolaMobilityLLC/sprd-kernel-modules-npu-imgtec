@@ -58,9 +58,12 @@ struct mem_ctx {
 	unsigned id;
 	struct idr buffers;
 	struct list_head mmu_ctxs;
-	/* Used to track memory usage */
+	/* Used to track memory usage for all buffers and
+	 * separately for MMU page tables only */
 	size_t mem_usage_max;
 	size_t mem_usage_curr;
+	size_t mmu_usage_max;
+	size_t mmu_usage_curr;
 };
 
 /* An MMU mapping of a buffer */
@@ -141,8 +144,8 @@ struct heap_ops {
 				 size_t size, enum img_mem_attr attr,
 				 struct buffer *buffer);
 	int (*import)(struct device *device, struct heap *heap,
-					size_t size, enum img_mem_attr attr, uint64_t buf_hnd,
-					struct buffer *buffer);
+					size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+					struct page **pages, struct buffer *buffer);
 	int (*export)(struct device *device, struct heap *heap,
 					size_t size, enum img_mem_attr attr, struct buffer *buffer,
 					uint64_t *buf_hnd);
@@ -153,7 +156,7 @@ struct heap_ops {
 	int (*map_km)(struct heap *heap, struct buffer *buffer);
 	int (*unmap_km)(struct heap *heap, struct buffer *buffer);
 	int (*get_sg_table)(struct heap *heap, struct buffer *buffer,
-					struct sg_table **sg_table);
+					struct sg_table **sg_table, bool *use_sg_dma);
 	int (*get_page_array)(struct heap *heap, struct buffer *buffer,
 						uint64_t **addrs);
 	void (*sync_cpu_to_dev)(struct heap *heap, struct buffer *buffer);

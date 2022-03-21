@@ -43,12 +43,13 @@
 #include <linux/irq.h>
 #include <linux/moduleparam.h>
 #include <linux/pm_runtime.h>
+#include <linux/slab.h>
+#include <linux/random.h>
 
 #include <uapi/vha.h>
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
-#include "vha_devfreq.h"
 
 #if defined(CFG_SYS_VAGUS)
 #include <hwdefs/nn_sys_cr_vagus.h>
@@ -98,10 +99,6 @@ static void vha_dev_enable_clocks(struct vha_dev *vha)
 
 static void vha_dev_ready(struct vha_dev *vha)
 {
-#ifndef CONFIG_VHA_DUMMY
-	if (!vha->is_ready)
-		return;
-#endif
 	dev_dbg(vha->dev, "%s\n", __func__);
 
 	vha_dev_wait(vha);
@@ -152,9 +149,10 @@ static int vha_dev_disable_clocks(struct vha_dev *vha)
 {
 	/* If auto gating was turned on, wait for clocks idle state */
 	img_pdump_printf("-- Wait for clocks IDLE state\n");
-	IOPOLL64_PDUMP(0, 100, 1000,
+	IOPOLL64_PDUMP(0, 1000, 1000,
 			VHA_CR_CLK_STATUS0_MASKFULL,
-			VHA_CR_CLK_STATUS0);
+			VHA_CR_CLK_STATUS0,
+			true);
 #if defined(CFG_SYS_VAGUS)
 	IOPOLL64_PDUMP_REGIO(0, 100, 1000, NN_SYS_CR_CLK_STATUS_MASKFULL,
 			NN_SYS_CR_BASE, NN_SYS_CR_CLK_STATUS, "REG_NNSYS");
@@ -219,7 +217,7 @@ int vha_dev_start(struct vha_dev *vha)
 
 	vha->state = VHA_STATE_ON;
 	/* Remember the time hw is powered on */
-	getnstimeofday(&vha->stats.hw_start);
+	GETNSTIMEOFDAY(&vha->stats.hw_start);
 	return ret;
 }
 
@@ -238,14 +236,16 @@ int vha_dev_stop(struct vha_dev *vha, bool reset)
 	/* Disable events at first */
 	vha_dev_disable_events(vha);
 
-	vha->is_ready = false;
 /* Assuming OS0 is the privileged one */
 #if _OSID_ == 0 /* For HW_AX2 */
 	/////////////// POWER_OFF //////////////////////////
 	img_pdump_printf("-- POWER_OFF_BEGIN\n");
 	/* Reset core in case of error or pending inference */
-	if (reset)
+	if (reset) {
+		/* ensure that clocks are set to AUTO before reset */
+		vha_dev_enable_clocks(vha);
 		ret = vha_dev_reset(vha);
+	}
 	if(ret)
 		dev_warn(vha->dev,
 			"%s: Problem with resetting device!\n",
@@ -265,8 +265,8 @@ int vha_dev_stop(struct vha_dev *vha, bool reset)
 	/* Update the up time of the core */
 	if (!vha->do_calibration) {
 		uint64_t tmp = 0;
-		struct timespec now;
-		getnstimeofday(&now);
+		struct TIMESPEC now;
+		GETNSTIMEOFDAY(&now);
 		if (get_timespan_us(&vha->stats.hw_start, &now, &tmp)) {
 			do_div(tmp, 1000UL);
 			vha->stats.uptime_ms += tmp;
@@ -299,6 +299,40 @@ void vha_update_utilization(struct vha_dev *vha)
 	vha->stats.cnn_utilization = tmp;
 }
 
+#ifdef VHA_EVENT_INJECT
+/* Array of error bits for VHA_CR_VHA_EVENT_STATUS reg. */
+static uint64_t vha_cr_errors[] = {
+	VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_ERROR_EN,
+	VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_HL_WDT_EN,
+	VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_AXI_ERROR_EN,
+	VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_MMU_PAGE_FAULT_EN,
+	VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_CNN0_MEM_WDT_EN,
+	VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_CNN0_ERROR_EN
+};
+/*
+ * Inject EVENT_STATUS bits, requested by respective debugfs nodes, to
+ * the status register.
+ */
+static inline void __inject_event_regs(struct vha_dev* vha, uint64_t* event_status)
+{
+	if(!__EVENT_INJECT())
+		return;
+
+	if (*event_status & (1 << VHA_CR_VHA_EVENT_STATUS_TYPE_VHA_CNN0_COMPLETE_SHIFT)) {
+		if (vha->injection.random_inject) {
+			uint8_t rand_error;
+			/* Generate random error and inject it. */
+			get_random_bytes(&rand_error, sizeof(rand_error));
+			rand_error %= (sizeof(vha_cr_errors) / sizeof(uint64_t));
+			*event_status |= vha_cr_errors[rand_error];
+		} else {
+			/* Inject user defined errors. */
+			*event_status |= vha->injection.vha_cr_event;
+		}
+	}
+}
+#endif
+
 /* Top half */
 irqreturn_t vha_handle_irq(struct device *dev)
 {
@@ -312,6 +346,7 @@ irqreturn_t vha_handle_irq(struct device *dev)
 		return IRQ_NONE;
 
 	event_status = IOREAD64(vha->reg_base, VHA_CR_OS(VHA_EVENT_STATUS));
+	event_status &= IOREAD64(vha->reg_base, VHA_CR_OS(VHA_EVENT_ENABLE));
 	/* On fpga platform it is possible to get
 	 * a spurious interrupt when the hw died
 	 * Do not proceed, just throw a warning */
@@ -320,8 +355,12 @@ irqreturn_t vha_handle_irq(struct device *dev)
 		return IRQ_NONE;
 	}
 
+#ifdef VHA_EVENT_INJECT
+	__inject_event_regs(vha, &event_status);
+#endif
+
 #ifdef VHA_SCF
-	if (vha->core_props.supported.parity &&
+	if (vha->hw_props.supported.parity &&
 			!vha->parity_disable) {
 		bool par_bit = img_mem_calc_parity(event_status &
 				~VHA_CR_BITMASK(VHA_EVENT_STATUS_TYPE, PARITY));
@@ -350,7 +389,7 @@ irqreturn_t vha_handle_irq(struct device *dev)
 		cnn_status = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_STATUS));
 
 #ifdef VHA_SCF
-		if (vha->core_props.supported.parity &&
+		if (vha->hw_props.supported.parity &&
 				!vha->parity_disable) {
 			bool par_bit = img_mem_calc_parity(cnn_status &
 					~VHA_CR_BITMASK_OS(CNN_STATUS, PARITY));
@@ -361,28 +400,49 @@ irqreturn_t vha_handle_irq(struct device *dev)
 			}
 		}
 #endif
+		{
+			/* Post check for AXI bus errors */
+			uint64_t ace_status = IOREAD64(vha->reg_base, VHA_CR_ACE_STATUS);
+			if (ace_status) {
+				dev_err(vha->dev, "AXI bus protocol error: %#llx\n",
+							ace_status);
+				/* Use AXI error event to indicate that */
+				event_status |=  VHA_CR_OS(VHA_EVENT_STATUS_VHA_AXI_ERROR_EN);
+			}
+		}
+
 		/* Read the stream count as single IRQ may be raised for multiple kicks */
 		count = VHA_CR_GETBITS_OS(CNN_STATUS, STREAM_COUNT, cnn_status);
 
 		spin_lock(&vha->irq_lock);
 		/* store the status to be processed later */
-		vha->irq_status |= event_status;
-		if (vha->low_latency == VHA_LL_SELF_KICK)
-			/* Two separate IRQs may be raised for multiple kicks */
-			vha->irq_count += count - vha->stream_count;
-		else
-			/* Only single IRQ may be raised otherwise ... */
-			vha->irq_count = count - vha->stream_count;
-		vha->stream_count = count;
+		if (vha->do_calibration ||
+				vha_is_busy(vha)) {
+			vha->irq_status |= event_status;
+
+			if (vha->low_latency == VHA_LL_SELF_KICK)
+				/* Two separate IRQs may be raised for multiple kicks */
+				vha->irq_count += count - vha->stream_count;
+			else
+				/* Only single IRQ may be raised otherwise ... */
+				vha->irq_count = count - vha->stream_count;
+
+			vha->stream_count = count;
 #ifdef VHA_DEVFREQ
 		if (vha->devfreq) {
 			now = ktime_get();
 			vha_update_dvfs_state(vha, false, &now);
 		}
 #endif
-		/* Record hw processing end timestamps */
-		vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
-		getnstimeofday(&vha->stats.hw_proc_end);
+			/* Record hw processing end timestamps */
+			vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
+			GETNSTIMEOFDAY(&vha->stats.hw_proc_end);
+		} else {
+			/* Command may have been aborted before this handler is executed */
+			vha->irq_status = 0;
+			vha->irq_count = 0;
+			vha->stream_count = 0;
+		}
 		spin_unlock(&vha->irq_lock);
 
 		ret = IRQ_WAKE_THREAD;
@@ -400,19 +460,30 @@ static bool vha_rollback_cnn_cmds(struct vha_dev *vha)
 	/* Not processed commands are still on the pending list
 	 * of each session, so just mark the hw pending lists as empty */
 	if (vha->pendcmd[VHA_CNN_CMD].cmd) {
-		vha->pendcmd[VHA_CNN_CMD].cmd->in_hw = false;
-		vha->pendcmd[VHA_CNN_CMD].cmd->queued = false;
-		vha->pendcmd[VHA_CNN_CMD].cmd = NULL;
+		struct vha_cmd *pendcmd = vha->pendcmd[VHA_CNN_CMD].cmd;
+		pendcmd->in_hw = false;
+		pendcmd->queued = false;
+		pendcmd->rolled_back = true;
 		processing = true;
-		vha->stats.cnn_kicks_aborted++;
+		vha->stats.cnn_kicks_aborted += pendcmd->subseg_current;
+		vha->stats.cnn_kicks_completed -= pendcmd->subsegs_completed;
+		vha->pri_q_counters[pendcmd->user_cmd.priority] += pendcmd->subseg_current;
+		pendcmd->subseg_current = 0;
+		pendcmd->subsegs_completed = 0;
+		vha->pendcmd[VHA_CNN_CMD].cmd = NULL;
 	}
 	/* low_latency ...*/
 	if (vha->queuedcmd[VHA_CNN_CMD].cmd) {
-		vha->queuedcmd[VHA_CNN_CMD].cmd->in_hw = false;
-		vha->queuedcmd[VHA_CNN_CMD].cmd->queued = false;
+		struct vha_cmd *queuedcmd = vha->queuedcmd[VHA_CNN_CMD].cmd;
+		queuedcmd->in_hw = false;
+		queuedcmd->queued = false;
+		queuedcmd->rolled_back = true;
+		vha->stats.cnn_kicks_aborted += queuedcmd->subseg_current;
+		vha->stats.cnn_kicks_completed -= queuedcmd->subsegs_completed;
+		vha->pri_q_counters[queuedcmd->user_cmd.priority] += queuedcmd->subseg_current;
+		queuedcmd->subseg_current = 0;
+		queuedcmd->subsegs_completed = 0;
 		vha->queuedcmd[VHA_CNN_CMD].cmd = NULL;
-		if (vha->low_latency == VHA_LL_SELF_KICK)
-			vha->stats.cnn_kicks_aborted++;
 	}
 	dev_dbg(vha->dev, "%s: (%d)\n", __func__, processing);
 
@@ -424,17 +495,34 @@ bool vha_rollback_cmds(struct vha_dev *vha)
 	return vha_rollback_cnn_cmds(vha);
 }
 
+static bool vha_is_processing(struct vha_dev *vha)
+{
+	return vha->pendcmd[VHA_CNN_CMD].cmd != NULL;
+}
+
+int vha_dev_suspend_work(struct vha_dev *vha)
+{
+	bool processing = false;
+	int ret;
+
+	/* Check if anything is being processed right now. */
+	processing = vha_is_processing(vha);
+	/* Forcing hardware disable. */
+	ret = vha_dev_stop(vha, processing);
+	/* Rollback commands after hw is stopped. */
+	vha_rollback_cmds(vha);
+
+	return ret;
+}
+
 /*
- * handles the command (of given cmd_idx) already processed by the hw.
+ * handles the command already processed by the hw.
  */
-static bool vha_handle_cmd(struct vha_dev *vha, int cmd_idx, int status)
+static bool vha_handle_cmd(struct vha_dev *vha, int status)
 {
 	struct vha_cmd *cmd = NULL;
 
-	if (cmd_idx >= VHA_CMD_MAX)
-		return false;
-
-	cmd = vha->pendcmd[cmd_idx].cmd;
+	cmd = vha->pendcmd[VHA_CNN_CMD].cmd;
 	if (unlikely(!cmd)) {
 		dev_dbg(vha->dev, "No command. Probably it has been aborted\n");
 		return false;
@@ -442,10 +530,10 @@ static bool vha_handle_cmd(struct vha_dev *vha, int cmd_idx, int status)
 
 	{
 		uint64_t proc_time = 0;
-		struct timespec *from = &cmd->hw_proc_start;
-		struct timespec *to = &vha->stats.hw_proc_end;
+		struct TIMESPEC *from = &cmd->hw_proc_start;
+		struct TIMESPEC *to = &vha->stats.hw_proc_end;
 
-		if (timespec_compare(&vha->stats.hw_proc_end_prev, &cmd->hw_proc_start) >= 0)
+		if (TIMESPEC_COMPARE(&vha->stats.hw_proc_end_prev, &cmd->hw_proc_start) >= 0)
 			from = &vha->stats.hw_proc_end_prev;
 
 		if (get_timespan_us(from, to, &proc_time)) {
@@ -455,44 +543,78 @@ static bool vha_handle_cmd(struct vha_dev *vha, int cmd_idx, int status)
 		}
 		/* Update cnn stats */
 		vha_cnn_update_stats(vha);
+
+		/* Update cmd stats. */
+		cmd->proc_us += vha->stats.cnn_last_proc_us;
+		cmd->hw_cycles += vha->stats.cnn_last_cycles;
 	}
 
-	if (cmd_idx == VHA_CNN_CMD)
-		vha_cnn_cmd_completed(cmd, status);
+	/* Mark this subsegment as completed. */
+	if (status == 0)
+		vha->pendcmd[VHA_CNN_CMD].cmd->subsegs_completed++;
+	/* If this isn't the last subsegment, just return to process the next one. */
+	if ((cmd->subseg_current < VHA_CMD_SUBSEG_NUM(cmd)) && (status == 0)) {
+		vha->pendcmd[VHA_CNN_CMD].cmd->in_hw = false;
+		vha->pendcmd[VHA_CNN_CMD].cmd = NULL;
+		return true;
+	}
+
+	vha_cnn_cmd_completed(cmd, status);
 
 	if (status) {
 		/* Rollback any queued command ... */
 		vha_rollback_cnn_cmds(vha);
+		/* Adjust for just rolled back pending cmd. */
+		vha->pri_q_counters[cmd->user_cmd.priority] -= VHA_CMD_SUBSEG_NUM(cmd);
 		/* Notify immediately current command */
 		vha_cmd_notify(cmd);
 
 		return false;
 	}
 
-	if (vha->queuedcmd[cmd_idx].cmd)
-		vha->pendcmd[cmd_idx].cmd = vha->queuedcmd[cmd_idx].cmd;
+	if (vha->queuedcmd[VHA_CNN_CMD].cmd)
+		vha->pendcmd[VHA_CNN_CMD].cmd = vha->queuedcmd[VHA_CNN_CMD].cmd;
 	else
-		vha->pendcmd[cmd_idx].cmd = NULL;
+		vha->pendcmd[VHA_CNN_CMD].cmd = NULL;
 
-	vha->queuedcmd[cmd_idx].cmd = NULL;
-	dev_dbg(vha->dev,
-			"%s: %p -> new pending %p\n",
-			__func__, cmd, vha->pendcmd[cmd_idx].cmd);
+	vha->queuedcmd[VHA_CNN_CMD].cmd = NULL;
+	if (vha->pendcmd[VHA_CNN_CMD].cmd)
+		dev_dbg(vha->dev,
+				"%s: 0x%08x/%u -> new pending: 0x%08x/%u\n",
+				__func__,
+				cmd->user_cmd.cmd_id, cmd->session->id,
+				vha->pendcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id,
+				vha->pendcmd[VHA_CNN_CMD].cmd->session->id);
+	else
+		dev_dbg(vha->dev,
+				"%s: 0x%08x/%u -> new pending: none\n",
+				__func__,
+				cmd->user_cmd.cmd_id, cmd->session->id);
 
 	vha_cmd_notify(cmd);
 
 	return true;
 }
 
-static void vha_do_queued_cmd(struct vha_dev *vha, int cmd_idx)
+static void vha_do_queued_cmd(struct vha_dev *vha)
 {
 	struct vha_cmd *cmd, *pend;
 
-	cmd = vha->queuedcmd[cmd_idx].cmd;
+	cmd = vha->queuedcmd[VHA_CNN_CMD].cmd;
+	/* store actual pending command as it will be modified */
+	pend = vha->pendcmd[VHA_CNN_CMD].cmd;
 
-	dev_dbg(vha->dev,
-			"%s: queued %p pending %p\n",
-			__func__, cmd, vha->pendcmd[cmd_idx].cmd);
+	if (cmd)
+		dev_dbg(vha->dev,
+				"%s: queued: 0x%08x/%u, pending: 0x%08x/%u\n",
+				__func__,
+				cmd->user_cmd.cmd_id, cmd->session->id,
+				pend->user_cmd.cmd_id, pend->session->id);
+	else
+		dev_dbg(vha->dev,
+				"%s: queued: none, pending: 0x%08x/%u\n",
+				__func__,
+				pend->user_cmd.cmd_id, pend->session->id);
 
 	if (!cmd || (cmd &&
 				((vha->low_latency == VHA_LL_DISABLED ||
@@ -502,14 +624,11 @@ static void vha_do_queued_cmd(struct vha_dev *vha, int cmd_idx)
 		return;
 	}
 
-	/* store actual pending command as it will be modified */
-	pend = vha->pendcmd[cmd_idx].cmd;
-
 	/* at this point we should be able to process the cmd */
 	vha_do_cnn_cmd(cmd);
 
 	/* restore pending */
-	vha->pendcmd[cmd_idx].cmd = pend;
+	vha->pendcmd[VHA_CNN_CMD].cmd = pend;
 }
 
 static int vha_report_failure(struct vha_dev *vha, uint64_t status,
@@ -518,12 +637,15 @@ static int vha_report_failure(struct vha_dev *vha, uint64_t status,
 	int error = 0;
 	int i;
 	int cmdid = -1;
+	int sesid = -1;
 
-	if (vha->pendcmd[VHA_CNN_CMD].cmd)
+	if (vha->pendcmd[VHA_CNN_CMD].cmd) {
 		cmdid = vha->pendcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id;
+		sesid = vha->pendcmd[VHA_CNN_CMD].cmd->session->id;
+	}
 
 	if (vha_observers.error)
-		vha_observers.error(vha->id, cmdid, status);
+		vha_observers.error(vha->id, sesid, cmdid, status);
 
 	/* event status in human readable form */
 	for (i = 0; i < bits_size; i++) {
@@ -566,9 +688,9 @@ static int vha_handle_cnn_event(struct vha_dev *vha, uint64_t event_status)
 	/* Poke the hw if there were already
 	 * command queued in the hw */
 	if (!err)
-		vha_do_queued_cmd(vha, VHA_CNN_CMD);
+		vha_do_queued_cmd(vha);
 	/* Handle actual command */
-	if (vha_handle_cmd(vha, VHA_CNN_CMD, err) == false)
+	if (vha_handle_cmd(vha, err) == false)
 		err = -ENOENT;
 
 	return err;
@@ -585,9 +707,10 @@ void vha_dummy_worker(struct work_struct *work)
 	if (vha->pendcmd[VHA_CNN_CMD].cmd) {
 		/* Record hw processing end timestamps */
 		vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
-		getnstimeofday(&vha->stats.hw_proc_end);
+		GETNSTIMEOFDAY(&vha->stats.hw_proc_end);
 		/* Handle current pending command */
 		vha_handle_cnn_event(vha, VHA_CNN_CMPLT_EVNT);
+		vha->stats.cnn_kicks_completed++;
 		/* Schedule following commands */
 		vha_chk_cmd_queues(vha, true);
 	}
@@ -610,6 +733,16 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 
 	mutex_lock(&vha->lock);
 
+#ifdef CONFIG_FAULT_INJECTION
+	if (!vha->irq_bh_pid)
+		vha->irq_bh_pid = task_pid_nr(current);
+
+	if (vha->fault_inject & VHA_FI_IRQ_WORKER)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+
 	spin_lock_irq(&vha->irq_lock);
 	status = vha->irq_status;
 	vha->irq_status = 0;
@@ -627,10 +760,14 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 	}
 	spin_unlock_irq(&vha->irq_lock);
 	/* Command may have been aborted before this handler is executed */
-	if (!status) {
-		mutex_unlock(&vha->lock);
-		return ret;
-	}
+	if (!status)
+		goto exit;
+
+	/* There can be two inferences already finished for self kick mode,
+	 * otherwise, only single inference at the time */
+	if ((vha->low_latency == VHA_LL_SELF_KICK && count > 2) ||
+			(vha->low_latency != VHA_LL_SELF_KICK && count > 1))
+		WARN_ON(1);
 
 	dev_dbg(dev, "%s: status:%llx count:%d\n",
 			__func__, status, count);
@@ -652,22 +789,9 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 			};
 
 #ifdef HW_AX3
-			if (status & VHA_EVENT_TYPE(HL_WDT)
-					&& vha->is_ready)
+			if (status & VHA_EVENT_TYPE(HL_WDT))
 				if (vha_check_calibration(vha))
 					break;
-
-			if ((status & VHA_CORE_EVNTS)==
-					VHA_EVENT_TYPE(READY)
-					&& !vha->is_ready) {
-				vha->is_ready = true;
-				vha_dev_ready(vha);
-				if (vha->do_calibration) {
-					vha_cnn_start_calib(vha);
-					break;
-				} else
-					vha_chk_cmd_queues(vha, true);
-			}
 #endif
 
 			err = vha_report_failure(vha, status,
@@ -695,8 +819,8 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 			vha_rollback_cnn_cmds(vha);
 		}
 #endif
-		else if (err && vha->is_ready) { /* Core level error */
-			if (vha_handle_cmd(vha, VHA_CNN_CMD, err) == false)
+		else if (err) { /* Core level error */
+			if (vha_handle_cmd(vha, err) == false)
 				err = -ENOENT;
 		}
 
@@ -713,6 +837,12 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 		vha_chk_cmd_queues(vha, false);
 	}
 	vha->stats.cnn_kicks_completed += count;
+
+exit:
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_IRQ_WORKER)
+		current->make_it_fail = false;
+#endif
 	mutex_unlock(&vha->lock);
 
 	return ret;
@@ -724,6 +854,8 @@ bool vha_rm_session_cmds(struct vha_session *session)
 	bool pend_removed = false;
 	bool queued_removed = false;
 	bool reschedule = false;
+	struct vha_cmd *cur_cmd, *tmp_cmd;
+	uint8_t pri;
 
 	/* Check if pend/queued commands will be removed. */
 	if (vha->pendcmd[VHA_CNN_CMD].cmd &&
@@ -745,12 +877,13 @@ bool vha_rm_session_cmds(struct vha_session *session)
 	/* Update session scheduling. */
 	if (vha->queuedcmd[VHA_CNN_CMD].cmd &&
 			(pend_removed && !queued_removed)) {
+		uint8_t pri = vha->queuedcmd[VHA_CNN_CMD].cmd->user_cmd.priority;
 		if (vha->queuedcmd[VHA_CNN_CMD].cmd->session !=
-					list_entry(&vha->sched_sessions, struct vha_session,
-								sched_list))
-			while(list_first_entry(&vha->sched_sessions, struct vha_session,
-						sched_list) != vha->queuedcmd[VHA_CNN_CMD].cmd->session)
-				list_rotate_left(&vha->sched_sessions);
+					list_entry(&vha->sched_sessions[pri], struct vha_session,
+								sched_list[pri]))
+			while(list_first_entry(&vha->sched_sessions[pri], struct vha_session,
+						sched_list[pri]) != vha->queuedcmd[VHA_CNN_CMD].cmd->session)
+				list_rotate_left(&vha->sched_sessions[pri]);
 	}
 
 	/* Remove pend/queued commands if needed. */
@@ -758,6 +891,22 @@ bool vha_rm_session_cmds(struct vha_session *session)
 		vha_rollback_cnn_cmds(vha);
 		/* Need to reschedule too. */
 		reschedule = true;
+	}
+
+	/* Remove session related commands. */
+	for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++) {
+		list_for_each_entry_safe(cur_cmd, tmp_cmd, &session->cmds[pri], list[pri]) {
+			/* rsp didn't make it to rsps list, free it now */
+			kfree(cur_cmd->rsp);
+
+			list_del(&cur_cmd->list[cur_cmd->user_cmd.priority]);
+			vha->pri_q_counters[cur_cmd->user_cmd.priority] -=
+								(VHA_CMD_SUBSEG_NUM(cur_cmd) - cur_cmd->subseg_current);
+			if (vha_observers.canceled)
+				vha_observers.canceled(vha->id, session->id, cur_cmd->user_cmd.cmd_id,
+										cur_cmd->user_cmd.priority);
+			kfree(cur_cmd);
+		}
 	}
 
 	return reschedule;
@@ -769,7 +918,9 @@ bool vha_rm_session_cmds_masked(struct vha_session *session, uint32_t cmd_id,
 	struct vha_dev *vha = session->vha;
 	bool reschedule = false;
 	bool pend_removed = false;
+	uint32_t pend_aborted_kicks_adj_val = 0;
 	bool queued_removed = false;
+	uint32_t queued_aborted_kicks_adj_val = 0;
 
 	/* Check if pend/queued commands will be removed. */
 	if (vha->pendcmd[VHA_CNN_CMD].cmd &&
@@ -777,6 +928,8 @@ bool vha_rm_session_cmds_masked(struct vha_session *session, uint32_t cmd_id,
 			(vha->pendcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id & cmd_id_mask)
 																	== cmd_id) {
 		pend_removed = true;
+		vha->stats.cnn_kicks_cancelled += vha->pendcmd[VHA_CNN_CMD].cmd->subseg_current;
+		pend_aborted_kicks_adj_val = vha->pendcmd[VHA_CNN_CMD].cmd->subseg_current;
 #ifdef CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME
 		cancel_delayed_work(&vha->dummy_dwork);
 #endif
@@ -786,35 +939,151 @@ bool vha_rm_session_cmds_masked(struct vha_session *session, uint32_t cmd_id,
 			(vha->queuedcmd[VHA_CNN_CMD].cmd->user_cmd.cmd_id & cmd_id_mask)
 																	== cmd_id) {
 		queued_removed = true;
+		vha->stats.cnn_kicks_cancelled += vha->queuedcmd[VHA_CNN_CMD].cmd->subseg_current;
+		queued_aborted_kicks_adj_val = vha->queuedcmd[VHA_CNN_CMD].cmd->subseg_current;
 	}
 
 	/* Update session scheduling. */
 	if (vha->queuedcmd[VHA_CNN_CMD].cmd &&
 			(pend_removed && !queued_removed)) {
+		uint8_t pri = vha->queuedcmd[VHA_CNN_CMD].cmd->user_cmd.priority;
 		if (vha->queuedcmd[VHA_CNN_CMD].cmd->session !=
-					list_entry(&vha->sched_sessions, struct vha_session,
-								sched_list))
-			while(list_first_entry(&vha->sched_sessions, struct vha_session,
-						sched_list) != vha->queuedcmd[VHA_CNN_CMD].cmd->session)
-				list_rotate_left(&vha->sched_sessions);
+					list_entry(&vha->sched_sessions[pri], struct vha_session,
+								sched_list[pri]))
+			while(list_first_entry(&vha->sched_sessions[pri], struct vha_session,
+						sched_list[pri]) != vha->queuedcmd[VHA_CNN_CMD].cmd->session)
+				list_rotate_left(&vha->sched_sessions[pri]);
 	}
 
 	/* Remove pend/queued commands if needed. */
 	if (pend_removed || queued_removed) {
 		vha_rollback_cnn_cmds(vha);
+		/* Correct aborted stats. */
+		if (queued_removed)
+			vha->stats.cnn_kicks_aborted -= queued_aborted_kicks_adj_val;
+		if (pend_removed)
+			vha->stats.cnn_kicks_aborted -= pend_aborted_kicks_adj_val;
 		reschedule = true;
 	}
 
 	return reschedule;
 }
 
-bool vha_is_busy(struct vha_dev *vha)
+int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
+		uint32_t cmd_id_mask, bool respond)
 {
-#ifndef CONFIG_VHA_DUMMY
-	if (!vha->is_ready)
-		return true;
+	struct vha_dev *vha = session->vha;
+	struct vha_cmd *cur_cmd, *tmp_cmd;
+	struct vha_rsp *cur_rsp, *tmp_rsp;
+	bool reschedule = false;
+	bool respond_aux = false;
+	int ret = 0;
+	uint8_t pri;
+
+	mutex_lock(&vha->lock);
+
+	/* Remove pend/queued session commands that match the cmd_id. */
+	reschedule = vha_rm_session_cmds_masked(session, cmd_id, cmd_id_mask);
+
+	/* Remove session related commands matching command id template. */
+	for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++) {
+		list_for_each_entry_safe(cur_cmd, tmp_cmd, &session->cmds[pri], list[pri]) {
+			if ((cur_cmd->user_cmd.cmd_id & cmd_id_mask) == cmd_id) {
+
+#ifdef KERNEL_DMA_FENCE_SUPPORT
+				switch (cur_cmd->user_cmd.cmd_type)
+				{
+				case VHA_CMD_CNN_SUBMIT:
+				{
+					struct vha_user_cnn_submit_cmd *cnn_cmd =
+							(struct vha_user_cnn_submit_cmd *)&cur_cmd->user_cmd;
+					int j;
+					for (j = 0; j < (cnn_cmd->msg.num_bufs - 1); j++) {
+						struct vha_buffer *buf = vha_find_bufid(session, cnn_cmd->bufs[j]);
+						if (buf == NULL) {
+							dev_warn(vha->dev, "%s: could not find buf %x\n", __func__,
+											cnn_cmd->bufs[j]);
+						} else {
+							vha_rm_buf_fence(session, buf);
+						}
+					}
+					break;
+				}
+				default:
+					dev_warn(vha->dev, "%s: invalid cmd type %x\n", __func__,
+								cur_cmd->user_cmd.cmd_type);
+					break;
+				}
 #endif
 
+				/* rsp didn't make it to rsps list; free it now. */
+				kfree(cur_cmd->rsp);
+
+				list_del(&cur_cmd->list[cur_cmd->user_cmd.priority]);
+				vha->pri_q_counters[cur_cmd->user_cmd.priority] -=
+								(VHA_CMD_SUBSEG_NUM(cur_cmd) - cur_cmd->subseg_current);
+				if (vha_observers.canceled)
+					vha_observers.canceled(vha->id, session->id, cur_cmd->user_cmd.cmd_id,
+											cur_cmd->user_cmd.priority);
+				kfree(cur_cmd);
+
+				/* There were commands matching command id template in the list,
+				 * so respond to wake user space. */
+				respond_aux = true;
+			}
+		}
+	}
+
+	/* Remove responses for session related commands
+	 * matching command id template. */
+	list_for_each_entry_safe(cur_rsp, tmp_rsp, &session->rsps, list) {
+		if ((cur_rsp->user_rsp.cmd_id & cmd_id_mask) == cmd_id) {
+			list_del(&cur_rsp->list);
+			kfree(cur_rsp);
+			respond_aux = true;
+		}
+	}
+
+	/* Reset hardware if required. */
+	if (reschedule)
+		ret = vha_dev_stop(vha, reschedule);
+
+	/* Generate "cancel" response if any commands matching command id template
+	 * were removed. */
+	if (respond_aux && respond) {
+		/* Calculate space for the response. */
+		size_t sz = sizeof(struct vha_rsp)
+			+ sizeof(struct vha_user_cnn_submit_rsp)
+			- sizeof(struct vha_user_rsp);
+		/* Allocate space for standard response. */
+		struct vha_rsp *rsp = kzalloc(sz, GFP_KERNEL);
+		if (rsp == NULL) {
+			dev_crit(session->vha->dev,
+					"Failed to allocate memory to notify cancel for cmds 0x%08x\n", cmd_id);
+			session->oom = true;
+		} else {
+			rsp->size = sizeof(struct vha_user_cnn_submit_rsp);
+			rsp->user_rsp.cmd_id = cmd_id;
+			list_add_tail(&rsp->list, &session->rsps);
+		}
+		wake_up(&session->wq);
+	}
+
+	mutex_unlock(&vha->lock);
+
+	/* Just return in case of oom. */
+	if (session->oom)
+		return -ENOMEM;
+
+	/* Reschedule once all commands matching command id template are removed. */
+	if (reschedule)
+		vha_chk_cmd_queues(vha, true);
+
+	return ret;
+}
+
+bool vha_is_busy(struct vha_dev *vha)
+{
 	if (vha->low_latency != VHA_LL_DISABLED) {
 		return vha->pendcmd[VHA_CNN_CMD].cmd != NULL ||
 				vha->queuedcmd[VHA_CNN_CMD].cmd != NULL;
@@ -851,14 +1120,79 @@ bool vha_is_queue_full(struct vha_dev *vha, struct vha_cmd *cmd)
 	return vha->pendcmd[VHA_CNN_CMD].cmd != NULL;
 }
 
+/* check all input buffers are filled and ready to go */
+bool vha_is_waiting_for_inputs(struct vha_session *session,
+	struct vha_cmd *cmd)
+{
+	if (!cmd->inbufs_ready) {
+		const struct vha_user_cnn_submit_cmd *user_cmd =
+			(struct vha_user_cnn_submit_cmd *)&cmd->user_cmd;
+		int i;
+
+		for (i = 0; i < cmd->user_cmd.num_inbufs - 1; i++) {
+			struct vha_buffer *buf = vha_find_bufid(session, user_cmd->bufs[i]);
+
+			if (buf && buf->status == VHA_BUF_UNFILLED) {
+				dev_dbg(session->vha->dev,
+					"%s: cmd %u waiting for input "
+					"buf %d to be ready\n",
+					__func__,
+					cmd->user_cmd.cmd_id,
+					buf->id);
+				return true;
+			}
+		}
+	}
+
+	cmd->inbufs_ready = true;
+	return false;
+}
+
+static bool vha_can_schedule(struct vha_dev *vha)
+{
+	if (vha->low_latency != VHA_LL_DISABLED) {
+		return vha->pendcmd[VHA_CNN_CMD].cmd == NULL ||
+				vha->queuedcmd[VHA_CNN_CMD].cmd == NULL;
+	}
+	return vha->pendcmd[VHA_CNN_CMD].cmd == NULL;
+}
+
+static void vha_scheduler_set_starting_session(struct vha_dev *vha,
+	uint8_t priority, struct vha_session *session, bool set_next)
+{
+	/* Rotate scheduling list to the current session
+	 * to make it a starting point for the next scheduling round. */
+	if (session != list_entry(&vha->sched_sessions[priority],
+								struct vha_session, sched_list[priority]))
+		while(list_first_entry(&vha->sched_sessions[priority],
+								struct vha_session, sched_list[priority]) != session)
+			list_rotate_left(&vha->sched_sessions[priority]);
+	/* Set a starting point session for the next scheduling round
+	 * to next to the current one if requested. */
+	if (set_next)
+		list_rotate_left(&vha->sched_sessions[priority]);
+}
+
+static uint8_t vha_scheduler_get_priority(struct vha_dev *vha)
+{
+	uint8_t pri;
+
+	/* Calculate current total window width. */
+	for (pri = VHA_MAX_PRIORITIES - 1; (int8_t)pri >= 0; pri--)
+		if (vha->pri_q_counters[pri] > 0)
+			return pri;
+
+	/* If there's no priority with WLs to schedule, just return 0. */
+	return VHA_INVALID_PRI;
+}
+
 void vha_scheduler_loop(struct vha_dev *vha)
 {
 	struct vha_cmd *cmd, *tmp;
-	struct vha_session *session, *wait_session = NULL;
-	bool queued, in_hw;
-	bool retry = false;
-	bool retrying = false;
+	struct vha_session *session = NULL;
 	enum do_cmd_status cmd_status = CMD_OK;
+	bool scheduled = false;
+	uint8_t current_pri = VHA_DEFAULT_PRI;
 
 	if (vha_is_queue_full(vha, NULL)) {
 		/* Postpone worker task if command queue is full. */
@@ -867,12 +1201,13 @@ void vha_scheduler_loop(struct vha_dev *vha)
 	}
 
 	do {
-		list_for_each_entry(session, &vha->sched_sessions, sched_list) {
-			list_for_each_entry_safe(cmd, tmp, &session->cmds, list) {
+		scheduled = false;
+		current_pri = vha_scheduler_get_priority(vha);
+		if (current_pri == VHA_INVALID_PRI)
+			break;
+		list_for_each_entry(session, &vha->sched_sessions[current_pri], sched_list[current_pri]) {
+			list_for_each_entry_safe(cmd, tmp, &session->cmds[current_pri], list[current_pri]) {
 
-				/* Reset previous state. */
-				queued = false;
-				in_hw = false;
 				/* For hw commands... */
 				if (CMD_EXEC_ON_HW(cmd)) {
 					if (!VHA_IS_DUMMY(vha)) {
@@ -880,10 +1215,11 @@ void vha_scheduler_loop(struct vha_dev *vha)
 						if(vha_dev_start(vha))
 							return;
 					}
-					/* Store previous state. */
-					queued = cmd->queued;
-					in_hw = cmd->in_hw;
 				}
+
+				/* Skip this workload as it's already scheduled. */
+				if (cmd->queued || cmd->in_hw)
+					continue;
 
 				/* Attempt to schedule command for execution. */
 				cmd_status = vha_do_cmd(cmd);
@@ -891,90 +1227,22 @@ void vha_scheduler_loop(struct vha_dev *vha)
 					continue;
 				}
 
-				/* For hw commands... */
-				if (CMD_EXEC_ON_HW(cmd)) {
-					/* For low latency processing... */
-					if (vha->low_latency != VHA_LL_DISABLED) {
-						if (cmd->in_hw) {
-							if (!retrying) {
-								/* Set for retrying in case nothing will be queued
-								 * in this round */
-								retry = true;
-							} else {
-								/* Retry only once. */
-								retry = false;
-								/* It's a retry round, so nothing was queued in the previous
-								 * one. Check the command following the one in the hardware
-								 * for this session then. */
-								continue;
-							}
-							/* If command is already in hw, go to next session. */
-							break;
-						}
-						if (!cmd->inbufs_ready) {
-							/* If command is waiting for input buffers, set this session
-							 * as a starting point for next scheduling round. */
-							if (wait_session == NULL)
-								wait_session = session;
-							/* Go to the next session. */
-							break;
-						}
-						if (cmd->queued != queued) {
-							/* If command has just been queued, set following session
-							 * as a starting point for the next scheduling round. */
-							if (wait_session == NULL) {
-								wait_session = list_next_entry(session, sched_list);
-								if (&wait_session->sched_list == &vha->sched_sessions)
-									wait_session = list_first_entry(&vha->sched_sessions,
-																	struct vha_session,
-																	sched_list);
-							}
-							/* Quit this scheduling round as there's no room for more
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-						if (cmd->queued == queued && cmd->in_hw == in_hw) {
-							/* If command has neither been scheduled for execution nor queued,
-							 * quit this scheduling round as there's no room for
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-					} else {
-						/* For non low latency processing... */
-						if (cmd->in_hw) {
-							/* If command is already in hw, set following session
-							 * as a starting point for the next scheduling round. */
-							if (wait_session == NULL) {
-								wait_session = list_next_entry(session, sched_list);
-								if (&wait_session->sched_list == &vha->sched_sessions)
-									wait_session = list_first_entry(&vha->sched_sessions,
-																	struct vha_session,
-																	sched_list);
-							}
-							/* Quit this scheduling round as there's no room for more
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
-						if (!cmd->inbufs_ready) {
-							/* If command is waiting for input buffers, set this session
-							 * as a starting point for next scheduling round. */
-							if (wait_session == NULL)
-								wait_session = session;
-							/* Go to the next session. */
-							break;
-						}
-						if (cmd->in_hw == in_hw) {
-							/* If command has not been scheduled for execution,
-							 * quit this scheduling round as there's no room for
-							 * commands to be scheduled. */
-							goto skip_cmds;
-						}
+				/* Update scheduling loop based on command scheduling status. */
+				if ((cmd_status == CMD_OK) || (cmd_status == CMD_HW_BUSY)) {
+					bool set_next = false;
+					if (cmd_status == CMD_OK) {
+						scheduled = true;
+						if (cmd->subseg_current == VHA_CMD_SUBSEG_NUM(cmd))
+							set_next = true;
 					}
+					vha_scheduler_set_starting_session(vha, current_pri, session, set_next);
+					goto exit_session_loop;
 				}
 			}
 		}
-		retrying = true;
-	} while (retry);
+exit_session_loop:;
+	/* Iterate until a workload was scheduled and no other can be scheduled. */
+	} while (vha_can_schedule(vha) && scheduled);
 
 	if (!VHA_IS_DUMMY(vha)) {
 		/* Schedule APM if needed */
@@ -988,20 +1256,12 @@ void vha_scheduler_loop(struct vha_dev *vha)
 						dev_err(vha->dev, "%s: Failed to stop device with reset!", __func__);
 				}
 			}
-			else
+			else {
+				vha->apm_dworks[0].delay_ms = vha->pm_delay;
 				vha_sched_apm(vha, &vha->apm_dworks[0]);
+			}
 		}
 	}
-
-skip_cmds:
-	/* Set a starting point session for next scheduling round. */
-	if (wait_session != NULL)
-		session = wait_session;
-	if (session != list_entry(&vha->sched_sessions, struct vha_session,
-														sched_list))
-		while(list_first_entry(&vha->sched_sessions, struct vha_session,
-													sched_list) != session)
-			list_rotate_left(&vha->sched_sessions);
 }
 
 void vha_dev_apm_stop(struct vha_dev *vha, struct vha_apm_work *apm_work)
@@ -1019,7 +1279,7 @@ void vha_dev_apm_stop(struct vha_dev *vha, struct vha_apm_work *apm_work)
 
 int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 {
-	struct vha_core_props *props = &vha->core_props;
+	struct vha_hw_props *props = &vha->hw_props;
 	uint64_t ip_config;
 	uint32_t ocm_size_kb = 0;
 
@@ -1029,7 +1289,7 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 	/* Note: dummy dev always reads zeroes from registers */
 	props->product_id  = 0x8070605040302010ULL;
 	props->core_id  = (long)HW_SERIES << (int)VHA_CR_CORE_ID_BRANCH_ID_SHIFT;
-	props->core_id += 0x010203040506ULL;   // provide a dummy core id
+	props->core_id += 0x010203040505ULL;   // provide a dummy core id
 	props->dummy_dev = true;
 	props->num_cnn_core_devs = 1;
 #else
@@ -1050,7 +1310,6 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 	/* Mirage uses MMU version 3 hardware */
 	if (!props->mmu_ver)
 		props->mmu_ver = 3;
-			;
 	if (VHA_CR_GETBITS(CORE_IP_CONFIG, CNN_SUPPORTED, ip_config))
 		props->num_cnn_core_devs = 1;
 	if (VHA_CR_GETBITS(CORE_IP_CONFIG, RTM_SUPPORTED, ip_config))
@@ -1103,24 +1362,24 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 #endif
 
 	if (ocm_size_kb) {
-		vha->core_props.locm_size_bytes = ocm_size_kb * 1024;
+		vha->hw_props.locm_size_bytes = ocm_size_kb * 1024;
 		/* User may wanted to limit OCM ... */
 		if (onchipmem_size) {
-			if (onchipmem_size < vha->core_props.locm_size_bytes) {
+			if (onchipmem_size < vha->hw_props.locm_size_bytes) {
 				dev_warn(vha->dev, "%s:Limiting onchip memory to %u bytes (available:%u)\n",
-						__func__, onchipmem_size, vha->core_props.locm_size_bytes);
-				vha->core_props.locm_size_bytes = onchipmem_size;
-			} else if (onchipmem_size > vha->core_props.locm_size_bytes) {
+						__func__, onchipmem_size, vha->hw_props.locm_size_bytes);
+				vha->hw_props.locm_size_bytes = onchipmem_size;
+			} else if (onchipmem_size > vha->hw_props.locm_size_bytes) {
 				dev_err(vha->dev, "%s: User defined onchip memory size exceeded (%u > %u))\n",
-						__func__, onchipmem_size, vha->core_props.locm_size_bytes);
+						__func__, onchipmem_size, vha->hw_props.locm_size_bytes);
 			}
 		}
 	} else {
-		vha->core_props.locm_size_bytes = onchipmem_size;
+		vha->hw_props.locm_size_bytes = onchipmem_size;
 	}
 
 	dev_info(vha->dev, "%s: Total onchip memory: %u [kB]\n",
-			__func__, vha->core_props.locm_size_bytes / 1024);
+			__func__, vha->hw_props.locm_size_bytes / 1024);
 
 	dev_info(vha->dev, "%s: Devices: DUMMY:%u CNN:%u\n", __func__,
 			props->dummy_dev ? props->num_cnn_core_devs : 0,
@@ -1134,25 +1393,26 @@ void vha_dev_ocm_configure(struct vha_dev *vha)
 #if defined(CFG_SYS_VAGUS)
 	dev_dbg(vha->dev, "%s: OCM address range: %#lx - %#lx\n",
 			__func__, vha->ocm_paddr,
-			vha->ocm_paddr + vha->core_props.locm_size_bytes - 1);
+			vha->ocm_paddr + vha->hw_props.locm_size_bytes - 1);
 	IOWRITE64(vha->reg_base, NN_SYS_CR(NOC_LOWER_ADDR1), vha->ocm_paddr);
 	IOWRITE64(vha->reg_base, NN_SYS_CR(NOC_UPPER_ADDR1),
-			vha->ocm_paddr + vha->core_props.locm_size_bytes - 1);
+			vha->ocm_paddr + vha->hw_props.locm_size_bytes - 1);
 	img_pdump_printf("-- Setup NN_SYS OCM phys address range\n"
 		"WRW "_PMEM_":$0 :OCM:BLOCK_CACHE:0x0\n"
 		"WRW64 :REG_NNSYS:%#x "_PMEM_":$0\n"
 		"WRW "_PMEM_":$0 :OCM:BLOCK_CACHE:%#x\n"
 		"WRW64 :REG_NNSYS:%#x "_PMEM_":$0\n",
-		NN_SYS_CR_NOC_LOWER_ADDR1, vha->core_props.locm_size_bytes-1,
+		NN_SYS_CR_NOC_LOWER_ADDR1, vha->hw_props.locm_size_bytes-1,
 		NN_SYS_CR_NOC_UPPER_ADDR1);
 #endif
 }
 
 /* prepare CRC and DEBUG data buffers */
-void vha_dbg_prepare_hwbufs(struct vha_session *session, uint8_t mask, struct vha_crc_config_regs *regs)
+void vha_dbg_prepare_hwbufs(struct vha_session *session, struct vha_cmd *cmd,
+		struct vha_crc_config_regs *regs)
 {
 	struct vha_dev *vha = session->vha;
-	(void)mask;
+	(void)cmd;
 
 	if (session->cnn_dbg.cnn_crc_buf[0]) {
 		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf[0];
@@ -1178,23 +1438,21 @@ void vha_dbg_prepare_hwbufs(struct vha_session *session, uint8_t mask, struct vh
 
 		/* enable DEBUG: address, perf mode, band mode */
 		img_pdump_printf("-- DEBUG_CONTROL=%u,%u buf 'DBG' size=%zx\n",
-				session->cnn_dbg.cnn_dbg_modes[0], session->cnn_dbg.cnn_dbg_modes[1],
+				GET_CNN_DBG_MODE(PERF, session), GET_CNN_DBG_MODE(BAND, session),
 				buf->size);
 		IOWRITE_PDUMP_BUFADDR(session, buf, 0,
-					VHA_CR_OS(CNN_DEBUG_ADDRESS));
+							VHA_CR_OS(CNN_DEBUG_ADDRESS));
 		val64 = VHA_CR_ALIGN_SETBITS_OS(CNN_DEBUG_SIZE,
-						CNN_DEBUG_SIZE,
-						buf->size);
+								CNN_DEBUG_SIZE,
+								buf->size);
 		IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_DEBUG_SIZE));
 
 		/* Set the CONTROL register only if requested */
-		if (session->cnn_dbg.cnn_dbg_modes[0] > 0 || session->cnn_dbg.cnn_dbg_modes[1] > 0) {
-			val64 = VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL,
-						 CNN_PERF_ENABLE,
-						 session->cnn_dbg.cnn_dbg_modes[0]);
-			val64 |= VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL,
-						 CNN_BAND_ENABLE,
-						 session->cnn_dbg.cnn_dbg_modes[1]);
+		if (CNN_DBG_MODE_ON(PERF, session) || CNN_DBG_MODE_ON(BAND, session)) {
+			val64 = VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL, CNN_PERF_ENABLE,
+										GET_CNN_DBG_MODE(PERF, session));
+			val64 |= VHA_CR_SETBITS_OS(CNN_DEBUG_CONTROL, CNN_BAND_ENABLE,
+										GET_CNN_DBG_MODE(BAND, session));
 			IOWRITE64_PDUMP(val64, VHA_CR_OS(CNN_DEBUG_CONTROL));
 		}
 	}
@@ -1208,7 +1466,7 @@ void vha_dbg_flush_hwbufs(struct vha_session *session, char checkpoint, uint8_t 
 	if (session->cnn_dbg.cnn_dbg_flush != checkpoint)
 		return;
 
-	if (session->cnn_dbg.cnn_crc_buf[0] && !session->use_cmd_crc_buf) {
+	if (session->cnn_dbg.cnn_crc_buf[0]) {
 		struct vha_buffer *buf = session->cnn_dbg.cnn_crc_buf[0];
 		/*
 		 * TOBEDONE: calculate CRC buffer size based
@@ -1248,14 +1506,14 @@ void vha_dbg_stop_hwbufs(struct vha_session *session, uint8_t mask)
 	/* Flush hw debug buffers */
 	vha_dbg_flush_hwbufs(session, 0, 0);
 
-	if (session->cnn_dbg.cnn_crc_buf[0] || session->use_cmd_crc_buf) {
+	if (session->cnn_dbg.cnn_crc_buf[0]) {
 		IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_CRC_CONTROL));
 	}
 	if (session->cnn_dbg.cnn_dbg_buf[0]) {
 		/* read the size of the DEBUG buffer */
 		uint64_t size = IOREAD64(vha->reg_base, VHA_CR_OS(CNN_DEBUG_STATUS));
 
-		if (session->cnn_dbg.cnn_dbg_modes[0] > 0 || session->cnn_dbg.cnn_dbg_modes[1] > 0) {
+		if (CNN_DBG_MODE_ON(PERF, session) || CNN_DBG_MODE_ON(BAND, session)) {
 			IOWRITE64_PDUMP(0, VHA_CR_OS(CNN_DEBUG_CONTROL));
 			/* just give a hint in the pdump:
 			 * dummy device returns 0 */

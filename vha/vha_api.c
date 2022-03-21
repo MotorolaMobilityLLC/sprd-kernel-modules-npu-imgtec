@@ -40,7 +40,6 @@
  *****************************************************************************/
 
 
-
 #include <linux/slab.h>
 #include <asm/current.h>
 #include <linux/fs.h>
@@ -54,6 +53,7 @@
 #include <linux/pm_runtime.h>
 
 #include <uapi/img_mem_man.h>
+#include <uapi/version.h>
 #include <img_mem_man.h>
 #include "vha_common.h"
 #include "vha_plat.h"
@@ -65,6 +65,12 @@ module_param(default_mem_heap, uint, 0444);
 MODULE_PARM_DESC(default_mem_heap,
 		"default heap to use when allocating device memory,"
 		"when 'invalid' -> user requested id will be used.");
+
+#define VHA_IRQ_FENCE() \
+	do { \
+		spin_lock_irq(&vha->irq_lock); \
+		spin_unlock_irq(&vha->irq_lock); \
+	} while(0)
 
 static void vha_session_pm_get(struct vha_session *session)
 {
@@ -170,9 +176,11 @@ static ssize_t vha_read(struct file *file, char __user *buf,
 	mutex_unlock(&vha->lock);
 	ret = rsp->size;
 
+#if 0
 	print_hex_dump_debug("VHA RSP: ", DUMP_PREFIX_NONE,
 				4, 4, (uint32_t *)&rsp->user_rsp,
 				ALIGN(rsp->size, 4), false);
+#endif
 
 	kfree(rsp);
 
@@ -180,6 +188,33 @@ static ssize_t vha_read(struct file *file, char __user *buf,
 
 out_unlock:
 	mutex_unlock(&vha->lock);
+	return ret;
+}
+
+static ssize_t vha_read_wrapper(struct file *file, char __user *buf,
+			size_t count, loff_t *ppos)
+{
+	ssize_t ret = 0;
+	struct vha_session *session = (struct vha_session *)file->private_data;
+	struct vha_dev *vha = session->vha;
+
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_READ)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+	ret = vha_read(file, buf, count, ppos);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if ((vha->fault_inject & VHA_FI_READ) &&
+			!(vha->fault_inject & VHA_FI_UM))
+		current->make_it_fail = false;
+#endif
+
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
 	return ret;
 }
 
@@ -213,6 +248,32 @@ static unsigned int vha_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
+static unsigned int vha_poll_wrapper(struct file *file, poll_table *wait)
+{
+	unsigned int ret = 0;
+	struct vha_session *session = (struct vha_session *)file->private_data;
+	struct vha_dev *vha = session->vha;
+
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_READ)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+	ret = vha_poll(file, wait);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if ((vha->fault_inject & VHA_FI_READ) &&
+			!(vha->fault_inject & VHA_FI_UM))
+		current->make_it_fail = false;
+#endif
+
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
+	return ret;
+}
+
 /* read a message from user, and queue it up to be sent to hw */
 static ssize_t vha_write(struct file *file, const char __user *buf,
 		size_t size, loff_t *offset)
@@ -226,10 +287,6 @@ static ssize_t vha_write(struct file *file, const char __user *buf,
 	dev_dbg(miscdev->this_device,
 		"%s: PID: %d, vha: %p, session: %p, size: %zu\n",
 		__func__, task_pid_nr(current), vha, session, size);
-
-#ifdef CONFIG_FAULT_INJECTION
-	current->make_it_fail = vha->fault_inject;
-#endif
 
 	if (size < sizeof(struct vha_user_cmd)) {
 		dev_err(miscdev->this_device, "%s: msg too small\n", __func__);
@@ -268,19 +325,43 @@ out_free_item:
 	return ret;
 }
 
+static ssize_t vha_write_wrapper(struct file *file, const char __user *buf,
+		size_t size, loff_t *offset)
+{
+	ssize_t ret = 0;
+	struct vha_session *session = (struct vha_session *)file->private_data;
+	struct vha_dev *vha = session->vha;
+
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_WRITE)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+	ret = vha_write(file, buf, size, offset);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if ((vha->fault_inject & VHA_FI_WRITE) &&
+			!(vha->fault_inject & VHA_FI_UM))
+		current->make_it_fail = false;
+#endif
+
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
+	return ret;
+}
+
 static int vha_open(struct inode *inode, struct file *file)
 {
 	struct miscdevice  *miscdev = (struct miscdevice *)file->private_data;
 	struct vha_dev     *vha = container_of(miscdev, struct vha_dev, miscdev);
 	struct vha_session *session;
 	int ret;
+	uint8_t pri;
 
 	dev_dbg(miscdev->this_device, "%s: PID: %d, vha: %p\n",
 		__func__, task_pid_nr(current), vha);
-
-#ifdef CONFIG_FAULT_INJECTION
-	current->make_it_fail = vha->fault_inject;
-#endif
 
 	session = devm_kzalloc(miscdev->this_device, sizeof(struct vha_session),
 		GFP_KERNEL);
@@ -298,7 +379,8 @@ static int vha_open(struct inode *inode, struct file *file)
 		return ret;
 	}
 
-	INIT_LIST_HEAD(&session->cmds);
+	for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++)
+		INIT_LIST_HEAD(&session->cmds[pri]);
 	INIT_LIST_HEAD(&session->rsps);
 	INIT_LIST_HEAD(&session->bufs);
 	init_waitqueue_head(&session->wq);
@@ -319,13 +401,39 @@ static int vha_open(struct inode *inode, struct file *file)
 	return ret;
 }
 
+static int vha_open_wrapper(struct inode *inode, struct file *file)
+{
+	int ret = 0;
+	struct miscdevice  *miscdev = (struct miscdevice *)file->private_data;
+	struct vha_dev *vha = container_of(miscdev, struct vha_dev, miscdev);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_OPEN)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+	ret = vha_open(inode, file);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if ((vha->fault_inject & VHA_FI_OPEN) &&
+			!(vha->fault_inject & VHA_FI_UM))
+		current->make_it_fail = false;
+#endif
+
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
+	return ret;
+}
+
 static int vha_release(struct inode *inode, struct file *file)
 {
 	struct vha_session *session = (struct vha_session *)file->private_data;
 	struct vha_dev     *vha     = session->vha;
 	struct miscdevice  *miscdev = &vha->miscdev;
 
-	dev_dbg(miscdev->this_device, "%s: PID: %d, vha: %p, session: %p\n",
+	dev_info(miscdev->this_device, "%s: PID: %d, vha: %p, session: %p\n",
 		__func__, task_pid_nr(current), vha, session);
 
 	vha_session_pm_get(session);
@@ -338,10 +446,13 @@ static int vha_release(struct inode *inode, struct file *file)
 	devm_kfree(miscdev->this_device, session);
 	file->private_data = NULL;
 
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
 	return 0;
 }
 
-static long vha_ioctl_get_core_props(struct vha_session *session,
+static long vha_ioctl_get_hw_props(struct vha_session *session,
 					void __user *buf)
 {
 	struct vha_dev *vha = session->vha;
@@ -349,8 +460,8 @@ static long vha_ioctl_get_core_props(struct vha_session *session,
 
 	dev_dbg(miscdev->this_device, "%s: session %p\n", __func__, session);
 
-	if (copy_to_user(buf, &vha->core_props,
-			sizeof(struct vha_core_props))) {
+	if (copy_to_user(buf, &vha->hw_props,
+			sizeof(struct vha_hw_props))) {
 		dev_err(miscdev->this_device, "%s: copy to user failed!\n",
 			__func__);
 		return -EFAULT;
@@ -455,12 +566,12 @@ static long vha_ioctl_import(struct vha_session *session, void __user *buf)
 	if (copy_from_user(&data, buf, sizeof(data)))
 		return -EFAULT;
 
-	dev_dbg(miscdev->this_device, "%s: session %u, buf_hnd 0x%016llx, size %llu, heap_id %u\n",
-			__func__, session->id, data.buf_hnd, data.size, data.heap_id);
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_fd 0x%016llx, size %llu, heap_id %u\n",
+			__func__, session->id, data.buf_fd, data.size, data.heap_id);
 
 	ret = img_mem_import(session->vha->dev, session->mem_ctx, data.heap_id,
-					(size_t)data.size, data.attributes, data.buf_hnd,
-					&data.buf_id);
+					(size_t)data.size, data.attributes, data.buf_fd,
+					data.cpu_ptr, &data.buf_id);
 	if (ret)
 		return ret;
 
@@ -640,14 +751,15 @@ static long vha_ioctl_buf_status(struct vha_session *session, void __user *buf)
 		return -EFAULT;
 	}
 
-	dev_dbg(miscdev->this_device, "%s: session %u, buf_id %u, status %u, in_sync_fd %d\n",
-		__func__, session->id, data.buf_id, data.status, data.in_sync_fd);
+	dev_dbg(miscdev->this_device, "%s: session %u, buf_id %u, status %u, in_sync_fd %d, out_sync_sig %d \n",
+			__func__, session->id, data.buf_id, data.status, data.in_sync_fd, data.out_sync_sig);
 
 	ret = mutex_lock_interruptible(&vha->lock);
 	if (ret)
 		return ret;
 
-	ret = vha_set_buf_status(session, data.buf_id, data.status, data.in_sync_fd);
+	ret = vha_set_buf_status(session, data.buf_id, data.status,
+			data.in_sync_fd, data.out_sync_sig);
 	mutex_unlock(&vha->lock);
 
 	return ret;
@@ -742,9 +854,9 @@ static long vha_ioctl_cancel(struct vha_session *session, void __user *buf)
 	}
 
 	dev_dbg(miscdev->this_device, "%s: session %u, cmd_id 0x%08x, cmd_id_mask 0x%08x\n",
-		__func__, session->id, data.cmd_id, data.cmd_id_mask);
+			__func__, session->id, data.cmd_id, data.cmd_id_mask);
 
-	return vha_rm_cmds(session, data.cmd_id, data.cmd_id_mask);
+	return vha_rm_cmds(session, data.cmd_id, data.cmd_id_mask, data.respond);
 }
 
 static long vha_ioctl_clk_ctrl(struct vha_session *session, void __user *buf)
@@ -788,6 +900,7 @@ static long vha_ioctl_state(struct vha_session *session, void __user *buf)
 	return 0;
 }
 
+#ifdef VHA_DEVFREQ
 static long vha_ioctl_max_freq(struct vha_session *session, void __user *buf)
 {
 	int ret = 0;
@@ -803,6 +916,30 @@ static long vha_ioctl_max_freq(struct vha_session *session, void __user *buf)
 
 	return ret;
 }
+#endif
+
+static long vha_ioctl_version(struct vha_session *session,
+					void __user *buf)
+{
+	struct vha_version_data data;
+	struct vha_dev *vha = session->vha;
+	struct miscdevice *miscdev = &vha->miscdev;
+
+	memset(&data, 0, sizeof(struct vha_version_data));
+	memcpy(data.digest, KERNEL_INTERFACE_DIGEST, sizeof(data.digest)-1);
+
+	dev_dbg(miscdev->this_device, "%s: session %p: interface digest:%s\n", __func__,
+			session, data.digest);
+
+	if (copy_to_user(buf, &data,
+			sizeof(struct vha_version_data))) {
+		dev_err(miscdev->this_device, "%s: copy to user failed!\n",
+			__func__);
+		return -EFAULT;
+	}
+
+	return 0;
+}
 
 static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 {
@@ -812,18 +949,9 @@ static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 
 	dev_dbg(miscdev->this_device, "%s: code: 0x%x, value: 0x%lx\n",
 		__func__, code, value);
-
-#ifdef CONFIG_FAULT_INJECTION
-	current->make_it_fail = vha->fault_inject;
-#endif
-
 	switch (code) {
-	case VHA_IOC_CORE_PROPS:
-		return vha_ioctl_get_core_props(session, (void __user *)value);
-	case VHA_IOC_CNN_PROPS:
-		dev_err(miscdev->this_device, "%s: not yet implemented\n",
-			__func__);
-		return -EINVAL;
+	case VHA_IOC_HW_PROPS:
+		return vha_ioctl_get_hw_props(session, (void __user *)value);
 	case VHA_IOC_QUERY_HEAPS:
 		return vha_ioctl_query_heaps(session, (void __user *)value);
 	case VHA_IOC_ALLOC:
@@ -850,13 +978,43 @@ static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 		return vha_ioctl_clk_ctrl(session, (void __user *)value);
 	case VHA_IOC_DEVICE_STATE:
 		return vha_ioctl_state(session, (void __user*)value);
+#ifdef VHA_DEVFREQ
 	case VHA_IOC_MAX_FREQ:
 		return vha_ioctl_max_freq(session, (void __user*)value);
+#endif
+	case VHA_IOC_VERSION:
+		return vha_ioctl_version(session, (void __user *)value);
 	default:
 		dev_err(miscdev->this_device, "%s: code %#x unknown\n",
 			__func__, code);
 		return -EINVAL;
 	}
+}
+
+static long vha_ioctl_wrapper(struct file *file, unsigned int code, unsigned long value)
+{
+	long ret = 0;
+	struct vha_session *session = (struct vha_session *)file->private_data;
+	struct vha_dev *vha = session->vha;
+
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_IOCTL)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+	ret = vha_ioctl(file, code, value);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if ((vha->fault_inject & VHA_FI_IOCTL) &&
+			!(vha->fault_inject & VHA_FI_UM))
+		current->make_it_fail = false;
+#endif
+
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
+	return ret;
 }
 
 static int vha_mmap(struct file *file, struct vm_area_struct *vma)
@@ -876,16 +1034,42 @@ static int vha_mmap(struct file *file, struct vm_area_struct *vma)
 	return img_mem_map_um(session->mem_ctx, buf_id, vma);
 }
 
+static int vha_mmap_wrapper(struct file *file, struct vm_area_struct *vma)
+{
+	int ret = 0;
+	struct vha_session *session = (struct vha_session *)file->private_data;
+	struct vha_dev *vha = session->vha;
+
+#ifdef CONFIG_FAULT_INJECTION
+	if (vha->fault_inject & VHA_FI_MMAP)
+		current->make_it_fail = true;
+	else
+		current->make_it_fail = false;
+#endif
+	ret = vha_mmap(file, vma);
+
+#ifdef CONFIG_FAULT_INJECTION
+	if ((vha->fault_inject & VHA_FI_MMAP) &&
+			!(vha->fault_inject & VHA_FI_UM))
+		current->make_it_fail = false;
+#endif
+
+	/* Avoid leaving ioctl with interrupts disabled. */
+	VHA_IRQ_FENCE();
+
+	return ret;
+}
+
 static const struct file_operations vha_fops = {
 	.owner          = THIS_MODULE,
-	.read           = vha_read,
-	.poll           = vha_poll,
-	.write          = vha_write,
+	.read           = vha_read_wrapper,
+	.poll           = vha_poll_wrapper,
+	.write          = vha_write_wrapper,
+	.open           = vha_open_wrapper,
+	.mmap           = vha_mmap_wrapper,
+	.unlocked_ioctl = vha_ioctl_wrapper,
+	.compat_ioctl   = vha_ioctl_wrapper,
 	.release        = vha_release,
-	.open           = vha_open,
-	.mmap           = vha_mmap,
-	.unlocked_ioctl = vha_ioctl,
-	.compat_ioctl   = vha_ioctl,
 };
 
 #define VHA_MAX_NODE_NAME 16
@@ -957,6 +1141,8 @@ static int __init vha_api_init(void)
 
 	pr_debug("loading VHA module.\n");
 
+	img_mem_init();
+
 	ret = vha_early_init();
 	if (ret)
 		pr_err("failed initialize VHA driver\n");
@@ -977,6 +1163,8 @@ static void __exit vha_api_exit(void)
 	ret = vha_plat_deinit();
 	if (ret)
 		pr_err("failed to deinitialise VHA driver\n");
+
+	img_mem_exit();
 }
 
 module_init(vha_api_init);

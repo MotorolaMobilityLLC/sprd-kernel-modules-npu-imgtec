@@ -69,14 +69,15 @@ extern "C" {
 #define VHA_SHARED_OCM 1  /* Shared OCM */
 #define VHA_OCM_TYPE_MAX 2
 
-
-/* device properties */
-struct vha_core_props {
+/* device hw properties */
+struct vha_hw_props {
 	uint64_t product_id;
 	uint64_t core_id;
 	uint64_t soc_axi;
-	uint8_t  mmu_width;	/* MMU address width: 40, or 0 if no MMU */
-	uint8_t  mmu_ver;  /* MMU version */
+	uint8_t  mmu_width;	   /* MMU address width: 40, or 0 if no MMU */
+	uint8_t  mmu_ver;      /* MMU version */
+	uint32_t mmu_pagesize; /* MMU page size */
+
 	union {
 		struct {
 			unsigned rtm: 1;
@@ -86,10 +87,12 @@ struct vha_core_props {
 	};
 	bool     dummy_dev;
 	bool     skip_bvnc_check;
+	bool     use_pdump;
 	uint8_t  num_cnn_core_devs;
 	uint32_t locm_size_bytes; /* per core */
 	uint32_t socm_size_bytes; /* total size for all cores */
 	uint32_t socm_core_size_bytes; /* per core */
+	uint32_t clock_freq;		/* hardware clock rate, kHz */
 
 } __attribute__((aligned(8)));
 
@@ -104,8 +107,11 @@ enum vha_cmd_type {
 	VHA_CMD_CNN_SUBMIT_MULTI,
 	VHA_CMD_CNN_PDUMP_MSG
 };
+
 /* optional flags for commands */
-#define VHA_CMDFLAG_NOTIFY	0x0001 /* send response when cmd complete */
+#define VHA_CMDFLAG_NOTIFY       0x0001 /* send response when cmd complete */
+#define VHA_CHECK_CRC            0x0002 /* check the combined CRCs */
+#define VHA_EXEC_TIME_SET        0x0004 /* execution time is valid */
 
 /*
  * message from user to be sent to VHA (write).
@@ -121,7 +127,8 @@ struct vha_user_cmd {
 	uint32_t cmd_id;     /* arbitrary id for cmd */
 	uint16_t cmd_type;   /* enum vha_cmd_type */
 	uint16_t flags;      /* VHA_CMDFLAG_xxx */
-	uint16_t padding;    /* padding to keep data 32bit aligned */
+	uint8_t  priority;   /* WL priority */
+	uint8_t  padding;    /* padding to keep data 32bit aligned */
 	uint8_t  num_bufs;   /* total number of buffers */
 	uint8_t  num_inbufs; /* number of input buffers */
 	uint32_t data[0];    /* 0-N words: input bufids
@@ -133,7 +140,9 @@ struct vha_user_cmd {
 struct vha_hw_brns {
 	union {
 		struct {
-			unsigned bReserved: 1;
+			unsigned bRN71649: 1;
+			unsigned bRN71556: 1;
+			unsigned bRN71338: 1;
 		} bit;
 		uint64_t map;
 	};
@@ -148,6 +157,10 @@ struct vha_hw_brns {
  * and a register map: this tells the driver which alt-register-N
  * will contain the address of which buffer.
  */
+struct vha_subseg_info {
+	uint32_t cmdbuf_offset;
+	uint32_t cmdbuf_size;
+};
 struct vha_user_cnn_submit_cmd {
 	struct vha_user_cmd msg;
 	uint32_t cmdbuf;                             /* bufid of cmdstream buffer */
@@ -157,11 +170,11 @@ struct vha_user_cnn_submit_cmd {
 	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];     /* register to be used for inbufs and outbufs */
 	uint32_t onchipram_map_id;                   /* OCM mapping id - hot pages */
 	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX];   /* OCM linear mapping buffers */
-	uint32_t crc_buf;                            /* bufid of CRC buffer */
-	uint32_t crc_buf_offset;                     /* offsets into CRC buffer */
 	uint32_t estimated_cycles;                   /* estimated number of cycles for this command */
 	uint64_t expected_ip_capab;                  /* expected BVNC */
 	uint64_t hw_brns;                            /* BRNSs bit map */
+	uint32_t subseg_num;                         /* number of subsegments in subseg_info array */
+	struct vha_subseg_info subseg_info[1];       /* there's always at least one subsegment */
 } __attribute__((aligned(8)));
 
 /*
@@ -182,8 +195,8 @@ struct vha_user_cnn_submit_multi_cmd {
 	uint8_t  regidx[VHA_CORE_MAX_ALT_ADDRS];     /* register to be used for inbufs and outbufs */
 	uint8_t  num_cores;                          /* number of cores required for this workload */
 	uint32_t onchipram_bufs[VHA_OCM_TYPE_MAX];   /* OCM linear mapping buffers */
-	uint32_t crc_buf;                            /* bufid of CRC buffer */
-	uint32_t crc_buf_offset;                     /* offsets into CRC buffer */
+	uint32_t crcs[VHA_MAX_CORES];                /* golden CRCs */
+	uint64_t exec_time;                          /* expected execution time */
 	uint32_t shared_circ_buf_offs;               /* circular buffer offset in the shared memory */
 	uint32_t estimated_cycles;                   /* estimated number of cycles for this command */
 	uint64_t expected_ip_capab;                  /* expected BVNC */
@@ -196,6 +209,7 @@ struct vha_user_cnn_submit_multi_cmd {
 struct vha_user_rsp {
 	uint32_t cmd_id;	/* arbitrary id to identify cmd */
 	uint32_t err_no;	/* 0 if successful, else -ve */
+	uint64_t rsp_err_flags;
 	uint32_t data[0];	/* 0-N words of additional info */
 };
 
@@ -208,7 +222,6 @@ struct vha_user_cnn_submit_rsp {
 				measured with system clock */
 	uint32_t mem_usage;	/* device memory used */
 	uint32_t hw_cycles;	/* hardware cycles used */
-	uint32_t clock_freq;	/* hardware clock rate, kHz */
 } __attribute__((aligned(8)));
 
 #define MAX_VHA_USER_RSP_SIZE (sizeof(struct vha_user_cnn_submit_rsp))
@@ -241,8 +254,8 @@ struct vha_alloc_data {
 /* parameters to import a device buffer */
 struct vha_import_data {
 	uint64_t size;				/* [IN] Size of device memory (in bytes)    */
-	uint64_t buf_hnd;			/* [IN] File descriptor/cpu pointer
-														of buffer to import */
+	uint64_t buf_fd;			/* [IN] File descriptor */
+	uint64_t cpu_ptr;			/* [IN] Cpu pointer of buffer to import */
 	uint32_t heap_id;			/* [IN] Heap ID of allocator                */
 	uint32_t attributes;	/* [IN] Attributes of buffer                */
 	char     name[8];			/* [IN] short name for buffer               */
@@ -303,7 +316,8 @@ enum vha_buf_status {
 struct vha_buf_status_data {
 	uint32_t buf_id;
 	uint32_t status;	/* enum vha_buf_status */
-	int      in_sync_fd;
+	int      in_sync_fd;   /* input sync to attach */
+	bool     out_sync_sig; /* output sync signal */
 } __attribute__((aligned(8)));
 
 enum vha_sync_op {
@@ -340,8 +354,10 @@ struct vha_sync_data {
 struct vha_cancel_data {
 	uint32_t cmd_id;      /* [IN] masked ID of commands to be cancelled */
 	uint32_t cmd_id_mask; /* [IN] mask for command IDs to be cancelled */
+	bool     respond;     /* [IN] if true, respond to this cancel request */
 } __attribute__((aligned(8)));
 
+/// Begin Modification of UNISOC ///
 /* parameters to vha clock control */
 struct vha_clk_ctrl_data {
 	uint32_t fg_enable; /* enable(1)/disable(0) clock */
@@ -351,25 +367,33 @@ enum vha_device_state {
 	VHA_IDLE  = 0,
 	VHA_BUSY  = 1
 };
+/// End Modification of UNISOC ///
+
+struct vha_version_data {
+	char  digest[33];     /* [OUT] digest of this interface file */
+} __attribute__((aligned(8)));
 
 #define VHA_IOC_MAGIC  'q'
 
-#define VHA_IOC_CORE_PROPS        _IOR(VHA_IOC_MAGIC,  0, struct vha_core_props)
-#define VHA_IOC_CNN_PROPS         _IOR(VHA_IOC_MAGIC,  1, struct vha_cnn_props)
-#define VHA_IOC_QUERY_HEAPS       _IOR(VHA_IOC_MAGIC,  2, struct vha_heaps_data)
-#define VHA_IOC_ALLOC             _IOWR(VHA_IOC_MAGIC, 3, struct vha_alloc_data)
-#define VHA_IOC_IMPORT            _IOWR(VHA_IOC_MAGIC, 4, struct vha_import_data)
-#define VHA_IOC_EXPORT            _IOWR(VHA_IOC_MAGIC, 5, struct vha_export_data)
-#define VHA_IOC_FREE              _IOW(VHA_IOC_MAGIC,  6, struct vha_free_data)
-#define VHA_IOC_VHA_MAP_TO_ONCHIP _IOW(VHA_IOC_MAGIC,  7, struct vha_map_to_onchip_data)
-#define VHA_IOC_VHA_MAP           _IOW(VHA_IOC_MAGIC,  8, struct vha_map_data)
-#define VHA_IOC_VHA_UNMAP         _IOW(VHA_IOC_MAGIC,  9, struct vha_unmap_data)
-#define VHA_IOC_BUF_STATUS        _IOW(VHA_IOC_MAGIC,  10, struct vha_buf_status_data)
-#define VHA_IOC_SYNC              _IOWR(VHA_IOC_MAGIC, 11, struct vha_sync_data)
-#define VHA_IOC_CANCEL            _IOW(VHA_IOC_MAGIC,  12, struct vha_cancel_data)
+#define VHA_IOC_HW_PROPS          _IOR(VHA_IOC_MAGIC,  0, struct vha_hw_props)
+#define VHA_IOC_QUERY_HEAPS       _IOR(VHA_IOC_MAGIC,  1, struct vha_heaps_data)
+#define VHA_IOC_ALLOC             _IOWR(VHA_IOC_MAGIC, 2, struct vha_alloc_data)
+#define VHA_IOC_IMPORT            _IOWR(VHA_IOC_MAGIC, 3, struct vha_import_data)
+#define VHA_IOC_EXPORT            _IOWR(VHA_IOC_MAGIC, 4, struct vha_export_data)
+#define VHA_IOC_FREE              _IOW(VHA_IOC_MAGIC,  5, struct vha_free_data)
+#define VHA_IOC_VHA_MAP_TO_ONCHIP _IOW(VHA_IOC_MAGIC,  6, struct vha_map_to_onchip_data)
+#define VHA_IOC_VHA_MAP           _IOW(VHA_IOC_MAGIC,  7, struct vha_map_data)
+#define VHA_IOC_VHA_UNMAP         _IOW(VHA_IOC_MAGIC,  8, struct vha_unmap_data)
+#define VHA_IOC_BUF_STATUS        _IOW(VHA_IOC_MAGIC,  9, struct vha_buf_status_data)
+#define VHA_IOC_SYNC              _IOWR(VHA_IOC_MAGIC, 10, struct vha_sync_data)
+#define VHA_IOC_CANCEL            _IOW(VHA_IOC_MAGIC,  11, struct vha_cancel_data)
+/// Begin Modification of UNISOC ///
 #define VHA_IOC_CLK_CTRL          _IOW(VHA_IOC_MAGIC,  13, struct vha_clk_ctrl_data)
 #define VHA_IOC_DEVICE_STATE      _IOR(VHA_IOC_MAGIC,  14, enum vha_device_state)
 #define VHA_IOC_MAX_FREQ          _IOW(VHA_IOC_MAGIC,  15, int)
+/// End Modification of UNISOC ///
+
+#define VHA_IOC_VERSION           _IOW(VHA_IOC_MAGIC,  16, struct vha_version_data)
 
 #define VHA_SCOPE_DEV_NAME "vha_scope"
 
