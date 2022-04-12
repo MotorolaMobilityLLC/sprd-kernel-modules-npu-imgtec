@@ -361,6 +361,12 @@ static int carveout_heap_alloc(struct device *device, struct heap *heap,
 		return -ENOMEM;
 
 	pages = size / PAGE_SIZE;
+	/* Check if buffer is not too big. */
+	if (get_order(pages * sizeof(uint64_t)) >= MAX_ORDER) {
+		pr_err("%s: buffer size is too big (%zu bytes)\n", __func__, size);
+		kfree(buffer_data);
+		return -ENOMEM;
+	}
 	buffer_data->addrs = kmalloc_array(pages, sizeof(uint64_t), GFP_KERNEL);
 	if (!buffer_data->addrs) {
 		kfree(buffer_data);

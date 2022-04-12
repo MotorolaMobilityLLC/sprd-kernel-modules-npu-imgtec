@@ -57,6 +57,7 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include <vha_regs.h>
+#include "uapi/version.h"
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 #include <linux/dma-fence.h>
@@ -260,6 +261,10 @@ ALLOW_ERROR_INJECTION(__EVENT_INJECT, ERRNO);
 #endif /* VHA_EVENT_INJECT */
 
 #endif
+
+#define CALC_MEM_USAGE(type, value) \
+	type##_MB = value / (1024 * 1024); \
+	type##_kB = ((value - (type##_MB * (1024 * 1024))) * 1000) / (1024 * 1024);
 
 /* Calculate current timespan for the given timestamp */
 bool get_timespan_us(struct TIMESPEC *from, struct TIMESPEC *to, uint64_t *result)
@@ -529,16 +534,20 @@ int vha_deinit(void)
 {
 	/* Destroy memory management context */
 	if (drv.mem_ctx) {
-		size_t mem_usage;
-		size_t MB, bytes, kB;
+		size_t mem_usage, mmu_usage;
 
 		img_mem_get_usage(drv.mem_ctx, &mem_usage, NULL);
-		MB = mem_usage / (1024 * 1024);
-		bytes = mem_usage - (MB * (1024 * 1024));
-		kB = (bytes * 1000) / (1024 * 1024);
+		img_mmu_get_usage(drv.mem_ctx, &mmu_usage, NULL);
 
-		pr_debug("%s: Total kernel memory used: %zu.%zu MB\n",
-				__func__, MB, kB);
+		{
+			uint32_t mem_MB, mem_kB, mmu_MB, mmu_kB;
+
+			CALC_MEM_USAGE(mem, mem_usage);
+			CALC_MEM_USAGE(mmu, mmu_usage);
+
+			pr_debug("%s: Total kernel memory used: %u.%u MB (MMU: %u.%u MB)\n",
+					__func__, mem_MB, mem_kB, mmu_MB, mmu_kB);
+		}
 
 		img_mem_destroy_proc_ctx(drv.mem_ctx);
 		drv.mem_ctx = NULL;
@@ -682,6 +691,12 @@ int vha_add_session(struct vha_session *session)
 	struct mmu_config mmu_config;
 	int ctx_id;
 	uint8_t pri;
+	char version[100];
+
+	memset(version, 0, sizeof(version));
+	snprintf(version, sizeof(version)-1, NNA_VER_STR);
+
+	img_pdump_printf("-- Generated using %s\n", version);
 
 	img_pdump_printf("-- OPEN_BEGIN\n");
 	img_pdump_printf("-- VHA driver session started\n");
@@ -818,8 +833,8 @@ int vha_add_session(struct vha_session *session)
 		}
 
 	dev_dbg(vha->dev,
-			"%s: %p ctxid:%d\n", __func__, session,
-			session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].id);
+			"%s: %p ctxid:%d (%s)\n", __func__, session,
+			session->mmu_ctxs[VHA_MMU_REQ_MODEL_CTXID].id, version);
 
 	mutex_unlock(&vha->lock);
 	return ret;
@@ -959,21 +974,25 @@ void vha_rm_session(struct vha_session *session)
 		}
 	}
 
-	/* Update mem stats - max memory usage in this session. */
+	/* Update memory utilization stats - max memory usage in this session. */
 	img_mem_get_usage(session->mem_ctx,
 			(size_t *)&vha->stats.mem_usage_last, NULL);
-	{
-		uint32_t MB = vha->stats.mem_usage_last / (1024 * 1024);
-		uint32_t bytes = vha->stats.mem_usage_last -
-			(MB * (1024 * 1024));
-		uint32_t kB = (bytes * 1000) / (1024 * 1024);
-
-		dev_dbg(vha->dev,
-			"%s: Total user memory used in session: %u.%u MB\n",
-			__func__, MB, kB);
-	}
 	img_mmu_get_usage(session->mem_ctx,
 			(size_t *)&vha->stats.mmu_usage_last, NULL);
+	img_ocm_get_usage(session->mem_ctx,
+			(size_t *)&vha->stats.ocm_usage_last, NULL);
+
+	{
+		uint32_t mem_MB, mem_kB, mmu_MB, mmu_kB, ocm_MB, ocm_kB;
+
+		CALC_MEM_USAGE(mem, vha->stats.mem_usage_last);
+		CALC_MEM_USAGE(mmu, vha->stats.mmu_usage_last);
+		CALC_MEM_USAGE(ocm, vha->stats.ocm_usage_last);
+
+		dev_dbg(vha->dev,
+			"%s: Total user memory used in session: %u.%u MB (MMU: %u.%u MB, OCM:%u.%u MB)\n",
+			__func__, mem_MB, mem_kB, mmu_MB, mmu_kB, ocm_MB, ocm_kB);
+	}
 
 	vha->active_mmu_ctx = VHA_INVALID_ID;
 	img_pdump_printf("-- VHA driver session complete\n");
@@ -2370,6 +2389,11 @@ int vha_add_cmd(struct vha_session *session, struct vha_cmd *cmd)
 
 #ifdef CONFIG_HW_MULTICORE
 	if (user_cmd->cmd_type == VHA_CMD_CNN_SUBMIT) {
+		dev_err(dev, "%s: invalid cmd type 0x%x\n", __func__, user_cmd->cmd_type);
+		return -EINVAL;
+	}
+#else
+	if (user_cmd->cmd_type == VHA_CMD_CNN_SUBMIT_MULTI) {
 		dev_err(dev, "%s: invalid cmd type 0x%x\n", __func__, user_cmd->cmd_type);
 		return -EINVAL;
 	}

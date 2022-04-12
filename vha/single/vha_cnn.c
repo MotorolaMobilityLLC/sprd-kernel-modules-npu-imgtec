@@ -101,7 +101,7 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 	if (vha->low_latency != VHA_LL_DISABLED) {
 		/* Sanity wait for the kick bit to be deasserted */
 		IOPOLL64_PDUMP(0, 1000, 10, (uint64_t)VHA_CR_OS(CNN_CONTROL_START_EN),
-							VHA_CR_OS(CNN_CONTROL));
+							VHA_CR_OS(CNN_CONTROL), true);
 		if (cmd->queued &&
 				vha->low_latency == VHA_LL_SW_KICK)
 			goto hw_kick;
@@ -654,8 +654,8 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 #endif
 		cnn_submit_rsp->last_proc_us = cmd->proc_us;
 		cnn_submit_rsp->hw_cycles = cmd->hw_cycles;
-		dev_dbg(session->vha->dev, "%s: %p, hw_cycles %llx\n", __func__,
-				cmd, session->vha->stats.cnn_last_cycles);
+		dev_dbg(session->vha->dev, "%s: 0x%08x/%u, hw_cycles %llx\n", __func__,
+				cmd->user_cmd.cmd_id, session->id, session->vha->stats.cnn_last_cycles);
 
 		if (session->vha->stats.cnn_last_cycles > (uint32_t)~0)
 			dev_warn(session->vha->dev,

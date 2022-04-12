@@ -393,6 +393,8 @@ struct vha_stats {
 	uint32_t mem_usage_last;
 	/* Total memory used for MMU pages tables by the last session */
 	uint32_t mmu_usage_last;
+	/* Total memory used for OCM mappings by the last session */
+	uint32_t ocm_usage_last;
 	/* Hw power on timestamp (temporary var) */
 	struct TIMESPEC hw_start;
 #ifdef CONFIG_HW_MULTICORE

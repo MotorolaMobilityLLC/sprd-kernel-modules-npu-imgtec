@@ -46,6 +46,7 @@
 #include <linux/gfp.h>
 #include <linux/vmalloc.h>
 #include <linux/dma-mapping.h>
+#include <linux/dma-buf.h>
 
 #include <img_mem_man.h>
 #include "img_mem_man_priv.h"
@@ -56,10 +57,272 @@ struct buffer_data {
 	uint64_t *addrs; /* array of physical addresses, upcast to 64-bit */
 	struct device *dev;
 	size_t size;
-
+	/* exporter via dmabuf */
+	struct sg_table *sgt;
+	bool exported;
+	struct dma_buf *dma_buf;
 };
 
 static int trace_physical_pages;
+
+/*
+ * dmabuf wrapper ops
+ */
+static struct sg_table *coherent_map_dmabuf(struct dma_buf_attachment *attach,
+		enum dma_data_direction dir)
+{
+	struct buffer *buffer = attach->dmabuf->priv;
+	struct buffer_data *buffer_data;
+
+	if (!buffer)
+		return NULL;
+
+	pr_debug("%s\n", __func__);
+
+	buffer_data = buffer->priv;
+	sg_dma_address(buffer_data->sgt->sgl) = buffer_data->dma_handle;
+	sg_dma_len(buffer_data->sgt->sgl) = buffer_data->size;
+
+	return buffer_data->sgt;
+}
+
+static void coherent_unmap_dmabuf(struct dma_buf_attachment *attach,
+					struct sg_table *sgt,
+					enum dma_data_direction dir)
+{
+	struct buffer *buffer = attach->dmabuf->priv;
+	struct buffer_data *buffer_data;
+
+	if (!buffer)
+		return;
+
+	pr_debug("%s\n", __func__);
+
+	buffer_data = buffer->priv;
+	sg_dma_address(buffer_data->sgt->sgl) = (~(dma_addr_t)0);
+	sg_dma_len(buffer_data->sgt->sgl) = 0;
+}
+
+/* Called when when ref counter reaches zero! */
+static void coherent_release_dmabuf(struct dma_buf *buf)
+{
+	struct buffer *buffer = buf->priv;
+	struct buffer_data *buffer_data;
+
+	if (!buffer)
+		return;
+
+	buffer_data = buffer->priv;
+	pr_debug("%s %p\n", __func__, buffer_data);
+	if (!buffer_data)
+		return;
+
+	buffer_data->exported = false;
+}
+
+/* Called on file descriptor mmap */
+static int coherent_mmap_dmabuf(struct dma_buf *buf, struct vm_area_struct *vma)
+{
+	struct buffer *buffer = buf->priv;
+	struct buffer_data *buffer_data;
+	struct scatterlist *sgl;
+	unsigned long addr;
+
+	if (!buffer)
+		return -EINVAL;
+
+	buffer_data = buffer->priv;
+
+	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer);
+	pr_debug("%s:%d vm_start %#lx vm_end %#lx size %#lx\n",
+		__func__, __LINE__,
+		vma->vm_start, vma->vm_end, vma->vm_end - vma->vm_start);
+
+	vma->vm_page_prot = pgprot_writecombine(vma->vm_page_prot);
+
+	sgl = buffer_data->sgt->sgl;
+	addr = vma->vm_start;
+	while (sgl) {
+		dma_addr_t phys = sg_phys(sgl);
+		unsigned long pfn = phys >> PAGE_SHIFT;
+		unsigned int len = sgl->length;
+		int ret;
+
+		if (vma->vm_end < (addr + len)) {
+			unsigned long size = vma->vm_end - addr;
+			pr_debug("%s:%d buffer %d (0x%p) truncating len=%#x to size=%#lx\n",
+				__func__, __LINE__,
+				buffer->id, buffer, len, size);
+			WARN(round_up(size, PAGE_SIZE) != size,
+				"VMA size %#lx not page aligned\n", size);
+			len = size;
+			if (!len) /* VM space is smaller than allocation */
+				break;
+		}
+
+		ret = remap_pfn_range(vma, addr, pfn, len, vma->vm_page_prot);
+		if (ret)
+			return ret;
+
+		addr += len;
+		sgl = sg_next(sgl);
+	}
+
+	return 0;
+}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+static void *coherent_kmap_dmabuf(struct dma_buf *buf, unsigned long page)
+{
+	struct buffer *buffer = buf->priv;
+
+	if (!buffer)
+		return NULL;
+
+	return buffer->kptr;
+}
+#endif
+
+static int coherent_heap_map_km(struct heap *heap, struct buffer *buffer);
+static int coherent_heap_unmap_km(struct heap *heap, struct buffer *buffer);
+
+static void *coherent_vmap_dmabuf(struct dma_buf *buf)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer)
+		return NULL;
+
+	heap = buffer->heap;
+
+	if (coherent_heap_map_km(heap, buffer))
+		return NULL;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p\n", __func__, __LINE__,
+		buffer->id, buffer->kptr);
+
+	return buffer->kptr;
+}
+
+static void coherent_vunmap_dmabuf(struct dma_buf *buf, void *kptr)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer)
+		return;
+
+	heap = buffer->heap;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer->kptr, kptr);
+
+	if (buffer->kptr == kptr)
+		coherent_heap_unmap_km(heap, buffer);
+}
+
+static const struct dma_buf_ops coherent_dmabuf_ops = {
+	.map_dma_buf = coherent_map_dmabuf,
+	.unmap_dma_buf = coherent_unmap_dmabuf,
+	.release = coherent_release_dmabuf,
+	.mmap = coherent_mmap_dmabuf,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,12,0)
+	.kmap_atomic = coherent_kmap_dmabuf,
+	.kmap = coherent_kmap_dmabuf,
+#else
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,19,0)
+	.map_atomic = coherent_kmap_dmabuf,
+	.map = coherent_kmap_dmabuf,
+#endif
+#endif
+	.vmap = coherent_vmap_dmabuf,
+	.vunmap = coherent_vunmap_dmabuf,
+};
+
+static int coherent_heap_export(struct device *device, struct heap *heap,
+						 size_t size, enum img_mem_attr attr,
+						 struct buffer *buffer, uint64_t* buf_hnd)
+{
+	struct buffer_data *buffer_data = buffer->priv;
+	struct dma_buf *dma_buf;
+	int ret, fd;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
+	DEFINE_DMA_BUF_EXPORT_INFO(exp_info);
+#endif
+	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer);
+
+	if (!buffer_data)
+		/* Nothing to export ? */
+		return -ENOMEM;
+
+	if (buffer_data->exported) {
+		pr_err("%s: already exported!\n", __func__);
+		return -EBUSY;
+	}
+
+	if (!buffer_data->sgt) {
+		/* Create for the very first time */
+		buffer_data->sgt = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
+		if (!buffer_data->sgt) {
+			pr_err("%s: failed to allocate sg_table\n", __func__);
+			return -ENOMEM;
+		}
+
+		ret = sg_alloc_table(buffer_data->sgt, 1, GFP_KERNEL);
+		if (ret) {
+			pr_err("%s: sg_alloc_table failed\n", __func__);
+			goto free_sgt_mem;
+		}
+		sg_set_page(buffer_data->sgt->sgl,
+				pfn_to_page(PFN_DOWN(buffer_data->dma_handle)), /*virt_to_page ?*/
+				PAGE_ALIGN(size), 0);
+		/* No mapping yet */
+		sg_dma_address(buffer_data->sgt->sgl) = (~(dma_addr_t)0);
+		sg_dma_len(buffer_data->sgt->sgl) = 0;
+	}
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
+	dma_buf = dma_buf_export(buffer_data, &coherent_dmabuf_ops,
+			size, O_RDWR);
+#elif LINUX_VERSION_CODE < KERNEL_VERSION(4,1,0)
+	dma_buf = dma_buf_export(buffer_data, &coherent_dmabuf_ops,
+			size, O_RDWR, NULL);
+#else
+	exp_info.ops = &coherent_dmabuf_ops;
+	exp_info.size = size;
+	exp_info.flags = O_RDWR;
+	exp_info.priv = buffer;
+	exp_info.resv = NULL;
+	dma_buf = dma_buf_export(&exp_info);
+#endif
+	if (IS_ERR(dma_buf)) {
+		pr_err("%s:dma_buf_export failed\n", __func__);
+		ret = PTR_ERR(dma_buf);
+		return ret;
+	}
+
+	get_dma_buf(dma_buf);
+	fd = dma_buf_fd(dma_buf, 0);
+	if (fd < 0) {
+		pr_err("%s: dma_buf_fd failed\n", __func__);
+		dma_buf_put(dma_buf);
+		return -EFAULT;
+	}
+	buffer_data->dma_buf = dma_buf;
+	buffer_data->exported = true;
+	*buf_hnd = (uint64_t)fd;
+
+	return 0;
+
+free_sgt_mem:
+	kfree(buffer_data->sgt);
+	buffer_data->sgt = NULL;
+
+	return ret;
+}
 
 static int coherent_heap_alloc(struct device *device, struct heap *heap,
 			       size_t size, enum img_mem_attr attr,
@@ -69,14 +332,20 @@ static int coherent_heap_alloc(struct device *device, struct heap *heap,
 	phys_addr_t phys_addr;
 	size_t pages, page;
 
-	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
-		 buffer->id, buffer);
+	pr_debug("%s:%d buffer %d (0x%p) size:%zu attr:%x\n", __func__, __LINE__,
+		buffer->id, buffer, size, attr);
 
 	buffer_data = kzalloc(sizeof(struct buffer_data), GFP_KERNEL);
 	if (!buffer_data)
 		return -ENOMEM;
 
 	pages = size / PAGE_SIZE;
+	/* Check if buffer is not too big. */
+	if (get_order(pages * sizeof(uint64_t)) >= MAX_ORDER) {
+		pr_err("%s: buffer size is too big (%zu bytes)\n", __func__, size);
+		kfree(buffer_data);
+		return -ENOMEM;
+	}
 	buffer_data->addrs = kmalloc_array(pages, sizeof(uint64_t), GFP_KERNEL);
 	if (!buffer_data->addrs) {
 		kfree(buffer_data);
@@ -121,6 +390,17 @@ static void coherent_heap_free(struct heap *heap, struct buffer *buffer)
 
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		 buffer->id, buffer);
+
+	if (buffer_data->dma_buf) {
+		dma_buf_put(buffer_data->dma_buf);
+		buffer_data->dma_buf->priv = NULL;
+	}
+
+	if (buffer_data->sgt) {
+		sg_free_table(buffer_data->sgt);
+		kfree(buffer_data->sgt);
+		buffer_data->sgt = NULL;
+	}
 
 	dma_free_coherent(buffer_data->dev, buffer_data->size,
 			  buffer_data->kptr, buffer_data->dma_handle);
@@ -178,6 +458,7 @@ static void coherent_heap_destroy(struct heap *heap)
 }
 
 static struct heap_ops coherent_heap_ops = {
+	.export = coherent_heap_export,
 	.alloc = coherent_heap_alloc,
 	.import = NULL,
 	.free = coherent_heap_free,

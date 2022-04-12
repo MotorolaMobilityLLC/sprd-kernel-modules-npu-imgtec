@@ -357,6 +357,11 @@ struct vha_cancel_data {
 	bool     respond;     /* [IN] if true, respond to this cancel request */
 } __attribute__((aligned(8)));
 
+struct vha_version_data {
+	char  digest[33];     /* [OUT] digest of this interface file */
+	char  vers_str[100];   /* [OUT] version string of the kernel driver */
+} __attribute__((aligned(8)));
+
 /// Begin Modification of UNISOC ///
 /* parameters to vha clock control */
 struct vha_clk_ctrl_data {
@@ -368,10 +373,6 @@ enum vha_device_state {
 	VHA_BUSY  = 1
 };
 /// End Modification of UNISOC ///
-
-struct vha_version_data {
-	char  digest[33];     /* [OUT] digest of this interface file */
-} __attribute__((aligned(8)));
 
 #define VHA_IOC_MAGIC  'q'
 

@@ -1059,7 +1059,8 @@ int vha_rm_cmds(struct vha_session *session, uint32_t cmd_id,
 		struct vha_rsp *rsp = kzalloc(sz, GFP_KERNEL);
 		if (rsp == NULL) {
 			dev_crit(session->vha->dev,
-					"Failed to allocate memory to notify cancel for cmds 0x%08x\n", cmd_id);
+					"Failed to allocate memory to notify cancel for cmds 0x%08x/%u\n",
+					cmd_id, session->id);
 			session->oom = true;
 		} else {
 			rsp->size = sizeof(struct vha_user_cnn_submit_rsp);
@@ -1134,11 +1135,8 @@ bool vha_is_waiting_for_inputs(struct vha_session *session,
 
 			if (buf && buf->status == VHA_BUF_UNFILLED) {
 				dev_dbg(session->vha->dev,
-					"%s: cmd %u waiting for input "
-					"buf %d to be ready\n",
-					__func__,
-					cmd->user_cmd.cmd_id,
-					buf->id);
+					"%s: cmd 0x%08x/%u waiting for input buf %u to be ready\n",
+					__func__, cmd->user_cmd.cmd_id, session->id, buf->id);
 				return true;
 			}
 		}

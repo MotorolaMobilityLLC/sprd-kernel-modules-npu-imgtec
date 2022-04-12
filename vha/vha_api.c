@@ -927,6 +927,7 @@ static long vha_ioctl_version(struct vha_session *session,
 
 	memset(&data, 0, sizeof(struct vha_version_data));
 	memcpy(data.digest, KERNEL_INTERFACE_DIGEST, sizeof(data.digest)-1);
+	snprintf(data.vers_str, sizeof(data.vers_str)-1, NNA_VER_STR);
 
 	dev_dbg(miscdev->this_device, "%s: session %p: interface digest:%s\n", __func__,
 			session, data.digest);

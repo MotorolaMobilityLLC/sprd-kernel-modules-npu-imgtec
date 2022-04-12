@@ -67,7 +67,7 @@ struct mem_man {
 	struct idr mem_ctxs;
 	struct mutex mutex;
 
-	unsigned cache_usage;
+	unsigned cache_ref;
 };
 /* define like this, so it is easier to convert to a function argument later */
 static struct mem_man mem_man_data;
@@ -460,6 +460,12 @@ static int _img_mem_alloc(struct device *device, struct mem_ctx *ctx,
 	if (ctx->mem_usage_curr > ctx->mem_usage_max)
 		ctx->mem_usage_max = ctx->mem_usage_curr;
 
+	if (heap->type == IMG_MEM_HEAP_TYPE_OCM) {
+		ctx->ocm_usage_curr += buffer->actual_size;
+		if (ctx->ocm_usage_curr > ctx->ocm_usage_max)
+			ctx->ocm_usage_max = ctx->ocm_usage_curr;
+	}
+
 	*buffer_new = buffer;
 
 	pr_debug("%s heap %p ctx %p created buffer %d (%p) actual_size %zu\n",
@@ -648,7 +654,7 @@ static int _img_mem_get_user_pages(size_t size, uint64_t cpu_ptr,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0)
 	ret = get_user_pages(
 			cpu_ptr, num_pages,
-			FOLL_WRITE,
+			0,
 			tmp_pages, NULL);
 #else
 	pr_err("%s get_user_pages not supported for this kernel version\n",
@@ -841,6 +847,13 @@ static void _img_mem_free(struct buffer *buffer)
 		ctx->mem_usage_curr -= buffer->actual_size;
 	else
 		WARN_ON(1);
+
+	if (heap->type == IMG_MEM_HEAP_TYPE_OCM) {
+		if (ctx->ocm_usage_curr >= buffer->actual_size)
+			ctx->ocm_usage_curr -= buffer->actual_size;
+		else
+			WARN_ON(1);
+	}
 
 	idr_remove(&ctx->buffers, buffer->id);
 
@@ -1327,13 +1340,13 @@ int img_mmu_init_cache(struct mmu_ctx *mmu_ctx,	unsigned long cache_phys_start,
 	mmu_ctx->cache_phys_start = cache_phys_start;
 	mmu_ctx->cache_size = cache_size;
 
-	if (img_pdump_enabled(pdump) && cache_size && !mem_man->cache_usage) {
+	if (img_pdump_enabled(pdump) && cache_size && !mem_man->cache_ref) {
 		__img_pdump_printf(mmu_ctx->device, "-- Allocating img mem cache buffer size:%u\n", cache_size);
 		__img_pdump_printf(mmu_ctx->device, "CALLOC :OCM:BLOCK_CACHE %#x %#zx 0x0\n",
 			cache_size, IMGMMU_GET_MAX_PAGE_SIZE());
 	}
 
-	mem_man->cache_usage++;
+	mem_man->cache_ref++;
 
 	mutex_unlock(&mem_man->mutex);
 
@@ -1348,13 +1361,14 @@ int img_mmu_clear_cache(struct mmu_ctx *mmu_ctx)
 
 	mutex_lock(&mem_man->mutex);
 
-	if (mem_man->cache_usage)
-		mem_man->cache_usage--;
+	if (mem_man->cache_ref)
+		mem_man->cache_ref--;
 
-	if (img_pdump_enabled(pdump) && mmu_ctx->cache_size && !mem_man->cache_usage) {
+	if (img_pdump_enabled(pdump) && mmu_ctx->cache_size && !mem_man->cache_ref) {
 		__img_pdump_printf(mmu_ctx->device, "-- Freeing img mem cache buffer size:%u\n",
 				mmu_ctx->cache_size);
 		__img_pdump_printf(mmu_ctx->device, "FREE :OCM:BLOCK_CACHE\n");
+		mmu_ctx->mem_ctx->ocm_usage_curr = 0;
 	}
 
 	mutex_unlock(&mem_man->mutex);
@@ -1404,10 +1418,19 @@ int img_mmu_move_pg_to_cache(struct mmu_ctx *mmu_ctx, struct mem_ctx *mem_ctx,
 					mmu_ctx->cache_phys_start + mapping->cache_offset);
 
 				mapping->cache_offset += imgmmu_get_page_size();
+			} else {
+				pr_warn("%s: trying to move page out of cache boundaries!\n", __func__);
 			}
 			break;
 		}
 	}
+
+	/* Note: only valid for single model per session */
+	if ((mem_ctx->ocm_usage_curr + page_size) <= mmu_ctx->cache_size)
+		mem_ctx->ocm_usage_curr += page_size;
+
+	if (mem_ctx->ocm_usage_curr > mem_ctx->ocm_usage_max)
+		mem_ctx->ocm_usage_max = mem_ctx->ocm_usage_curr;
 
 	mutex_unlock(&mem_man->mutex);
 
@@ -1539,6 +1562,21 @@ int img_mmu_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr)
 	return 0;
 }
 EXPORT_SYMBOL(img_mmu_get_usage);
+
+int img_ocm_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr)
+{
+	struct mem_man *mem_man = &mem_man_data;
+
+	mutex_lock(&mem_man->mutex);
+	if (max)
+		*max = ctx->ocm_usage_max;
+	if (curr)
+		*curr = ctx->ocm_usage_curr;
+	mutex_unlock(&mem_man->mutex);
+
+	return 0;
+}
+EXPORT_SYMBOL(img_ocm_get_usage);
 
 static int  img_mmu_cache_get_offset(struct mem_ctx *mem_ctx,
 	unsigned long addr, unsigned int *offset)
@@ -2695,7 +2733,7 @@ int img_mem_init(void)
 	idr_init(&mem_man->heaps);
 	idr_init(&mem_man->mem_ctxs);
 	mutex_init(&mem_man->mutex);
-	mem_man->cache_usage = 0;
+	mem_man->cache_ref = 0;
 
 	return 0;
 }

@@ -452,11 +452,10 @@ static int unified_alloc(struct device *device, struct heap *heap,
 	int min_order = heap->options.unified.min_order;
 	int max_order = heap->options.unified.max_order;
 
-	pr_debug("%s:%d buffer %d (0x%p) size:%zu attr:%x\n", __func__, __LINE__,
-		buffer->id, buffer, size, attr);
+	pr_debug("%s:%d buffer %d (0x%p) size:%zu attr:%x order<%u-%u>\n", __func__, __LINE__,
+		buffer->id, buffer, size, attr, min_order, max_order);
 
 	ret = min_max_order_init(&min_order, &max_order, attr, size);
-
 	if (ret) {
 		pr_err("%s: min_max_order_init failed\n", __func__);
 		return -EINVAL;
@@ -469,16 +468,13 @@ static int unified_alloc(struct device *device, struct heap *heap,
 
 		page = NULL;
 		/*
-		 * Fit the buffer size starting from the biggest order.
+		 * Fit the buffer size starting from the biggest order for given size.
 		 * When system already run out of chunks with specific order,
-		 * try with lowest available with min_order constraint
+		 * try with lower, but not less than min_order constraint.
 		 */
+		max_order = min(max_order, get_order(size));
 		for (order = max_order; order >= min_order; order--) {
 			int page_order;
-
-			/* Try to allocate min_order size */
-			if (size < (PAGE_SIZE << order) && (order > min_order))
-				continue;
 
 			page = alloc_pages(heap->options.unified.gfp_type |
 					__GFP_COMP | __GFP_NOWARN, order);

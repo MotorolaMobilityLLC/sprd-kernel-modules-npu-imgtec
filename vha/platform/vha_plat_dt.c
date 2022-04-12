@@ -338,10 +338,7 @@ static struct dev_pm_ops vha_pm_plat_ops = {
 
 static ssize_t info_show(struct device_driver *drv, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE,
-			"VHA DT driver version: NNA_API_%u.%u.%u_DDK_%u.%u@%s\n",
-			DDK_API_MAJOR_NUMBER, DDK_API_MINOR_NUMBER, DDK_API_PATCH_NUMBER,
-			DDK_MAJOR_NUMBER, DDK_MINOR_NUMBER, VERSION_STRING);
+	return snprintf(buf, PAGE_SIZE, "VHA DT driver version: %s\n", NNA_VER_STR);
 }
 
 static DRIVER_ATTR_RO(info);

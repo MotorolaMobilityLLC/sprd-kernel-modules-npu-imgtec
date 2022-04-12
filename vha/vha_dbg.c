@@ -112,9 +112,7 @@ static ssize_t vha_version_read(struct file *file, char __user *buf, size_t len,
 {
 	char version[100];
 
-	size_t size = snprintf(version, sizeof(version), "NNA_API_%u.%u.%u_DDK_%u.%u@%s\n",
-			DDK_API_MAJOR_NUMBER, DDK_API_MINOR_NUMBER, DDK_API_PATCH_NUMBER,
-			DDK_MAJOR_NUMBER, DDK_MINOR_NUMBER, VERSION_STRING);
+	size_t size = snprintf(version, sizeof(version)-1, "%s\n", NNA_VER_STR);
 
 	return simple_read_from_buffer(buf, len, ppos, version, size);
 }
@@ -502,6 +500,46 @@ static const struct file_operations vha_session_mmu_curr_fops = {
 	.read = vha_session_mmu_curr_read,
 };
 
+static ssize_t vha_session_ocm_max_read(struct file *file, char __user *buf,
+			size_t count, loff_t *ppos)
+{
+	struct vha_session *session = file->private_data;
+	char mem_usage[25] = { 0 };
+	size_t mem_val = 0;
+	size_t size;
+
+	img_ocm_get_usage(session->mem_ctx, &mem_val, NULL);
+	size = snprintf(mem_usage, sizeof(mem_usage), "%ld\n", mem_val);
+
+	return simple_read_from_buffer(buf, count, ppos, mem_usage, size);
+}
+
+static const struct file_operations vha_session_ocm_max_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = vha_session_ocm_max_read,
+};
+
+static ssize_t vha_session_ocm_curr_read(struct file *file, char __user *buf,
+			size_t count, loff_t *ppos)
+{
+	struct vha_session *session = file->private_data;
+	char mem_usage[25] = { 0 };
+	size_t mem_val = 0;
+	size_t size;
+
+	img_ocm_get_usage(session->mem_ctx, NULL, &mem_val);
+	size = snprintf(mem_usage, sizeof(mem_usage), "%ld\n", mem_val);
+
+	return simple_read_from_buffer(buf, count, ppos, mem_usage, size);
+}
+
+static const struct file_operations vha_session_ocm_curr_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = vha_session_ocm_curr_read,
+};
+
 struct dbgfs_buf_info {
 	struct vha_session *session;
 	struct vha_buffer  *buf;
@@ -770,6 +808,16 @@ int vha_dbg_create_hwbufs(struct vha_session *session)
 						session, &vha_session_mmu_curr_fops))
 				dev_warn(vha->dev,
 					"%s: failed to create mmu_usage_curr!\n",
+					__func__);
+			if (!debugfs_create_file("ocm_usage_max", S_IRUGO, session->dbgfs,
+						session, &vha_session_ocm_max_fops))
+				dev_warn(vha->dev,
+					"%s: failed to create ocm_usage_max!\n",
+					__func__);
+			if (!debugfs_create_file("ocm_usage_curr", S_IRUGO, session->dbgfs,
+						session, &vha_session_ocm_curr_fops))
+				dev_warn(vha->dev,
+					"%s: failed to create ocm_usage_curr!\n",
 					__func__);
 
 			if (!debugfs_create_file("buffer_dump", S_IRUGO, session->dbgfs,
@@ -1840,6 +1888,7 @@ void vha_dbg_init(struct vha_dev *vha)
 
 	VHA_DBGFS_CREATE_RO(u32, "mem_usage_last", stats.mem_usage_last, debugfs_dir);
 	VHA_DBGFS_CREATE_RO(u32, "mmu_usage_last", stats.mmu_usage_last, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "ocm_usage_last", stats.ocm_usage_last, debugfs_dir);
 	VHA_DBGFS_CREATE_RO(u32, "total_failures", stats.total_failures, debugfs_dir);
 
 	if (vha->hw_props.supported.rtm) {

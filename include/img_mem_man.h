@@ -192,6 +192,7 @@ int img_mem_sync_device_to_cpu(struct mem_ctx *ctx, int buf_id);
 
 int img_mem_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr);
 int img_mmu_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr);
+int img_ocm_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr);
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 struct dma_fence * img_mem_add_fence(struct mem_ctx *ctx, int buf_id);

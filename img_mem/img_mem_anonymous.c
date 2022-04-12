@@ -99,6 +99,11 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 		struct page *page = pages[i];
 		sg_set_page(sgl, page, PAGE_SIZE, 0);
 
+		if (trace_physical_pages)
+			pr_info("%s:%d phys %#llx length %d\n",
+				 __func__, __LINE__,
+				 (unsigned long long)sg_phys(sgl), sgl->length);
+
 		/* Sanity check if physical address is
 		 * accessible from the device PoV */
 		if (~dma_get_mask(device) & sg_phys(sgl)) {
@@ -108,11 +113,6 @@ static int anonymous_heap_import(struct device *device, struct heap *heap,
 			ret = -ERANGE;
 			goto dma_mask_check_failed;
 		}
-
-		if (trace_physical_pages)
-			pr_info("%s:%d phys %#llx length %d\n",
-				 __func__, __LINE__,
-				 (unsigned long long)sg_phys(sgl), sgl->length);
 	}
 
 	pr_debug("%s:%d buffer %d orig_nents %d\n", __func__, __LINE__,

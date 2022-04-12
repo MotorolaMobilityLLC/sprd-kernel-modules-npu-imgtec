@@ -64,6 +64,8 @@ struct mem_ctx {
 	size_t mem_usage_curr;
 	size_t mmu_usage_max;
 	size_t mmu_usage_curr;
+	size_t ocm_usage_max;
+	size_t ocm_usage_curr;
 };
 
 /* An MMU mapping of a buffer */
