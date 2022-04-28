@@ -109,9 +109,9 @@ int vha_dev_prepare(struct vha_dev *vha)
 {
 	/* Enable core events */
 	img_pdump_printf("-- Enable CORE events\n");
-	IOWRITE64_PDUMP(VHA_CORE_EVNTS | VHA_EVENT_TYPE(READY), VHA_CR_OS(VHA_EVENT_ENABLE));
+	IOWRITE64_PDUMP(VHA_CORE_EVNTS, VHA_CR_OS(VHA_EVENT_ENABLE));
 	img_pdump_printf("-- Clear CORE events\n");
-	IOWRITE64_PDUMP(VHA_CORE_EVNTS | VHA_EVENT_TYPE(READY), VHA_CR_OS(VHA_EVENT_CLEAR));
+	IOWRITE64_PDUMP(VHA_CORE_EVNTS, VHA_CR_OS(VHA_EVENT_CLEAR));
 
 	return 0;
 }
