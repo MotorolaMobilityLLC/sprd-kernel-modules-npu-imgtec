@@ -54,7 +54,7 @@
 #define VHA_CORE_WDT_CYCLES           0x7fffff
 #elif defined(HW_AX3)
 /* MMM can transfer any number of bytes at cost of higher cycles, setting it to ~100ms @800MHz */
-#define VHA_CORE_WDT_CYCLES           0xfffffff
+#define VHA_CORE_WDT_CYCLES           0x80000000
 /* Memory watchdog is set ~1ms @800MHz which is very safe value to avoid any false interrupts */
 #define VHA_CORE_MEM_WDT_CYCLES       0xffffffff
 #endif
@@ -91,9 +91,11 @@
 #ifdef CONFIG_HW_MULTICORE
 #define VHA_OCM_ADDR_START 0x1000
 #else
-#define VHA_OCM_ADDR_START (~0)
+#define VHA_OCM_ADDR_START 0x27200000
 #endif
 
+#define VHA_FREQ_KHZ 0
+#define VHA_OCM_MEM_SIZE 524288
 /* IO hooks */
 uint64_t vha_plat_read64(void *addr);
 void vha_plat_write64(void *addr, uint64_t val);

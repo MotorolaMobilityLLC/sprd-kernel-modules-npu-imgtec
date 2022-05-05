@@ -97,7 +97,7 @@ static int pm_delay = 0;
 module_param(pm_delay, int, S_IRUSR | S_IRGRP);
 MODULE_PARM_DESC(pm_delay, "Delay, in ms, before powering off the core that's idle");
 
-static int freq_khz = -1;
+static int freq_khz = VHA_FREQ_KHZ;
 module_param(freq_khz, int, 0444);
 MODULE_PARM_DESC(freq_khz,
 	"core frequency in kHz, -1=start self measurement during driver load, 0=use platform defined value, otherwise (>0) declared value is used");
@@ -130,7 +130,7 @@ static unsigned long onchipmem_phys_start= VHA_OCM_ADDR_START;
 module_param(onchipmem_phys_start, ulong, 0444);
 MODULE_PARM_DESC(onchipmem_phys_start,
 	"Physical address of start of on-chip ram. '0xFs' means that ocm is disabled");
-static uint32_t onchipmem_size;
+static uint32_t onchipmem_size = VHA_OCM_MEM_SIZE;
 module_param(onchipmem_size, uint, 0444);
 MODULE_PARM_DESC(onchipmem_size,
 	"Size of on-chip memory in bytes");
