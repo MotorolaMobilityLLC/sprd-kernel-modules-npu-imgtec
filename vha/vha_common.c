@@ -540,12 +540,12 @@ int vha_deinit(void)
 		img_mmu_get_usage(drv.mem_ctx, &mmu_usage, NULL);
 
 		{
-			uint32_t mem_MB, mem_kB, mmu_MB, mmu_kB;
+			size_t mem_MB, mem_kB, mmu_MB, mmu_kB;
 
 			CALC_MEM_USAGE(mem, mem_usage);
 			CALC_MEM_USAGE(mmu, mmu_usage);
 
-			pr_debug("%s: Total kernel memory used: %u.%u MB (MMU: %u.%u MB)\n",
+			pr_debug("%s: Total kernel memory used: %zu.%zu MB (MMU: %u.%u MB)\n",
 					__func__, mem_MB, mem_kB, mmu_MB, mmu_kB);
 		}
 
