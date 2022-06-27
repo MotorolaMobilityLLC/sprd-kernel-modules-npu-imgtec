@@ -1749,7 +1749,7 @@ static struct imgmmu_page *_page_alloc(void *arg, unsigned char type)
 		else
 			page->page.phys_addr = sg_phys(sgt->sgl);
 	} else if (heap->ops && heap->ops->get_page_array) {
-		uint64_t *addrs;
+		uint64_t *addrs = NULL;
 
 		ret = heap->ops->get_page_array(heap, buffer, &addrs);
 		if (ret) {
@@ -1845,7 +1845,7 @@ static void _page_write(struct imgmmu_page *page,
 	uint64_t paddr = entry;
 
 	mmu_page = container_of(page, struct mmu_page, page);
-	virt += ((1<<imgmmu_get_entry_shift(mmu_page->type))) * offset;
+	virt += (((uint64_t)1<<imgmmu_get_entry_shift(mmu_page->type))) * offset;
 
 	if (mmu_page->type == IMGMMU_PTYPE_PC ||
 		mmu_page->type == IMGMMU_PTYPE_PD)
@@ -2021,7 +2021,7 @@ static uint64_t _page_read(struct imgmmu_page *page,
 	struct buffer *buf = (struct buffer*)priv;
 
 	mmu_page = container_of(page, struct mmu_page, page);
-	virt += ((1<<imgmmu_get_entry_shift(mmu_page->type))) * offset;
+	virt += (((uint64_t)1<<imgmmu_get_entry_shift(mmu_page->type))) * offset;
 
 	if (mmu_page->type == IMGMMU_PTYPE_PC ||
 		mmu_page->type == IMGMMU_PTYPE_PD)

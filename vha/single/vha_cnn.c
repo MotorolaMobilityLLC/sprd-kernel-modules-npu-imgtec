@@ -206,7 +206,7 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 				* (VHA_CR_OS(CNN_ALT_ADDRESS1)
 				- VHA_CR_OS(CNN_ALT_ADDRESS0));
 			/* record what alt address is in use */
-			alt_addrs_used |= 1 << user_cmd->regidx[i-1];
+			alt_addrs_used |= (uint64_t)1 << user_cmd->regidx[i-1];
 #if defined(HW_AX3)
 			/* Alternative addresses from 8 to 15 are
 			 * located in different place */
@@ -216,7 +216,7 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 				* (VHA_CR_OS(CNN_ALT_ADDRESS1)
 				- VHA_CR_OS(CNN_ALT_ADDRESS0));
 			}
-			alt_addrs_used |= buf->req_type <<
+			alt_addrs_used |= (uint64_t)buf->req_type <<
 				(VHA_CR_OS(CNN_ALT_ADDRESS_USED_ALT_ADDR0_BUF_TYPE_SHIFT) +
 				user_cmd->regidx[i-1]);
 #elif defined(HW_AX2)

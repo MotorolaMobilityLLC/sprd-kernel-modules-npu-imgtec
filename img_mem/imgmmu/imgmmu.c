@@ -637,7 +637,7 @@ uint64_t imgmmu_cat_get_pte(struct imgmmu_cat *cat,
 	struct imgmmu_dir *dir;
 	struct imgmmu_pagetab *tab;
 	uint64_t addr;
-	unsigned flags;
+	unsigned flags = 0;
 
 	if (vaddr & (imgmmu_get_page_size()-1))
 		return (uint64_t)-1;
@@ -859,7 +859,7 @@ static struct imgmmu_dirmap *mmu_dir_map(struct imgmmu_dir *dir,
 	num_pages_to_update++;
 
 	for (i = 0; i < entries; i++) {
-		uint64_t curr_phy_addr;
+		uint64_t curr_phy_addr = 0;
 
 		if (phys_iter_next(phys_iter_arg, &curr_phy_addr) != 0) {
 			mmu_log_err("not enough entries in physical address array/sg list!\n");
@@ -1348,6 +1348,8 @@ static int mmu_dir_unmap(struct imgmmu_dirmap *map)
 int imgmmu_cat_unmap(struct imgmmu_map *map)
 {
 	WARN_ON(map == NULL);
+	if (!map)
+		return -EINVAL;
 
 	while (!list_empty(&map->dir_maps)) {
 		struct imgmmu_dirmap *dir_map;
@@ -1363,6 +1365,9 @@ int imgmmu_cat_unmap(struct imgmmu_map *map)
 		dir = dir_map->dir;
 		cat = dir->cat;
 		WARN_ON(cat == NULL);
+		if (!cat)
+			return -EINVAL;
+
 		/* This destroys the mapping */
 		mmu_dir_unmap(dir_map);
 

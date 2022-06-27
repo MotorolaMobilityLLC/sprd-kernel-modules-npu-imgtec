@@ -854,6 +854,8 @@ static void vha_clean_onchip_maps(struct vha_session *session, struct vha_buffer
 
 	WARN_ON(!buf);
 	WARN_ON(!session);
+	if (buf == NULL || session == NULL)
+		return;
 
 	list_for_each_entry_safe(onchip_map, tmp, &buf->onchip_maps, list) {
 		idr_remove(&session->onchip_maps, onchip_map->mapid);
