@@ -313,6 +313,7 @@ static const struct file_operations vha_mmu_ptedump_fops = {
 	.read    = seq_read,
 };
 
+#ifdef CONFIG_SPRD_DEBUG
 static void *vha_buffer_dump_start(struct seq_file *seq, loff_t *pos)
 {
 	struct vha_session *session = seq->private;
@@ -419,6 +420,7 @@ static const struct file_operations vha_buffer_dump_fops = {
 	.llseek  = seq_lseek,
 	.release = seq_release,
 };
+#endif
 
 static ssize_t vha_session_mem_max_read(struct file *file, char __user *buf,
 			size_t count, loff_t *ppos)
@@ -819,12 +821,13 @@ int vha_dbg_create_hwbufs(struct vha_session *session)
 				dev_warn(vha->dev,
 					"%s: failed to create ocm_usage_curr!\n",
 					__func__);
-
+#ifdef CONFIG_SPRD_DEBUG
 			if (!debugfs_create_file("buffer_dump", S_IRUGO, session->dbgfs,
 								session, &vha_buffer_dump_fops))
 					dev_warn(vha->dev,
 							"%s: failed to create buffer_dump!\n",
 							__func__);
+#endif
 		}
 	}
 
@@ -1082,8 +1085,9 @@ static ssize_t vha_bvnc_read(struct file *file, char __user *buf, size_t len,
 	struct vha_dev *vha = file->private_data;
 	char bvnc[4*6];
 
-	size_t size = snprintf(bvnc, sizeof(bvnc), "%llu.%llu.%llu.%llu\n",
-					core_id_quad(vha->hw_props.core_id));
+	size_t size = snprintf(bvnc, sizeof(bvnc), "%u.%u.%u.%u\n",
+							vha->hw_props.core_id_b, vha->hw_props.core_id_v,
+							vha->hw_props.core_id_n, vha->hw_props.core_id_c);
 
 	return simple_read_from_buffer(buf, len, ppos, bvnc, size);
 }
@@ -1132,6 +1136,63 @@ static const struct file_operations vha_pri_q_counters_fops = {
 	.owner = THIS_MODULE,
 	.open = simple_open,
 	.read = vha_pri_q_counters_read,
+};
+
+static ssize_t vha_irq_stats_read(struct file *file, char __user *buf, size_t len,
+					 loff_t *ppos)
+{
+#define MAX_IRQ_STAT_MEAN_LEN    16
+#define MAX_IRQ_STATS_LEN        64
+#define MAX_IRQ_STATS_REPORT_LEN (MAX_IRQ_STATS_LEN * 5)
+#define FORMAT_STAT_LINE(stat, pfx) \
+	do { \
+		mean_int = vha->stats.irq_##stat##_mean / 1000000; \
+		mean_frac = vha->stats.irq_##stat##_mean % 1000000; \
+		mean_frac_adj = (((mean_frac % 1000) > 499) ? 1 : 0); \
+		mean_frac = (mean_frac / 1000) + mean_frac_adj; \
+		mean_int += mean_frac / 1000; \
+		mean_frac = mean_frac % 1000; \
+		snprintf(irq_stat_mean_txt, MAX_IRQ_STAT_MEAN_LEN, "%10llu.%03llu", mean_int, mean_frac); \
+		size += snprintf(irq_stats_txt, MAX_IRQ_STATS_LEN, \
+						pfx"  %10llu  %10llu  %14s\n", \
+						vha->stats.irq_##stat##_min, vha->stats.irq_##stat##_max, irq_stat_mean_txt); \
+		strcat(irq_stats_report_txt, irq_stats_txt); \
+	} while(0)
+
+	struct vha_dev *vha = file->private_data;
+	int ret;
+	char irq_stats_txt[MAX_IRQ_STATS_LEN] = "";
+	char irq_stats_report_txt[MAX_IRQ_STATS_REPORT_LEN] =
+			"                min[us]     max[us]        mean[us]\n";
+	char irq_stat_mean_txt[MAX_IRQ_STAT_MEAN_LEN] = "";
+
+	ret = mutex_lock_interruptible(&vha->lock);
+	if (!ret) {
+		size_t size = strlen(irq_stats_report_txt);
+		uint64_t mean_int, mean_frac, mean_frac_adj;
+
+		FORMAT_STAT_LINE(th, "top exec   ");
+		FORMAT_STAT_LINE(bh, "btm exec   ");
+		FORMAT_STAT_LINE(th2th, "top to top ");
+		FORMAT_STAT_LINE(th2bh, "top to btm ");
+
+		mutex_unlock(&vha->lock);
+
+		return simple_read_from_buffer(buf, len, ppos, irq_stats_report_txt, size);
+	}
+
+	return ret;
+
+#undef MAX_IRQ_STAT_MEAN_LEN
+#undef MAX_IRQ_STATS_LEN
+#undef MAX_IRQ_STATS_REPORT_LEN
+#undef FORMAT_STAT_LINE
+}
+
+static const struct file_operations vha_irq_stats_fops = {
+	.owner = THIS_MODULE,
+	.open = simple_open,
+	.read = vha_irq_stats_read,
 };
 
 /* Real Time Monitor facilities.
@@ -1874,6 +1935,10 @@ void vha_dbg_init(struct vha_dev *vha)
 	VHA_DBGFS_CREATE_RO(u32, "cnn_kicks_completed", stats.cnn_kicks_completed, debugfs_dir);
 	VHA_DBGFS_CREATE_RO(u32, "cnn_kicks_cancelled", stats.cnn_kicks_cancelled, debugfs_dir);
 	VHA_DBGFS_CREATE_RO(u32, "cnn_kicks_aborted", stats.cnn_kicks_aborted, debugfs_dir);
+#ifdef KERNEL_DMA_FENCE_SUPPORT
+	VHA_DBGFS_CREATE_RO(u32, "syncs_in_signalled", stats.syncs_in_signalled, debugfs_dir);
+	VHA_DBGFS_CREATE_RO(u32, "syncs_out_signalled", stats.syncs_out_signalled, debugfs_dir);
+#endif
 	VHA_DBGFS_CREATE_RO(u64, "cnn_total_proc_us", stats.cnn_total_proc_us, debugfs_dir);
 	VHA_DBGFS_CREATE_RO(u64, "cnn_last_proc_us", stats.cnn_last_proc_us, debugfs_dir);
 	VHA_DBGFS_CREATE_RO(u64, "cnn_avg_proc_us", stats.cnn_avg_proc_us, debugfs_dir);
@@ -1903,6 +1968,7 @@ void vha_dbg_init(struct vha_dev *vha)
 	VHA_DBGFS_CREATE_FILE(S_IWUSR, "stats_reset", stats_reset);
 	VHA_DBGFS_CREATE_FILE(S_IRUGO, "BVNC", bvnc);
 	VHA_DBGFS_CREATE_FILE(S_IRUGO, "pri_q_counters", pri_q_counters);
+	VHA_DBGFS_CREATE_FILE(S_IRUGO, "irq_stats", irq_stats);
 #ifdef CONFIG_HW_MULTICORE
 	VHA_DBGFS_CREATE_FILE(S_IRUGO, "cnn_kicks_per_core", cnn_kicks_per_core);
 	VHA_DBGFS_CREATE_FILE(S_IRUGO, "cnn_utilization_per_core", cnn_utilization_per_core);

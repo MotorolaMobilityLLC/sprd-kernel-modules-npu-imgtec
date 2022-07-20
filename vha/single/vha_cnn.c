@@ -50,6 +50,7 @@
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
+#include "vha_devfreq.h"
 
 static uint32_t cnn_pdump_poll_count = 10000000;
 module_param(cnn_pdump_poll_count, uint, 0444);
@@ -86,10 +87,7 @@ static int do_cmd_cnn_submit(struct vha_cmd *cmd)
 	int ret = -EINVAL;
 	uint64_t alt_addrs_used = 0;
 	size_t user_cmd_size;
-#ifdef VHA_DEVFREQ
-	ktime_t now;
-#endif
-	
+
 	if (vha->hw_bypass) {
 		ret = -EAGAIN;
 		dev_info(vha->dev, "%s skip\n", __func__);
@@ -328,6 +326,10 @@ hw_kick:
 	/* Remember the time cnn is kicked */
 	GETNSTIMEOFDAY(&cmd->hw_proc_start);
 	vha->stats.hw_proc_start = cmd->hw_proc_start;
+#ifdef VHA_DEVFREQ
+	if (vha->devfreq)
+		vha_update_dvfs_state(vha, true);
+#endif
 	/* Need to generate proper pdump */
 	if (cmd->queued &&
 			vha->low_latency == VHA_LL_SW_KICK) {
@@ -348,12 +350,6 @@ hw_kick:
 	}
 
 	vha->stats.cnn_kicks++;
-#ifdef VHA_DEVFREQ
-	if (vha->devfreq) {
-		now = ktime_get();
-		vha_update_dvfs_state(vha, true, &now);
-	}
-#endif
 	/* notify any observers of the submit event */
 	if (vha_observers.submitted)
 		vha_observers.submitted(vha->id, session->id, cmd->user_cmd.cmd_id,
@@ -576,6 +572,23 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 		 * - this does pdump SAB when proper checkpoint is set */
 		vha_dbg_flush_hwbufs(session, 1, 0);
 
+#ifdef KERNEL_DMA_FENCE_SUPPORT
+		/* Release input fences */
+		for (i = 0; i < user_cmd->num_inbufs; i++) {
+			struct vha_buffer *buf = vha_find_bufid(session, user_cmd->data[i]);
+
+			if (buf) {
+				struct vha_buf_sync_info *sync_info = &buf->sync_info;
+				if (sync_info->in_fence) {
+					dma_fence_remove_callback(sync_info->in_fence, &sync_info->in_sync_cb);
+					dma_fence_put(sync_info->in_fence);
+					sync_info->in_fence = NULL;
+					memset(&sync_info->in_sync_cb, 0, sizeof(struct dma_fence_cb));
+				}
+			}
+		}
+#endif
+
 		/* pdump SAB for each of the output buffers */
 		img_pdump_printf("-- Save outputs\n");
 		for (i = user_cmd->num_inbufs; i < user_cmd->num_bufs; i++) {
@@ -614,7 +627,8 @@ void vha_cnn_cmd_completed(struct vha_cmd *cmd, int status)
 				img_mem_sync_device_to_cpu(session->mem_ctx, buf->id);
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
-			img_mem_signal_fence(session->mem_ctx, buf->id);
+			if (img_mem_signal_fence(session->mem_ctx, buf->id, status ? -EIO : 0) == 0)
+				session->vha->stats.syncs_out_signalled++;
 #endif
 			vha_dump_digest(session, buf, cmd);
 		}

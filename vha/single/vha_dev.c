@@ -39,17 +39,27 @@
  *
  *****************************************************************************/
 
+#include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/irq.h>
 #include <linux/moduleparam.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
 #include <linux/random.h>
+#include <linux/kthread.h>
+#include <linux/sched.h>
+#include <linux/wait.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+#include <linux/sched.h>
+#else
+#include <linux/sched/task.h>
+#endif
 
 #include <uapi/vha.h>
 #include "vha_common.h"
 #include "vha_plat.h"
 #include "vha_regs.h"
+#include "vha_devfreq.h"
 
 #if defined(CFG_SYS_VAGUS)
 #include <hwdefs/nn_sys_cr_vagus.h>
@@ -339,11 +349,13 @@ irqreturn_t vha_handle_irq(struct device *dev)
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	int ret = IRQ_HANDLED;
 	uint64_t event_status;
-#ifdef VHA_DEVFREQ
-	ktime_t now;
-#endif
+	uint64_t tmp = 0;
+	struct TIMESPEC irq_th_time, irq_th_time_end;
+
 	if (!vha)
 		return IRQ_NONE;
+
+	GETNSTIMEOFDAY(&irq_th_time);
 
 	event_status = IOREAD64(vha->reg_base, VHA_CR_OS(VHA_EVENT_STATUS));
 	event_status &= IOREAD64(vha->reg_base, VHA_CR_OS(VHA_EVENT_ENABLE));
@@ -428,15 +440,13 @@ irqreturn_t vha_handle_irq(struct device *dev)
 				vha->irq_count = count - vha->stream_count;
 
 			vha->stream_count = count;
-#ifdef VHA_DEVFREQ
-		if (vha->devfreq) {
-			now = ktime_get();
-			vha_update_dvfs_state(vha, false, &now);
-		}
-#endif
 			/* Record hw processing end timestamps */
 			vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
 			GETNSTIMEOFDAY(&vha->stats.hw_proc_end);
+#ifdef VHA_DEVFREQ
+			if (vha->devfreq)
+				vha_update_dvfs_state(vha, false);
+#endif
 		} else {
 			/* Command may have been aborted before this handler is executed */
 			vha->irq_status = 0;
@@ -445,11 +455,40 @@ irqreturn_t vha_handle_irq(struct device *dev)
 		}
 		spin_unlock(&vha->irq_lock);
 
-		ret = IRQ_WAKE_THREAD;
+		if (vha_plat_use_bh_thread()) {
+			vha->irq_bh_counter++;
+			if (vha->irq_bh_counter == U32_MAX)
+				dev_warn(dev, "IRQ counter capacity reached. Possible IRQ loss.");
+			wake_up_interruptible(&vha->irq_bh_wq);
+			ret = IRQ_HANDLED;
+		} else {
+			ret = IRQ_WAKE_THREAD;
+		}
 	} else
 		return IRQ_NONE;
 
 	dev_dbg(dev, "IRQ 0x%08llx\n", event_status);
+
+	vha->irq_th_time_prev = vha->irq_th_time;
+	vha->irq_th_time = irq_th_time;
+	vha->stats.irq_th_current_num++;
+	if (vha->stats.irq_th_current_num > 1) {
+		get_timespan_us(&vha->irq_th_time_prev, &vha->irq_th_time, &tmp);
+		if (tmp > vha->stats.irq_th2th_max)
+			vha->stats.irq_th2th_max = tmp;
+		if ((vha->stats.irq_th2th_min == 0) || (tmp < vha->stats.irq_th2th_min))
+			vha->stats.irq_th2th_min = tmp;
+		vha->stats.irq_th2th_mean = (vha->stats.irq_th2th_mean * (vha->stats.irq_th_current_num - 2) +
+										(tmp * 1000000)) / (vha->stats.irq_th_current_num - 1);
+	}
+	GETNSTIMEOFDAY(&irq_th_time_end);
+	get_timespan_us(&vha->irq_th_time, &irq_th_time_end, &tmp);
+	if (tmp > vha->stats.irq_th_max)
+		vha->stats.irq_th_max = tmp;
+	if ((vha->stats.irq_th_min == 0) || (tmp < vha->stats.irq_th_min))
+		vha->stats.irq_th_min = tmp;
+	vha->stats.irq_th_mean = (vha->stats.irq_th_mean * (vha->stats.irq_th_current_num - 1) +
+									(tmp * 1000000)) / vha->stats.irq_th_current_num;
 
 	return ret;
 }
@@ -719,6 +758,102 @@ void vha_dummy_worker(struct work_struct *work)
 }
 #endif
 
+static void vha_get_task_data(char **policy, int *priority)
+{
+	switch(current->policy & 0xff) {
+	case SCHED_NORMAL:
+		*policy = "SCHED_NORMAL";
+		break;
+	case SCHED_FIFO:
+		*policy = "SCHED_FIFO";
+		break;
+	case SCHED_RR:
+		*policy = "SCHED_RR";
+		break;
+	case SCHED_BATCH:
+		*policy = "SCHED_BATCH";
+		break;
+	case SCHED_IDLE:
+		*policy = "SCHED_IDLE";
+		break;
+	case SCHED_DEADLINE:
+		*policy = "SCHED_DEADLINE";
+		break;
+	default:
+		*policy = "SCHED_???";
+		break;
+	}
+	if ((current->policy == SCHED_FIFO) ||
+		(current->policy == SCHED_RR)   ||
+		(current->policy == SCHED_DEADLINE))
+		*priority = current->rt_priority;
+	else
+		*priority = task_nice(current);
+}
+
+static int vha_bh_thread(void *data)
+{
+	struct device *dev = data;
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
+	signed long ret = 0;
+	bool run_bh = true;
+	char* policy;
+	int prio = 0;
+
+	/* Increase priority of bottom half task */
+	prio = task_nice(current) - 10 ;
+	if (prio < MIN_NICE)
+		prio = MIN_NICE;
+	set_user_nice(current, prio);
+
+	vha_get_task_data(&policy, &prio);
+	dev_dbg(dev, "%s: starting bottom half thread (%s/%d)...\n",
+			__func__, policy, prio);
+
+	/* Process interrupts while not interrupted or explicitly stopped */
+	while (run_bh) {
+		if (wait_event_interruptible(vha->irq_bh_wq, (vha->irq_bh_stop || (vha->irq_bh_counter > 0))) == 0) {
+			mutex_lock(&vha->lock);
+			if (vha->irq_bh_stop)
+				run_bh = false;
+			else {
+				vha_handle_thread_irq(dev);
+				vha->irq_bh_counter--;
+			}
+
+			mutex_unlock(&vha->lock);
+		} else
+			run_bh = false;
+	}
+
+	dev_dbg(dev, "%s: stopping bottom half thread...\n", __func__);
+
+	do_exit(0);
+
+	return ret;
+}
+
+int vha_start_irq_bh_thread(struct device *dev)
+{
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
+
+	vha->irq_bh_thread  = kthread_create(vha_bh_thread, dev, "vha_bh_thread");
+	if (IS_ERR(vha->irq_bh_thread)) {
+		int err = PTR_ERR(vha->irq_bh_thread);
+		if (err == -EINTR) {
+			pr_warn("%s: bottom half thread killed before start\n",	__func__);
+			return -ENOENT;
+		} else {
+			pr_err("%s: low on memory\n", __func__);
+			return -ENOMEM;
+		}
+	}
+	get_task_struct(vha->irq_bh_thread);
+	wake_up_process(vha->irq_bh_thread);
+
+	return 0;
+}
+
 /* Bottom half */
 irqreturn_t vha_handle_thread_irq(struct device *dev)
 {
@@ -727,11 +862,24 @@ irqreturn_t vha_handle_thread_irq(struct device *dev)
 	uint64_t status;
 	uint8_t count, c = 0;
 	int err = 0;
+	uint64_t tmp = 0;
+	struct TIMESPEC irq_bh_time, irq_bh_time_end;
 
 	if (!vha)
 		return IRQ_NONE;
 
-	mutex_lock(&vha->lock);
+	if (!vha_plat_use_bh_thread())
+		mutex_lock(&vha->lock);
+
+	GETNSTIMEOFDAY(&irq_bh_time);
+	get_timespan_us(&vha->irq_th_time, &irq_bh_time, &tmp);
+	vha->stats.irq_bh_current_num++;
+	if (tmp > vha->stats.irq_th2bh_max)
+		vha->stats.irq_th2bh_max = tmp;
+	if ((vha->stats.irq_th2bh_min == 0) || (tmp < vha->stats.irq_th2bh_min))
+		vha->stats.irq_th2bh_min = tmp;
+	vha->stats.irq_th2bh_mean = (vha->stats.irq_th2bh_mean * (vha->stats.irq_bh_current_num - 1) +
+									(tmp * 1000000)) / vha->stats.irq_bh_current_num;
 
 #ifdef CONFIG_FAULT_INJECTION
 	if (!vha->irq_bh_pid)
@@ -843,7 +991,18 @@ exit:
 	if (vha->fault_inject & VHA_FI_IRQ_WORKER)
 		current->make_it_fail = false;
 #endif
-	mutex_unlock(&vha->lock);
+
+	GETNSTIMEOFDAY(&irq_bh_time_end);
+	get_timespan_us(&irq_bh_time, &irq_bh_time_end, &tmp);
+	if (tmp > vha->stats.irq_bh_max)
+		vha->stats.irq_bh_max = tmp;
+	if ((vha->stats.irq_bh_min == 0) || (tmp < vha->stats.irq_bh_min))
+		vha->stats.irq_bh_min = tmp;
+	vha->stats.irq_bh_mean = (vha->stats.irq_bh_mean * (vha->stats.irq_bh_current_num - 1) +
+									(tmp * 1000000)) / vha->stats.irq_bh_current_num;
+
+	if (!vha_plat_use_bh_thread())
+		mutex_unlock(&vha->lock);
 
 	return ret;
 }
@@ -1291,8 +1450,10 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 	props->dummy_dev = true;
 	props->num_cnn_core_devs = 1;
 #else
-	props->product_id  = IOREAD64(vha->reg_base, VHA_CR_PRODUCT_ID);
-	props->core_id  = IOREAD64(vha->reg_base, VHA_CR_CORE_ID);
+	props->product_id    = IOREAD64(vha->reg_base, VHA_CR_PRODUCT_ID);
+	props->core_id       = IOREAD64(vha->reg_base, VHA_CR_CORE_ID);
+	props->integrator_id = IOREAD64(vha->reg_base, VHA_CR_CORE_IP_INTEGRATOR_ID);
+	props->changelist    = IOREAD64(vha->reg_base, VHA_CR_CORE_IP_CHANGELIST);
 #endif
 	props->skip_bvnc_check = false;
 	/*
@@ -1344,14 +1505,10 @@ int vha_dev_get_props(struct vha_dev *vha, uint32_t onchipmem_size)
 			__func__, props->features);
 	dev_dbg(vha->dev, "%s: soc_axi: %#llx\n",
 			__func__, props->soc_axi);
-	{
-		uint64_t tmp = IOREAD64(vha->reg_base,
-				VHA_CR_CORE_IP_INTEGRATOR_ID);
-		dev_dbg(vha->dev, "%s: ip integrator id: %#llx\n",
-				__func__, tmp);
-		tmp = IOREAD64(vha->reg_base, VHA_CR_CORE_IP_CHANGELIST);
-		dev_dbg(vha->dev, "%s: ip change list: %llu\n", __func__, tmp);
-	}
+	dev_dbg(vha->dev, "%s: ip integrator id: %#llx\n",
+			__func__, props->integrator_id);
+	dev_dbg(vha->dev, "%s: ip change list: %llu\n",
+			__func__, props->changelist);
 
 #if defined(CFG_SYS_VAGUS)
 	ocm_size_kb = IOREAD64(vha->reg_base, NN_SYS_CR(CORE_IP_CONFIG)) &

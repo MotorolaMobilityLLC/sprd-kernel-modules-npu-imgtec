@@ -18,10 +18,16 @@
 #include <linux/of_platform.h>
 #include <linux/devfreq.h>
 #include <linux/pm_opp.h>
-#include <linux/sprd_npu_cooling.h>
 #include <linux/sprd_sip_svc.h>
 #include <linux/kernel.h>
 #include <linux/thermal.h>
+#include <linux/version.h>
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
+#include <linux/sprd_npu_cooling.h>
+#else
+#include <linux/unisoc_npu_cooling.h>
+#endif
 
 #include "vha_common.h"
 #include "vha_chipdep.h"
@@ -265,7 +271,7 @@ static void vha_pm_get_dvfs_utilisation(struct vha_dev *vha, ktime_t now)
 	vha->cur_state.time_period_start = now;
 }
 
-void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtimestamp)
+void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active)
 {
 	ktime_t now;
 	unsigned long flags;
@@ -273,11 +279,8 @@ void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtim
 		return;
 
 	spin_lock_irqsave(&vha->cur_state.lock, flags);
-	if (!endtimestamp) {
-		now = ktime_get();
-		endtimestamp = &now;
-	}
-	vha_pm_get_dvfs_utilisation(vha, *endtimestamp);
+	now = ktime_get();
+	vha_pm_get_dvfs_utilisation(vha, now);
 	vha->cur_state.vha_active = vha_active;
 
 	spin_unlock_irqrestore(&vha->cur_state.lock, flags);
@@ -424,8 +427,8 @@ int vha_devfreq_init(struct vha_dev *vha)
 		goto devfreq_add_device_failed;
 	}
 
-	vha->devfreq->max_freq = dp->freq_table[dp->max_state - 1];
-	vha->devfreq->min_freq = dp->freq_table[0];
+	vha->devfreq->scaling_max_freq = dp->freq_table[dp->max_state - 1];
+	vha->devfreq->scaling_min_freq = dp->freq_table[0];
 
 	npu_dvfs_ctx.max_freq_khz = dp->freq_table[dp->max_state - 1] / 1000UL;
 	npu_dvfs_ctx.npu_dvfs_on = 1;
@@ -438,9 +441,10 @@ int vha_devfreq_init(struct vha_dev *vha)
 
 	ret = npu_cooling_device_register(vha->devfreq);
 	if (ret) {
-		dev_err(vha->dev, "Failed to register npu cooling device\n", ret);
+		dev_err(vha->dev, "Failed to register npu cooling device\n");
 		goto npu_cooling_device_register_failed;
 	}
+
 	npu_dvfs_ctx.npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
 	if (!npu_dvfs_ctx.npu_tz) {
 		dev_err(vha->dev, "Failed to get ai thermal zone\n");
@@ -450,7 +454,6 @@ int vha_devfreq_init(struct vha_dev *vha)
 
 	npu_dvfs_ctx.cooling_device = true;
 	npu_dvfs_ctx.dvfs_init = true;
-
 	return ret;
 
 get_ai_thermal_zone_failed:
@@ -477,6 +480,7 @@ void vha_devfreq_term(struct vha_dev *vha)
 
 	if (npu_dvfs_ctx.cooling_device)
 		npu_cooling_device_unregister();
+
 	npu_dvfs_ctx.cooling_device = false;
 
 	devfreq_unregister_opp_notifier(vha->dev, vha->devfreq);

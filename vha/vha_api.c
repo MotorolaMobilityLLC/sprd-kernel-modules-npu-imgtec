@@ -198,6 +198,9 @@ static ssize_t vha_read_wrapper(struct file *file, char __user *buf,
 	struct vha_session *session = (struct vha_session *)file->private_data;
 	struct vha_dev *vha = session->vha;
 
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		return -EACCES;
+
 #ifdef CONFIG_FAULT_INJECTION
 	if (vha->fault_inject & VHA_FI_READ)
 		current->make_it_fail = true;
@@ -253,6 +256,9 @@ static unsigned int vha_poll_wrapper(struct file *file, poll_table *wait)
 	unsigned int ret = 0;
 	struct vha_session *session = (struct vha_session *)file->private_data;
 	struct vha_dev *vha = session->vha;
+
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		return -EACCES;
 
 #ifdef CONFIG_FAULT_INJECTION
 	if (vha->fault_inject & VHA_FI_READ)
@@ -332,6 +338,9 @@ static ssize_t vha_write_wrapper(struct file *file, const char __user *buf,
 	struct vha_session *session = (struct vha_session *)file->private_data;
 	struct vha_dev *vha = session->vha;
 
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		return -EACCES;
+
 #ifdef CONFIG_FAULT_INJECTION
 	if (vha->fault_inject & VHA_FI_WRITE)
 		current->make_it_fail = true;
@@ -371,7 +380,7 @@ static int vha_open(struct inode *inode, struct file *file)
 	session->vha = vha;
 
 	/* memory context for all buffers used by this session */
-	ret = img_mem_create_proc_ctx(&session->mem_ctx);
+	ret = img_mem_create_proc_ctx(vha->id, &session->mem_ctx);
 	if (ret) {
 		dev_err(miscdev->this_device, "%s: failed to create context!\n",
 			__func__);
@@ -379,18 +388,21 @@ static int vha_open(struct inode *inode, struct file *file)
 		return ret;
 	}
 
-	for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++)
-		INIT_LIST_HEAD(&session->cmds[pri]);
-	INIT_LIST_HEAD(&session->rsps);
-	INIT_LIST_HEAD(&session->bufs);
-	init_waitqueue_head(&session->wq);
-
 	mutex_init(&session->pm_lock);
-
 	file->private_data = session;
 	pm_runtime_get_sync(vha->dev);
 
-	ret = vha_add_session(session);
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		ret = vha_add_session_ro(session);
+	else {
+		for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++)
+			INIT_LIST_HEAD(&session->cmds[pri]);
+		INIT_LIST_HEAD(&session->rsps);
+		INIT_LIST_HEAD(&session->bufs);
+		init_waitqueue_head(&session->wq);
+
+		ret = vha_add_session(session);
+	}
 	if (ret) {
 		img_mem_destroy_proc_ctx(session->mem_ctx);
 		devm_kfree(miscdev->this_device, session);
@@ -438,7 +450,10 @@ static int vha_release(struct inode *inode, struct file *file)
 
 	vha_session_pm_get(session);
 
-	vha_rm_session(session);
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		vha_rm_session_ro(session);
+	else
+		vha_rm_session(session);
 	img_mem_destroy_proc_ctx(session->mem_ctx);
 
 	vha_session_pm_release(session);
@@ -566,8 +581,8 @@ static long vha_ioctl_import(struct vha_session *session, void __user *buf)
 	if (copy_from_user(&data, buf, sizeof(data)))
 		return -EFAULT;
 
-	dev_dbg(miscdev->this_device, "%s: session %u, buf_fd 0x%016llx, size %llu, heap_id %u\n",
-			__func__, session->id, data.buf_fd, data.size, data.heap_id);
+	dev_dbg(miscdev->this_device, "%s: session %u, fd %d / cpu_ptr %#llx, size %llu, heap_id %u\n",
+			__func__, session->id, data.buf_fd, data.cpu_ptr, data.size, data.heap_id);
 
 	ret = img_mem_import(session->vha->dev, session->mem_ctx, data.heap_id,
 					(size_t)data.size, data.attributes, data.buf_fd,
@@ -900,7 +915,6 @@ static long vha_ioctl_state(struct vha_session *session, void __user *buf)
 	return 0;
 }
 
-#ifdef VHA_DEVFREQ
 static long vha_ioctl_max_freq(struct vha_session *session, void __user *buf)
 {
 	int ret = 0;
@@ -912,11 +926,12 @@ static long vha_ioctl_max_freq(struct vha_session *session, void __user *buf)
 		return -EFAULT;
 	}
 
+#ifdef VHA_DEVFREQ
 	ret = vha_set_max_freq(max);
+#endif
 
 	return ret;
 }
-#endif
 
 static long vha_ioctl_version(struct vha_session *session,
 					void __user *buf)
@@ -979,10 +994,8 @@ static long vha_ioctl(struct file *file, unsigned int code, unsigned long value)
 		return vha_ioctl_clk_ctrl(session, (void __user *)value);
 	case VHA_IOC_DEVICE_STATE:
 		return vha_ioctl_state(session, (void __user*)value);
-#ifdef VHA_DEVFREQ
 	case VHA_IOC_MAX_FREQ:
 		return vha_ioctl_max_freq(session, (void __user*)value);
-#endif
 	case VHA_IOC_VERSION:
 		return vha_ioctl_version(session, (void __user *)value);
 	default:
@@ -997,6 +1010,9 @@ static long vha_ioctl_wrapper(struct file *file, unsigned int code, unsigned lon
 	long ret = 0;
 	struct vha_session *session = (struct vha_session *)file->private_data;
 	struct vha_dev *vha = session->vha;
+
+	if (((file->f_flags & O_ACCMODE) == O_RDONLY) && (code != VHA_IOC_HW_PROPS))
+		return -EACCES;
 
 #ifdef CONFIG_FAULT_INJECTION
 	if (vha->fault_inject & VHA_FI_IOCTL)
@@ -1040,6 +1056,9 @@ static int vha_mmap_wrapper(struct file *file, struct vm_area_struct *vma)
 	int ret = 0;
 	struct vha_session *session = (struct vha_session *)file->private_data;
 	struct vha_dev *vha = session->vha;
+
+	if ((file->f_flags & O_ACCMODE) == O_RDONLY)
+		return -EACCES;
 
 #ifdef CONFIG_FAULT_INJECTION
 	if (vha->fault_inject & VHA_FI_MMAP)
@@ -1090,7 +1109,7 @@ int vha_api_add_dev(struct device *dev, struct vha_dev *vha, unsigned int id)
 
 	snprintf(dev_name, VHA_MAX_NODE_NAME, "vha%d", id);
 
-	dev_dbg(dev, "%s: trying to register misc dev %s...\n",
+	dev_dbg(dev, "%s: trying to register VHA misc /dev/%s ...\n",
 		__func__, dev_name);
 
 	vha->miscdev.minor = MISC_DYNAMIC_MINOR;
@@ -1105,7 +1124,7 @@ int vha_api_add_dev(struct device *dev, struct vha_dev *vha, unsigned int id)
 		goto out_register;
 	}
 
-	dev_dbg(dev, "%s: misc dev registered successfully\n", __func__);
+	dev_dbg(dev, "%s: VHA misc device registered successfully\n", __func__);
 
 	return 0;
 
@@ -1124,14 +1143,15 @@ int vha_api_rm_dev(struct device *dev, struct vha_dev *vha)
 		return -EINVAL;
 	}
 
-	dev_dbg(dev, "%s: trying to deregister VHA misc device\n", __func__);
+	dev_dbg(dev, "%s: trying to deregister VHA misc /dev/%s ...\n",
+				__func__, vha->miscdev.name);
 
 	/* note: since linux v4.3, misc_deregister does not return errors */
 	misc_deregister(&vha->miscdev);
 
 	devm_kfree(dev, (void *)vha->miscdev.name);
 
-	dev_dbg(dev, "%s: VHA misc dev deregistered: %d\n", __func__, ret);
+	dev_dbg(dev, "%s: VHA misc device deregistered: %d\n", __func__, ret);
 
 	return ret;
 }

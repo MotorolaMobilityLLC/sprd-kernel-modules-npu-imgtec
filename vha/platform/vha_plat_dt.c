@@ -85,14 +85,24 @@ static unsigned int irq_poll_interval_ms = 100; /* 100 ms */
 module_param(irq_poll_interval_ms, uint, 0444);
 MODULE_PARM_DESC(irq_poll_interval_ms, "Time in ms between each interrupt poll");
 
+static bool use_bh_thread = false;
+module_param(use_bh_thread, bool, 0444);
+MODULE_PARM_DESC(use_bh_thread,
+		"Use separate bottom half thread: 0 -> no, 1 -> yes");
+
+#define MAX_IRQ_POLL 8
+
+static int num_devs = 0;
+
 /* Global timer used when irq poll mode is switched on.
- * NOTE: only single core instance is supported in polling mode */
+ * NOTE: MAX_IRQ_POLL instances is supported in polling mode */
 static struct poll_timer {
 	struct platform_device *pdev;
 	struct timer_list tmr;
 	bool enabled;
+	int id;
 
-} irq_poll_timer;
+} irq_poll_timer[MAX_IRQ_POLL];
 
 struct irq_functions {
 	char *irq_name;
@@ -117,7 +127,6 @@ static irqreturn_t dt_plat_isrcb(int irq, void *dev_id)
 
 	return vha_handle_irq(&ofdev->dev);
 }
-
 static struct irq_functions irq_func_table[] = {
 	[0].irq_name = "ai_powervr_0",
 	[0].irq_top_half = &dt_plat_isrcb,
@@ -143,18 +152,26 @@ static struct irq_functions irq_func_table[] = {
 #endif
 };
 
-static int dt_plat_reg_irqs(struct platform_device *ofdev)
+static int dt_plat_reg_irqs(struct platform_device *ofdev, bool use_bh_thread)
 {
 	int ret = 0;
 	int i, irq_count = ARRAY_SIZE(irq_func_table);
+
 	for (i = 0; i < irq_count; i++) {
 		irq_func_table[i].irq_num = of_irq_get_byname(ofdev->dev.of_node, irq_func_table[i].irq_name);
-		if (irq_func_table[i].irq_num == 0) {
+		if (irq_func_table[i].irq_num <= 0) {
 			dev_err(&ofdev->dev, "could not map IRQ\n");
 			return -ENXIO;
 		}
-		ret = devm_request_threaded_irq(&ofdev->dev, irq_func_table[i].irq_num, irq_func_table[i].irq_top_half,
+		if (use_bh_thread) {
+			vha_start_irq_bh_thread(&ofdev->dev);
+			ret = devm_request_irq(&ofdev->dev, irq_func_table[i].irq_num, irq_func_table[i].irq_top_half,
+				IRQF_SHARED, DEVICE_NAME, ofdev);
+		}
+		else {
+			ret = devm_request_threaded_irq(&ofdev->dev, irq_func_table[i].irq_num, irq_func_table[i].irq_top_half,
 				irq_func_table[i].irq_bottom_half, IRQF_SHARED, DEVICE_NAME, ofdev);
+		}
 		if (ret) {
 			dev_err(&ofdev->dev, "failed to request irq\n");
 			return ret;
@@ -175,20 +192,32 @@ static void dt_plat_poll_interrupt(unsigned long ctx)
 	struct poll_timer *poll_timer = (struct poll_timer *)ctx;
 #endif
 	struct platform_device *ofdev = poll_timer->pdev;
-	int ret;
 
 	if (!poll_timer->enabled)
 		return;
 
-	preempt_disable();
-	ret = vha_handle_irq(&ofdev->dev);
-	preempt_enable();
-	if (ret == IRQ_WAKE_THREAD)
-		vha_handle_thread_irq(&ofdev->dev);
+	if (use_bh_thread) {
+		preempt_disable();
+		vha_handle_irq(&ofdev->dev);
+		preempt_enable();
+	} else {
+		int ret;
+		preempt_disable();
+		ret = vha_handle_irq(&ofdev->dev);
+		//pr_info("%s: [%d] ret: %d\n", __func__, poll_timer->id, ret);
+		preempt_enable();
+		if (ret == IRQ_WAKE_THREAD)
+			vha_handle_thread_irq(&ofdev->dev);
+	}
 
 	/* retrigger */
 	mod_timer(&poll_timer->tmr,
 			jiffies + msecs_to_jiffies(irq_poll_interval_ms));
+}
+
+bool vha_plat_use_bh_thread(void)
+{
+	return use_bh_thread;
 }
 
 static int vha_plat_probe(struct platform_device *ofdev)
@@ -258,24 +287,28 @@ static int vha_plat_probe(struct platform_device *ofdev)
 	}
 
 	if (!poll_interrupts) {
-		ret = dt_plat_reg_irqs(ofdev);
+		ret = dt_plat_reg_irqs(ofdev, use_bh_thread);
 		if (ret) {
-			dev_err(&ofdev->dev, "failed to register irqs\n");
+			dev_err(&ofdev->dev, "failed to request irq\n");
 			goto out_irq;
 		}
 	} else {
-		irq_poll_timer.pdev = ofdev;
-		irq_poll_timer.enabled = true;
+		irq_poll_timer[num_devs].pdev = ofdev;
+		irq_poll_timer[num_devs].enabled = true;
+		irq_poll_timer[num_devs].id = num_devs;
 		/* Setup and start poll timer */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4,15,0)
-		timer_setup(&irq_poll_timer.tmr, dt_plat_poll_interrupt, 0);
+		timer_setup(&irq_poll_timer[num_devs].tmr, dt_plat_poll_interrupt, 0);
 #else
-		setup_timer(&irq_poll_timer.tmr, dt_plat_poll_interrupt,
+		setup_timer(&irq_poll_timer[num_devs].tmr, dt_plat_poll_interrupt,
 				(uintptr_t)&irq_poll_timer);
 #endif
-		mod_timer(&irq_poll_timer.tmr,
+		mod_timer(&irq_poll_timer[num_devs].tmr,
 				jiffies + msecs_to_jiffies(irq_poll_interval_ms));
+		pr_info("%s: start irq poll timer: %d\n", __func__, irq_poll_timer[num_devs].id);
 	}
+
+	num_devs++;
 
 	/* Try to calibrate the core if needed */
 	ret = vha_dev_calibrate(&ofdev->dev, FREQ_MEASURE_CYCLES);
@@ -388,8 +421,12 @@ int vha_plat_deinit(void)
 	int ret;
 
 	if (poll_interrupts) {
-		irq_poll_timer.enabled = false;
-		del_timer_sync(&irq_poll_timer.tmr);
+	    int i;
+
+	    for (i = 0; i < num_devs; i++) {
+	    	irq_poll_timer[i].enabled = false;
+	    	del_timer_sync(&irq_poll_timer[i].tmr);
+	    }
 	}
 
 	/* Unregister the driver from the OS */

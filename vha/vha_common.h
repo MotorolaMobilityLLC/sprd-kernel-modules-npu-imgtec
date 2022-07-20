@@ -137,13 +137,13 @@
 #ifdef VHA_MMU_MULTI_HW_CTX_SUPPORT
 #if defined(HW_AX2) || defined(CONFIG_HW_MULTICORE)
 #  define VHA_MMU_GET_CTXID(session) \
-		(((session->mmu_ctxs[0].id-1) + session->vha->mmu_ctx_default) \
-		% VHA_MMU_MAX_HW_CTXS)
+		(((session->mmu_ctxs[0].id) + session->vha->mmu_ctx_default) \
+		% VHA_MMU_MAX_HW_CTXS);
 #elif defined(HW_AX3)
 #  define VHA_MMU_GET_CTXID(session) \
 		((_OSID_ * VHA_MMU_MAX_HW_CTXS) + \
-		(((session->mmu_ctxs[0].id-1) + session->vha->mmu_ctx_default) \
-		% (VHA_MMU_MAX_HW_CTXS / 2)))
+		(((session->mmu_ctxs[0].id) + session->vha->mmu_ctx_default) \
+		% (VHA_MMU_MAX_HW_CTXS / 2)));
 #endif
 #else
 #  define VHA_MMU_GET_CTXID(session) \
@@ -373,6 +373,12 @@ struct vha_stats {
 	uint32_t cnn_kicks_cancelled;
 	/* Total cnn kicks that were interrupted during processing */
 	uint32_t cnn_kicks_aborted;
+#ifdef KERNEL_DMA_FENCE_SUPPORT
+	/* Total number of signalled input syncs */
+	uint32_t syncs_in_signalled;
+	/* Total number of signalled output syncs */
+	uint32_t syncs_out_signalled;
+#endif
 	/* CNN total processing time */
 	uint64_t cnn_total_proc_us;
 	/* CNN last processing time */
@@ -395,6 +401,26 @@ struct vha_stats {
 	uint32_t mmu_usage_last;
 	/* Total memory used for OCM mappings by the last session */
 	uint32_t ocm_usage_last;
+	/* Current number of top half calls */
+	uint64_t irq_th_current_num;
+	/* Current number of bottom half calls */
+	uint64_t irq_bh_current_num;
+	/* Top half handling time stats */
+	uint64_t irq_th_min;
+	uint64_t irq_th_max;
+	uint64_t irq_th_mean;
+	/* Bottom half handling time stats */
+	uint64_t irq_bh_min;
+	uint64_t irq_bh_max;
+	uint64_t irq_bh_mean;
+	/* Top half to bottom half transition time stats */
+	uint64_t irq_th2bh_min;
+	uint64_t irq_th2bh_max;
+	uint64_t irq_th2bh_mean;
+	/* Top half to top half time stats */
+	uint64_t irq_th2th_min;
+	uint64_t irq_th2th_max;
+	uint64_t irq_th2th_mean;
 	/* Hw power on timestamp (temporary var) */
 	struct TIMESPEC hw_start;
 #ifdef CONFIG_HW_MULTICORE
@@ -522,6 +548,7 @@ struct vha_dev {
 	struct mutex               lock;
 	struct device             *dev;
 	struct list_head           list;            /* entry in <struct vha_drv:devices> */
+	struct list_head           ro_sessions;     /* list of um read only sessions: vha_session */
 	struct list_head           sessions;        /* list of um sessions: vha_session */
 	struct list_head           sched_sessions[VHA_MAX_PRIORITIES]; /* scheduling list of um sessions*/
 	uint32_t                   pri_q_counters[VHA_MAX_PRIORITIES]; /* priority queue WL counters */
@@ -556,6 +583,13 @@ struct vha_dev {
 	struct vha_apm_work        apm_dworks[VHA_NUM_CORES]; /* APM delayed work */
 	spinlock_t                 irq_lock;
 	pid_t                      irq_bh_pid;
+
+	/* used only if separate bottom half thread is used */
+	struct task_struct        *irq_bh_thread;
+	wait_queue_head_t          irq_bh_wq;
+	uint32_t                   irq_bh_counter;
+	bool                       irq_bh_stop;
+
 	unsigned long              irq_flags;
 #ifdef CONFIG_HW_MULTICORE
 	struct vha_mc_irq_status   irq_status;
@@ -566,6 +600,10 @@ struct vha_dev {
 #endif
 	int                        int_heap_id;     /* heap id for internal
 			allocations such as crc/debug data, MMU page tables */
+
+	/* top half timestamps */
+	struct TIMESPEC            irq_th_time_prev;
+	struct TIMESPEC            irq_th_time;
 
 	struct vha_hwcmd           pendcmd[VHA_NUM_CORES];   /* pending command */
 	struct vha_hwcmd           queuedcmd[VHA_NUM_CORES]; /* queued command */
@@ -651,14 +689,6 @@ struct vha_dev {
 	struct vha_devfreq_metrics last_devfreq_metrics;
 	struct vha_pm_metrics_state cur_state;
 };
-
-#ifdef VHA_DEVFREQ
-void vha_devfreq_suspend(struct device *dev);
-void vha_devfreq_resume(struct device *dev);
-int vha_devfreq_init(struct vha_dev *vha);
-void vha_devfreq_term(struct vha_dev *vha);
-void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active, ktime_t *endtimestamp);
-#endif
 
 #ifdef CONFIG_HW_MULTICORE
 /* WL kick id count field. */
@@ -798,8 +828,6 @@ enum vha_req_type {
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 /* Buffer synchronisation data. */
 struct vha_buf_sync_info {
-	int                 in_sync_fd;   /* input sync file descriptor */
-	struct file        *in_sync_file; /* input sync file */
 	struct dma_fence   *in_fence;     /* input fence */
 	struct dma_fence_cb in_sync_cb;   /* input fence callback */
 };
@@ -908,6 +936,7 @@ int vha_map_to_onchip(struct vha_session *session,
 
 irqreturn_t vha_handle_irq(struct device *dev);
 irqreturn_t vha_handle_thread_irq(struct device *dev);
+int vha_start_irq_bh_thread(struct device *dev);
 
 #ifdef VHA_SCF
 void vha_start_swd(struct vha_dev *vha, int cmd_idx);
@@ -954,6 +983,8 @@ struct vha_buffer *vha_find_bufvaddr(const struct vha_session *session,
 void vha_chk_cmd_queues(struct vha_dev *vha, bool threaded);
 int vha_add_session(struct vha_session *session);
 void vha_rm_session(struct vha_session *session);
+int vha_add_session_ro(struct vha_session *session);
+void vha_rm_session_ro(struct vha_session *session);
 bool vha_rm_session_cmds(struct vha_session *session);
 bool vha_rm_session_cmds_masked(struct vha_session *session, uint32_t cmd_id,
 		uint32_t cmd_id_mask);

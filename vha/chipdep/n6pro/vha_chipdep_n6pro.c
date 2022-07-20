@@ -36,12 +36,9 @@
 
 struct npu_regmap{
 	struct regmap *ai_apb_regs;
-	struct regmap *ai_clock_regs;
-	struct regmap *ai_mtx_regs;
-	struct regmap *ai_busmon_regs;
-	struct regmap *top_dvfs_regs;
 	struct regmap *pmu_apb_regs;
 };
+
 static struct npu_regmap ai_regs;
 static struct regulator *vddai = NULL;
 
@@ -83,33 +80,9 @@ static int vha_init_regs(struct device *dev)
 		return -EINVAL;
 	}
 
-	ai_regs.ai_clock_regs = syscon_regmap_lookup_by_phandle(np, "clock_reg");
-	if (IS_ERR(ai_regs.ai_clock_regs)) {
-		dev_err_once(dev, "failed to get clock_reg\n");
-		return -EINVAL;
-	}
-
-	ai_regs.ai_mtx_regs = syscon_regmap_lookup_by_phandle(np, "mtx_reg");
-	if (IS_ERR(ai_regs.ai_mtx_regs)) {
-		dev_err_once(dev, "failed to get mtx_reg\n");
-		return -EINVAL;
-	}
-
-	ai_regs.ai_busmon_regs = syscon_regmap_lookup_by_phandle(np, "busmon_reg");
-	if (IS_ERR(ai_regs.ai_busmon_regs)) {
-		dev_err_once(dev, "failed to get busmon_reg\n");
-		return -EINVAL;
-	}
-
 	ai_regs.pmu_apb_regs = syscon_regmap_lookup_by_phandle(np, "pd_ai_sys");
 	if (IS_ERR(ai_regs.pmu_apb_regs)) {
 		dev_err_once(dev, "failed to get pd_ai_reg\n");
-		return -EINVAL;
-	}
-
-	ai_regs.top_dvfs_regs = syscon_regmap_lookup_by_phandle(np, "top_dvfs_cfg");
-	if (IS_ERR(ai_regs.top_dvfs_regs)) {
-		dev_err_once(dev, "failed to get top_dvfs_reg\n");
 		return -EINVAL;
 	}
 
@@ -120,6 +93,7 @@ static int vha_init_regs(struct device *dev)
 			return PTR_ERR(vddai);
 		}
 	}
+
 	return 0;
 }
 
@@ -280,7 +254,13 @@ static int vha_clockdomain_init(struct device *dev)
 static int vha_clockdomain_setup(struct device *dev)
 {
 	int num_clks = ARRAY_SIZE(clks);
-	clk_bulk_prepare_enable(num_clks, clks);
+	int ret = 0;
+
+	ret = clk_bulk_prepare_enable(num_clks, clks);
+	if (ret) {
+		dev_err(dev, "clk_bulk_prepare_enable failed, ret %d\n", ret);
+		return ret;
+	}
 
 	vha_auto_ckg_setup(dev);
 

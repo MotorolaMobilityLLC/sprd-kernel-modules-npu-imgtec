@@ -73,10 +73,13 @@ struct buffer_data {
 	struct sg_table *sgt;
 	enum img_mem_attr mattr;  /* memory attributes */
 	struct vm_area_struct *mapped_vma;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+	struct dma_buf_map map;
+#endif
 };
 
 static int dmabuf_heap_import(struct device *device, struct heap *heap,
-						size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+						size_t size, enum img_mem_attr attr, int buf_fd,
 						struct page **pages, struct buffer *buffer)
 {
 	struct buffer_data *data;
@@ -196,9 +199,13 @@ static void dmabuf_mmap_open(struct vm_area_struct *vma)
 
 static void dmabuf_mmap_close(struct vm_area_struct *vma)
 {
-	struct buffer *buffer = vma->vm_private_data;
+	struct buffer *buffer;
 	struct buffer_data *data;
 
+	if (!vma)
+		return;
+
+	buffer = vma->vm_private_data;
 	if (!buffer)
 		return;
 
@@ -221,17 +228,32 @@ static void dmabuf_mmap_close(struct vm_area_struct *vma)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 static vm_fault_t dmabuf_mmap_fault(struct vm_fault *vmf)
 {
-	struct vm_area_struct *vma = vmf->vma;
+	struct vm_area_struct *vma;
 #else
 static int dmabuf_mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 #endif
-	struct buffer *buffer = vma->vm_private_data;
-	struct buffer_data *data = buffer->priv;
-	struct sg_table *sgt = data->sgt;
+	struct buffer *buffer;
+	struct buffer_data *buffer_data;
+	struct sg_table *sgt;
 	struct scatterlist *sgl;
 	dma_addr_t phys = 0;
 	unsigned long addr;
+
+	if (!vmf)
+		return VM_FAULT_SIGBUS;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+	vma = vmf->vma;
+#endif
+	if (!vma)
+		return VM_FAULT_SIGBUS;
+
+	buffer = vma->vm_private_data;
+	if (!buffer)
+		return VM_FAULT_SIGBUS;
+
+	buffer_data = buffer->priv;
+	sgt = buffer_data->sgt;
 
 	if (trace_mmap_fault) {
 		pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",
@@ -371,11 +393,20 @@ static int dmabuf_heap_map_km(struct heap *heap, struct buffer *buffer)
 		return ret;
 	}
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 11, 0)
 	buffer->kptr = dma_buf_vmap(dma_buf);
 	if (!buffer->kptr) {
 		pr_err("%s dma_buf_vmap failed!\n", __func__);
 		return -EFAULT;
 	}
+#else
+	ret = dma_buf_vmap(dma_buf, &data->map);
+	if (ret) {
+		pr_err("%s dma_buf_vmap failed!\n", __func__);
+		return ret;
+	}
+	buffer->kptr = data->map.vaddr;
+#endif
 
 	pr_debug("%s:%d buffer %d vmap to 0x%p\n", __func__, __LINE__,
 		buffer->id, buffer->kptr);
@@ -403,7 +434,12 @@ static int dmabuf_heap_unmap_km(struct heap *heap, struct buffer *buffer)
 #endif
 					DMA_BIDIRECTIONAL);
 
-	dma_buf_vunmap(dma_buf, buffer->kptr);
+	dma_buf_vunmap(dma_buf,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 11, 0)
+			&data->map);
+#else
+			buffer->kptr);
+#endif
 
 	pr_debug("%s:%d buffer %d kunmap from 0x%p\n", __func__, __LINE__,
 		buffer->id, buffer->kptr);

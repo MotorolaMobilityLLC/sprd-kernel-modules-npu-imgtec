@@ -65,7 +65,7 @@ struct buffer_data {
 };
 
 static int anonymous_heap_import(struct device *device, struct heap *heap,
-						size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+						size_t size, enum img_mem_attr attr, int buf_fd,
 						struct page **pages, struct buffer *buffer)
 {
 	struct buffer_data *data;

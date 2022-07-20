@@ -114,6 +114,7 @@ union heap_options {
 		unsigned long offs; /* optional offset of the start
 							of memory as seen from device,
 							zero by default */
+		unsigned long aux_offs; /* auxiliary offset set in runtime */
 		int pool_order;  /* allocation order */
 	} carveout;
 #endif
@@ -163,13 +164,13 @@ int img_mem_get_heap_info(int heap_id, uint8_t *type, uint32_t *attrs);
 *  related to process context (contains SYSMEM heap's functionality in general)
 */
 
-int img_mem_create_proc_ctx(struct mem_ctx **ctx);
+int img_mem_create_proc_ctx(int dev_id, struct mem_ctx **ctx);
 void img_mem_destroy_proc_ctx(struct mem_ctx *ctx);
 
 int img_mem_alloc(struct device *device, struct mem_ctx *ctx, int heap_id,
 			size_t size, enum img_mem_attr attributes, int *buf_id);
 int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
-			 size_t size, enum img_mem_attr attributes, uint64_t buf_fd,
+			 size_t size, enum img_mem_attr attributes, int buf_fd,
 			 uint64_t cpu_ptr, int *buf_id);
 int img_mem_export(struct device *device, struct mem_ctx *ctx, int buf_id,
 			 size_t size, enum img_mem_attr attributes, uint64_t *buf_hnd);
@@ -196,8 +197,7 @@ int img_ocm_get_usage(const struct mem_ctx *ctx, size_t *max, size_t *curr);
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 struct dma_fence * img_mem_add_fence(struct mem_ctx *ctx, int buf_id);
-void img_mem_remove_fence(struct mem_ctx *ctx, int buf_id);
-int img_mem_signal_fence(struct mem_ctx *ctx, int buf_id);
+int img_mem_signal_fence(struct mem_ctx *ctx, int buf_id, int error);
 #endif
 
 /*

@@ -193,7 +193,7 @@ void vha_dev_wait(struct vha_dev *vha)
 #ifndef CONFIG_VHA_DUMMY
 	/* Poll only the READY bit, ignore all the others */
 	IOPOLL64(VHA_CR_OS(VHA_EVENT_STATUS_VHA_READY_EN),
-						1000000, 100,
+						vha_ready_count, 100,
 						VHA_CR_OS(VHA_EVENT_STATUS_VHA_READY_EN),
 						VHA_CR_OS(VHA_EVENT_STATUS));
 

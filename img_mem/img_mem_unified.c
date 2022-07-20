@@ -305,6 +305,7 @@ static void *unified_kmap_dmabuf(struct dma_buf *buf, unsigned long page)
 static int unified_map_km(struct heap *heap, struct buffer *buffer);
 static int unified_unmap_km(struct heap *heap, struct buffer *buffer);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0)
 static void *unified_vmap_dmabuf(struct dma_buf *buf)
 {
 	struct buffer *buffer = buf->priv;
@@ -314,7 +315,6 @@ static void *unified_vmap_dmabuf(struct dma_buf *buf)
 		return NULL;
 
 	heap = buffer->heap;
-
 	if (unified_map_km(heap, buffer))
 		return NULL;
 
@@ -340,6 +340,47 @@ static void unified_vunmap_dmabuf(struct dma_buf *buf, void *kptr)
 	if (buffer->kptr == kptr)
 		unified_unmap_km(heap, buffer);
 }
+#else
+static int unified_vmap_dmabuf(struct dma_buf *buf, struct dma_buf_map *map)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+	int ret = 0;
+
+	if (!buffer || !map)
+		return -EINVAL;
+
+	heap = buffer->heap;
+	ret = unified_map_km(heap, buffer);
+	if (ret)
+		return ret;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p\n", __func__, __LINE__,
+		buffer->id, buffer->kptr);
+
+	dma_buf_map_set_vaddr(map, buffer->kptr);
+
+	return ret;
+}
+
+static void unified_vunmap_dmabuf(struct dma_buf *buf, struct dma_buf_map *map)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer || !map)
+		return;
+
+	heap = buffer->heap;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer->kptr, map->vaddr);
+
+	if (buffer->kptr == map->vaddr)
+		unified_unmap_km(heap, buffer);
+	dma_buf_map_clear(map);
+}
+#endif
 
 static const struct dma_buf_ops unified_dmabuf_ops = {
 	.map_dma_buf = unified_map_dmabuf,
@@ -699,10 +740,14 @@ static void unified_mmap_open(struct vm_area_struct *vma)
 
 static void unified_mmap_close(struct vm_area_struct *vma)
 {
-	struct buffer *buffer = vma->vm_private_data;
+	struct buffer *buffer;
 	struct buffer_data *buffer_data;
 	struct sg_table *sgt;
 
+	if (!vma)
+		return;
+
+	buffer = vma->vm_private_data;
 	if (!buffer)
 		return;
 
@@ -733,18 +778,33 @@ static void unified_mmap_close(struct vm_area_struct *vma)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 static vm_fault_t unified_mmap_fault(struct vm_fault *vmf)
 {
-	struct vm_area_struct *vma = vmf->vma;
+	struct vm_area_struct *vma;
 #else
 static int unified_mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 #endif
-	struct buffer *buffer = vma->vm_private_data;
-	struct buffer_data *buffer_data = buffer->priv;
-	struct sg_table *sgt = buffer_data->sgt;
+	struct buffer *buffer;
+	struct buffer_data *buffer_data;
+	struct sg_table *sgt;
 	struct scatterlist *sgl;
 	struct page *page = NULL;
 	int err;
 	unsigned long addr;
+
+	if (!vmf)
+		return VM_FAULT_SIGBUS;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+	vma = vmf->vma;
+#endif
+	if (!vma)
+		return VM_FAULT_SIGBUS;
+
+	buffer = vma->vm_private_data;
+	if (!buffer)
+		return VM_FAULT_SIGBUS;
+
+	buffer_data = buffer->priv;
+	sgt = buffer_data->sgt;
 
 	if (trace_mmap_fault) {
 		pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",

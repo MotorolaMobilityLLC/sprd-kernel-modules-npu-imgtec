@@ -43,16 +43,16 @@
 #define VERSION_H
 
 /* ------------ DDK API ------------*/
-#define DDK_API_MAJOR_NUMBER 1
-#define DDK_API_MINOR_NUMBER 2
-#define DDK_API_PATCH_NUMBER 1
+#define DDK_API_MAJOR_NUMBER 2
+#define DDK_API_MINOR_NUMBER 0
+#define DDK_API_PATCH_NUMBER 0
 
 /* ------------ DDK Implementation ------------*/
 #define DDK_MAJOR_NUMBER 3
-#define DDK_MINOR_NUMBER 12
+#define DDK_MINOR_NUMBER 14
 
 /* ------------ Common build info ------------*/
-#define VERSION_STRING "REL_3.12-cl6219712"
+#define VERSION_STRING "REL_3.14-cl6273746"
 
 /* ------------ DDK version string helper macro ------------*/
 #define _VSTR_(s) #s
@@ -62,6 +62,6 @@
      "_DDK_" VSTR(DDK_MAJOR_NUMBER) "." VSTR(DDK_MINOR_NUMBER) "@" VERSION_STRING)
 
 /* ------------ Digest of the vha.h kernel interface -------------*/
-#define KERNEL_INTERFACE_DIGEST "ac6021ab8cee972249f29b9340613c84"
+#define KERNEL_INTERFACE_DIGEST "c0d861123db93c890132d3b2a181f656"
 
 #endif  // VERSION_H

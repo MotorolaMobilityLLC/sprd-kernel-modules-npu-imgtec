@@ -187,6 +187,7 @@ static void *coherent_kmap_dmabuf(struct dma_buf *buf, unsigned long page)
 static int coherent_heap_map_km(struct heap *heap, struct buffer *buffer);
 static int coherent_heap_unmap_km(struct heap *heap, struct buffer *buffer);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0)
 static void *coherent_vmap_dmabuf(struct dma_buf *buf)
 {
 	struct buffer *buffer = buf->priv;
@@ -222,6 +223,47 @@ static void coherent_vunmap_dmabuf(struct dma_buf *buf, void *kptr)
 	if (buffer->kptr == kptr)
 		coherent_heap_unmap_km(heap, buffer);
 }
+#else
+static int coherent_vmap_dmabuf(struct dma_buf *buf, struct dma_buf_map *map)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+	int ret = 0;
+
+	if (!buffer || !map)
+		return -EINVAL;
+
+	heap = buffer->heap;
+	ret = coherent_heap_map_km(heap, buffer);
+	if (ret)
+		return ret;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p\n", __func__, __LINE__,
+		buffer->id, buffer->kptr);
+
+	dma_buf_map_set_vaddr(map, buffer->kptr);
+
+	return ret;
+}
+
+static void coherent_vunmap_dmabuf(struct dma_buf *buf, struct dma_buf_map *map)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer || !map)
+		return;
+
+	heap = buffer->heap;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer->kptr, map->vaddr);
+
+	if (buffer->kptr == map->vaddr)
+		coherent_heap_unmap_km(heap, buffer);
+	dma_buf_map_clear(map);
+}
+#endif
 
 static const struct dma_buf_ops coherent_dmabuf_ops = {
 	.map_dma_buf = coherent_map_dmabuf,

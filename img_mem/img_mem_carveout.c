@@ -199,6 +199,7 @@ static void *carveout_kmap_dmabuf(struct dma_buf *buf, unsigned long page)
 static int carveout_heap_map_km(struct heap *heap, struct buffer *buffer);
 static int carveout_heap_unmap_km(struct heap *heap, struct buffer *buffer);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,11,0)
 static void *carveout_vmap_dmabuf(struct dma_buf *buf)
 {
 	struct buffer *buffer = buf->priv;
@@ -234,6 +235,47 @@ static void carveout_vunmap_dmabuf(struct dma_buf *buf, void *kptr)
 	if (buffer->kptr == kptr)
 		carveout_heap_unmap_km(heap, buffer);
 }
+#else
+static int carveout_vmap_dmabuf(struct dma_buf *buf, struct dma_buf_map *map)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+	int ret = 0;
+
+	if (!buffer || !map)
+		return -EINVAL;
+
+	heap = buffer->heap;
+	ret = carveout_heap_map_km(heap, buffer);
+	if (ret)
+		return ret;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p\n", __func__, __LINE__,
+		buffer->id, buffer->kptr);
+
+	dma_buf_map_set_vaddr(map, buffer->kptr);
+
+	return ret;
+}
+
+static void carveout_vunmap_dmabuf(struct dma_buf *buf, struct dma_buf_map *map)
+{
+	struct buffer *buffer = buf->priv;
+	struct heap *heap;
+
+	if (!buffer || !map)
+		return;
+
+	heap = buffer->heap;
+
+	pr_debug("%s:%d buffer %d kptr 0x%p (0x%p)\n", __func__, __LINE__,
+		buffer->id, buffer->kptr, map->vaddr);
+
+	if (buffer->kptr == map->vaddr)
+		carveout_heap_unmap_km(heap, buffer);
+	dma_buf_map_clear(map);
+}
+#endif
 
 static const struct dma_buf_ops carveout_dmabuf_ops = {
 	.map_dma_buf = carveout_map_dmabuf,
@@ -276,6 +318,8 @@ static int carveout_heap_export(struct device *device, struct heap *heap,
 	}
 
 	if (!buffer_data->sgt) {
+		unsigned long offset = heap->options.carveout.offs +
+				heap->options.carveout.aux_offs;
 		/* Create for the very first time */
 		buffer_data->sgt = kzalloc(sizeof(struct sg_table), GFP_KERNEL);
 		if (!buffer_data->sgt) {
@@ -289,14 +333,14 @@ static int carveout_heap_export(struct device *device, struct heap *heap,
 			goto free_sgt_mem;
 		}
 		sg_set_page(buffer_data->sgt->sgl,
-				pfn_to_page(PFN_DOWN(buffer_data->addr+heap->options.carveout.offs)),
+				pfn_to_page(PFN_DOWN(buffer_data->addr + offset)),
 				PAGE_ALIGN(size), 0);
 		/* Store dma info */
 		if (heap->to_dev_addr)
 			buffer_data->dma_base = heap->to_dev_addr(&heap->options,
-					buffer_data->addr+heap->options.carveout.offs);
+					buffer_data->addr + offset);
 		else
-			buffer_data->dma_base = buffer_data->addr+heap->options.carveout.offs;
+			buffer_data->dma_base = buffer_data->addr + offset;
 
 		buffer_data->dma_size = PAGE_ALIGN(size);
 		/* No mapping yet */
@@ -352,6 +396,8 @@ static int carveout_heap_alloc(struct device *device, struct heap *heap,
 	struct buffer_data *buffer_data;
 	phys_addr_t phys_addr;
 	size_t pages, page;
+	unsigned long offset = heap->options.carveout.offs +
+			heap->options.carveout.aux_offs;
 
 	pr_debug("%s:%d buffer %d (0x%p)\n", __func__, __LINE__,
 		buffer->id, buffer);
@@ -382,10 +428,18 @@ static int carveout_heap_alloc(struct device *device, struct heap *heap,
 		kfree(buffer_data);
 		return -ENOMEM;
 	}
+	if ((buffer_data->addr + heap->options.carveout.offs + size) >
+			(heap->options.carveout.phys + heap->options.carveout.size)) {
+		pr_err("%s gen_pool_alloc failed!\n", __func__);
+		gen_pool_free(heap_data->pool, buffer_data->addr, size);
+		kfree(buffer_data->addrs);
+		kfree(buffer_data);
+		return -ENOMEM;
+	}
 
 	/* The below assigns buffer_data->addr-> 1:1 mapping */
 	phys_addr = gen_pool_virt_to_phys(heap_data->pool,
-			buffer_data->addr + heap->options.carveout.offs);
+			buffer_data->addr + offset);
 
 	page = 0;
 	while (page < pages) {
@@ -452,9 +506,13 @@ static void carveout_mmap_open(struct vm_area_struct *vma)
 
 static void carveout_mmap_close(struct vm_area_struct *vma)
 {
-	struct buffer *buffer = vma->vm_private_data;
+	struct buffer *buffer;
 	struct buffer_data *buffer_data;
 
+	if (!vma)
+		return;
+
+	buffer = vma->vm_private_data;
 	if (!buffer)
 		return;
 
@@ -468,16 +526,30 @@ static void carveout_mmap_close(struct vm_area_struct *vma)
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
 static vm_fault_t carveout_mmap_fault(struct vm_fault *vmf)
 {
-	struct vm_area_struct *vma = vmf->vma;
+	struct vm_area_struct *vma;
 #else
 static int carveout_mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 #endif
-	struct buffer *buffer = vma->vm_private_data;
-	struct buffer_data *buffer_data = buffer->priv;
+	struct buffer *buffer;
+	struct buffer_data *buffer_data;
 	phys_addr_t phys_addr;
 	size_t pages, page;
 	unsigned long addr;
+
+	if (!vmf)
+		return VM_FAULT_SIGBUS;
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 11, 0)
+	vma = vmf->vma;
+#endif
+	if (!vma)
+		return VM_FAULT_SIGBUS;
+
+	buffer = vma->vm_private_data;
+	if (!buffer)
+		return VM_FAULT_SIGBUS;
+
+	buffer_data = buffer->priv;
 
 	if (trace_mmap_fault) {
 		pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",
@@ -638,12 +710,12 @@ static int carveout_heap_get_page_array(struct heap *heap,
 
 static int carveout_set_offset(struct heap *heap, size_t offs)
 {
-	if (heap->options.carveout.offs > heap->options.carveout.size) {
+	if (heap->options.carveout.offs + offs > heap->options.carveout.size) {
 		pr_err("%s offset exceeds size!\n", __func__);
 		return -EINVAL;
 	}
 
-	heap->options.carveout.offs = offs;
+	heap->options.carveout.aux_offs = offs;
 
 	return 0;
 }

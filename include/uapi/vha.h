@@ -72,11 +72,22 @@ extern "C" {
 /* device hw properties */
 struct vha_hw_props {
 	uint64_t product_id;
-	uint64_t core_id;
+	union {
+		uint64_t core_id;
+		struct {
+			uint16_t core_id_c;
+			uint16_t core_id_n;
+			uint16_t core_id_v;
+			uint16_t core_id_b;
+		};
+	};
+	uint64_t integrator_id;
+	uint64_t changelist;
 	uint64_t soc_axi;
 	uint8_t  mmu_width;	   /* MMU address width: 40, or 0 if no MMU */
 	uint8_t  mmu_ver;      /* MMU version */
 	uint32_t mmu_pagesize; /* MMU page size */
+	uint32_t memory_efficiency;
 
 	union {
 		struct {
@@ -95,10 +106,6 @@ struct vha_hw_props {
 	uint32_t clock_freq;		/* hardware clock rate, kHz */
 
 } __attribute__((aligned(8)));
-
-struct vha_cnn_props {
-	/* TOBEDONE */
-};
 
 /* command sent to device */
 enum vha_cmd_type {
@@ -254,7 +261,7 @@ struct vha_alloc_data {
 /* parameters to import a device buffer */
 struct vha_import_data {
 	uint64_t size;				/* [IN] Size of device memory (in bytes)    */
-	uint64_t buf_fd;			/* [IN] File descriptor */
+	int32_t buf_fd;			    /* [IN] File descriptor */
 	uint64_t cpu_ptr;			/* [IN] Cpu pointer of buffer to import */
 	uint32_t heap_id;			/* [IN] Heap ID of allocator                */
 	uint32_t attributes;	/* [IN] Attributes of buffer                */

@@ -103,4 +103,7 @@ void vha_plat_write64(void *addr, uint64_t val);
 int vha_plat_init(void);
 int vha_plat_deinit(void);
 
+/* Interrupt handling */
+bool vha_plat_use_bh_thread(void);
+
 #endif /* VHA_PLAT_H */

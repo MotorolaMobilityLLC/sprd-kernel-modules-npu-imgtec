@@ -62,9 +62,11 @@
 /* Minimum page size (4KB) bits. */
 #define MIN_PAGE_SIZE_BITS 12
 
+#define MAX_NUM_DEVS 8
+
 struct mem_man {
 	struct idr heaps;
-	struct idr mem_ctxs;
+	struct idr mem_ctxs[MAX_NUM_DEVS+1];
 	struct mutex mutex;
 
 	unsigned cache_ref;
@@ -290,13 +292,20 @@ EXPORT_SYMBOL(img_mem_get_heap_info);
 /*
  * related to process context (contains SYSMEM heap's functionality in general)
  */
-int img_mem_create_proc_ctx(struct mem_ctx **new_ctx)
+int img_mem_create_proc_ctx(int dev_id, struct mem_ctx **new_ctx)
 {
 	struct mem_man *mem_man = &mem_man_data;
 	struct mem_ctx *ctx;
 	int ret = 0;
 
 	pr_debug("%s:%d\n", __func__, __LINE__);
+
+	if (dev_id > MAX_NUM_DEVS)
+		return -EINVAL;
+
+	/* negative dev_id means that global ctx should be used */
+	if (dev_id < 0)
+		dev_id = MAX_NUM_DEVS;
 
 	ctx = kzalloc(sizeof(struct mem_ctx), GFP_KERNEL);
 	if (!ctx)
@@ -305,8 +314,10 @@ int img_mem_create_proc_ctx(struct mem_ctx **new_ctx)
 	idr_init(&ctx->buffers);
 	INIT_LIST_HEAD(&ctx->mmu_ctxs);
 
+	ctx->dev_id = dev_id;
+
 	mutex_lock(&mem_man->mutex);
-	ret = idr_alloc(&mem_man->mem_ctxs, ctx, 0 , MAX_PROC_CTX,
+	ret = idr_alloc(&mem_man->mem_ctxs[ctx->dev_id], ctx, 0 , MAX_PROC_CTX,
 			GFP_KERNEL);
 	if (ret < 0) {
 		mutex_unlock(&mem_man->mutex);
@@ -363,7 +374,7 @@ static void _img_mem_destroy_proc_ctx(struct mem_ctx *ctx)
 	}
 
 	idr_destroy(&ctx->buffers);
-	idr_remove(&mem_man->mem_ctxs, ctx->id);
+	idr_remove(&mem_man->mem_ctxs[ctx->dev_id], ctx->id);
 }
 
 void img_mem_destroy_proc_ctx(struct mem_ctx *ctx)
@@ -517,7 +528,7 @@ EXPORT_SYMBOL(img_mem_alloc);
 
 static int _img_mem_import(struct device *device,
 				struct mem_ctx *ctx, struct heap *heap,
-				size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+				size_t size, enum img_mem_attr attr, int buf_fd,
 				struct page **pages, struct buffer **buffer_new)
 {
 	struct mem_man *mem_man = &mem_man_data;
@@ -684,7 +695,7 @@ out_get_user_pages:
 }
 
 int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
-			size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+			size_t size, enum img_mem_attr attr, int buf_fd,
 			uint64_t cpu_ptr, int *buf_id)
 {
 	struct mem_man *mem_man = &mem_man_data;
@@ -693,7 +704,8 @@ int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
 	struct page **pages = NULL;
 	int ret;
 
-	pr_debug("%s heap %d ctx %p hnd %#llx\n", __func__, heap_id, ctx, buf_fd);
+	pr_debug("%s heap %d ctx %p fd %d / cpu_ptr %#llx\n", __func__,
+			heap_id, ctx, buf_fd, cpu_ptr);
 
 	if (cpu_ptr) {
 		ret = _img_mem_get_user_pages(size, cpu_ptr, &pages);
@@ -726,10 +738,8 @@ int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
 	if (cpu_ptr)
 		_img_mem_put_pages(size, pages);
 
-	pr_info("%s buf_fd %#llx heap %d (%s) buffer %d size %zu\n", __func__,
-		buf_fd, heap_id, get_heap_name(heap->type), *buf_id, size);
-	pr_debug("%s heap %d ctx %p created buffer %d (%p) size %zu\n",
-		__func__, heap_id, ctx, *buf_id, buffer, size);
+	pr_info("%s fd %d / cpu_ptr %#llx heap %d (%s) buffer %d size %zu\n", __func__,
+		buf_fd, cpu_ptr, heap_id, get_heap_name(heap->type), *buf_id, size);
 
 	return 0;
 
@@ -919,6 +929,7 @@ struct dma_fence * img_mem_add_fence(struct mem_ctx *ctx, int buf_id)
 {
 	struct mem_man *mem_man = &mem_man_data;
 	struct buffer *buffer;
+	unsigned i;
 
 	pr_debug("%s:%d buffer %d\n", __func__, __LINE__, buf_id);
 
@@ -931,68 +942,46 @@ struct dma_fence * img_mem_add_fence(struct mem_ctx *ctx, int buf_id)
 		return NULL;
 	}
 
-	if (buffer->fence) {
-		pr_err("%s: fence for buffer id %d already allocated and not freed \n",
+	for (i = 0; i < NUM_FENCES_PER_BUF; i++) {
+		if (buffer->fences[i] == NULL)
+			break;
+	}
+
+	if (i == NUM_FENCES_PER_BUF) {
+		pr_err("%s: all fences for buffer id %d already in use \n",
 					__func__, buf_id);
 		mutex_unlock(&mem_man->mutex);
 		return NULL;
 	}
 
-	buffer->fence = kmalloc(sizeof(struct buffer_fence), GFP_KERNEL);
-	if (!buffer->fence) {
+	buffer->fences[i] = kmalloc(sizeof(struct buffer_fence), GFP_KERNEL);
+	if (!buffer->fences[i]) {
 		pr_err("%s: cannot allocate fence for buffer id %d\n", __func__, buf_id);
 		mutex_unlock(&mem_man->mutex);
 		return NULL;
 	}
 
-	spin_lock_init(&buffer->fence->lock);
-	dma_fence_init(&buffer->fence->fence,
+	spin_lock_init(&buffer->fences[i]->lock);
+	dma_fence_init(&buffer->fences[i]->fence,
 					&dma_fence_ops,
-					&buffer->fence->lock,
+					&buffer->fences[i]->lock,
 					dma_fence_context_alloc(1),
 					1);
 
 	mutex_unlock(&mem_man->mutex);
 
-	return &buffer->fence->fence;
+	return dma_fence_get(&buffer->fences[i]->fence);
 }
 EXPORT_SYMBOL(img_mem_add_fence);
 
-void img_mem_remove_fence(struct mem_ctx *ctx, int buf_id)
+int img_mem_signal_fence(struct mem_ctx *ctx, int buf_id, int error)
 {
 	struct mem_man *mem_man = &mem_man_data;
 	struct buffer *buffer;
 	struct dma_fence *fence = NULL;
-
-	pr_debug("%s:%d buffer %d\n", __func__, __LINE__, buf_id);
-
-	mutex_lock(&mem_man->mutex);
-
-	buffer = idr_find(&ctx->buffers, buf_id);
-	if (!buffer) {
-		pr_err("%s: buffer id %d not found\n", __func__, buf_id);
-		mutex_unlock(&mem_man->mutex);
-		return;
-	}
-
-	if (buffer->fence) {
-		fence = &buffer->fence->fence;
-		buffer->fence = NULL;
-	}
-
-	mutex_unlock(&mem_man->mutex);
-
-	if (fence)
-		dma_fence_signal(fence);
-}
-EXPORT_SYMBOL(img_mem_remove_fence);
-
-int img_mem_signal_fence(struct mem_ctx *ctx, int buf_id)
-{
-	struct mem_man *mem_man = &mem_man_data;
-	struct buffer *buffer;
-	struct dma_fence *fence = NULL;
-	int ret = -1;
+	int ret = 0;
+	bool signalled = false;
+	unsigned i;
 
 	pr_debug("%s:%d buffer %d\n", __func__, __LINE__, buf_id);
 
@@ -1004,17 +993,32 @@ int img_mem_signal_fence(struct mem_ctx *ctx, int buf_id)
 		mutex_unlock(&mem_man->mutex);
 		return -1;
 	}
-	if (buffer->fence) {
-		fence = &buffer->fence->fence;
-		buffer->fence = NULL;
+
+	for (i = 0; i < NUM_FENCES_PER_BUF; i++) {
+		if (buffer->fences[i]) {
+			int temp_ret = 0;
+			fence = &buffer->fences[i]->fence;
+			buffer->fences[i] = NULL;
+
+			if (!dma_fence_is_signaled(fence)) {
+				if (error)
+					dma_fence_set_error(fence, error);
+				temp_ret = dma_fence_signal(fence);
+			}
+
+			dma_fence_put(fence);
+
+			if (temp_ret == 0)
+				signalled = true;
+			
+			ret |= temp_ret;
+		} else
+			break;
 	}
 
 	mutex_unlock(&mem_man->mutex);
 
-	if (fence)
-		ret = dma_fence_signal(fence);
-
-	return ret;
+	return signalled ? ret : -1;
 }
 EXPORT_SYMBOL(img_mem_signal_fence);
 #endif
@@ -2727,11 +2731,13 @@ EXPORT_SYMBOL(img_mem_calc_parity);
 int img_mem_init(void)
 {
 	struct mem_man *mem_man = &mem_man_data;
+	unsigned i;
 
 	pr_debug("%s:%d\n", __func__, __LINE__);
 
 	idr_init(&mem_man->heaps);
-	idr_init(&mem_man->mem_ctxs);
+	for (i = 0; i <= MAX_NUM_DEVS; i++)
+		idr_init(&mem_man->mem_ctxs[i]);
 	mutex_init(&mem_man->mutex);
 	mem_man->cache_ref = 0;
 
@@ -2745,20 +2751,23 @@ void img_mem_exit(void)
 	struct mem_ctx *ctx;
 	int heap_id;
 	int ctx_id;
+	unsigned i;
 
 	pr_debug("%s:%d\n", __func__, __LINE__);
 
 	/* keeps mutex checks (WARN_ON) happy, this will never actually wait */
 	mutex_lock(&mem_man->mutex);
 
-	ctx_id = 0;
-	ctx = idr_get_next(&mem_man->mem_ctxs, &ctx_id);
-	while (ctx) {
-		pr_warn("%s derelict memory context %p!\n", __func__, ctx);
-		_img_mem_destroy_proc_ctx(ctx);
-		kfree(ctx);
+	for (i = 0; i <= MAX_NUM_DEVS; i++) {
 		ctx_id = 0;
-		ctx = idr_get_next(&mem_man->mem_ctxs, &ctx_id);
+		ctx = idr_get_next(&mem_man->mem_ctxs[i], &ctx_id);
+		while (ctx) {
+			pr_warn("%s derelict memory context %p!\n", __func__, ctx);
+			_img_mem_destroy_proc_ctx(ctx);
+			kfree(ctx);
+			ctx_id = 0;
+			ctx = idr_get_next(&mem_man->mem_ctxs[i], &ctx_id);
+		}
 	}
 
 	heap_id = IMG_MEM_MAN_MIN_HEAP;
@@ -2771,7 +2780,8 @@ void img_mem_exit(void)
 		heap = idr_get_next(&mem_man->heaps, &heap_id);
 	}
 	idr_destroy(&mem_man->heaps);
-	idr_destroy(&mem_man->mem_ctxs);
+	for (i = 0; i <= MAX_NUM_DEVS; i++)
+		idr_destroy(&mem_man->mem_ctxs[i]);
 
 	mutex_unlock(&mem_man->mutex);
 

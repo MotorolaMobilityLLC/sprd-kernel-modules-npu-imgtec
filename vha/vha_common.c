@@ -39,6 +39,7 @@
  *
  *****************************************************************************/
 
+#include <linux/version.h>
 #include <linux/slab.h>
 #include <linux/device.h>
 #include <linux/gfp.h>
@@ -47,6 +48,12 @@
 #include <linux/jiffies.h>
 #include <linux/list.h>
 #include <linux/delay.h>
+#include <linux/kthread.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4, 11, 0)
+#include <linux/sched.h>
+#else
+#include <linux/sched/task.h>
+#endif
 
 #include <linux/pm_runtime.h>
 #include <linux/debugfs.h>
@@ -58,6 +65,7 @@
 #include "vha_plat.h"
 #include <vha_regs.h>
 #include "uapi/version.h"
+#include "vha_devfreq.h"
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 #include <linux/dma-fence.h>
@@ -134,6 +142,11 @@ static uint32_t onchipmem_size = VHA_OCM_MEM_SIZE;
 module_param(onchipmem_size, uint, 0444);
 MODULE_PARM_DESC(onchipmem_size,
 	"Size of on-chip memory in bytes");
+
+static uint32_t memory_efficiency = 0;
+module_param(memory_efficiency, uint, 0444);
+MODULE_PARM_DESC(memory_efficiency,
+	"DDR memory efficiency");
 
 /* bringup test: force MMU fault with MMU base register */
 static bool test_mmu_base_pf;
@@ -357,7 +370,7 @@ int vha_early_init(void)
 	INIT_LIST_HEAD(&drv.devices);
 
 	/* Create memory management context for HW buffers */
-	ret = img_mem_create_proc_ctx(&drv.mem_ctx);
+	ret = img_mem_create_proc_ctx(-1, &drv.mem_ctx);
 	if (ret) {
 		pr_err("%s: failed to create mem context (err:%d)!\n",
 			__func__, ret);
@@ -605,9 +618,10 @@ bool vha_dev_check_hw_capab(struct vha_dev* vha, uint64_t expected_hw_capab)
 	if (hw != mbs) {
 		dev_warn(vha->dev,
 			"%s: network was compiled for an incorrect hardware variant (BVNC): "
-			"found %llu.%llu.%llu.%llu, expected %llu.%llu.%llu.%llu\n",
+			"found %u.%u.%u.%u, expected %llu.%llu.%llu.%llu\n",
 			__func__,
-			core_id_quad(vha->hw_props.core_id),
+			vha->hw_props.core_id_b, vha->hw_props.core_id_v,
+			vha->hw_props.core_id_n, vha->hw_props.core_id_c,
 			core_id_quad(expected_hw_capab));
 		/* Conditionally allow the hw to be kicked */
 		if (test_without_bvnc_check)
@@ -705,7 +719,9 @@ int vha_add_session(struct vha_session *session)
 		return ret;
 
 #ifdef CONFIG_VHA_DUMMY
-	if (list_empty(&vha->sessions) && !vha->do_calibration)
+	if (list_empty(&vha->sessions) &&
+		list_empty(&vha->ro_sessions) &&
+		!vha->do_calibration)
 		vha_dev_start(vha);
 #endif
 
@@ -848,6 +864,39 @@ out_unlock:
 	return ret;
 }
 
+int vha_add_session_ro(struct vha_session *ro_session)
+{
+	struct vha_dev *vha = ro_session->vha;
+	int ret;
+	char version[100];
+
+	memset(version, 0, sizeof(version));
+	snprintf(version, sizeof(version)-1, NNA_VER_STR);
+
+	ret = mutex_lock_interruptible(&vha->lock);
+	if (ret)
+		return ret;
+
+#ifdef CONFIG_VHA_DUMMY
+	if (list_empty(&vha->sessions) &&
+		list_empty(&vha->ro_sessions) &&
+		!vha->do_calibration)
+		vha_dev_start(vha);
+#endif
+
+	/* Update current MMU page size, so that the correct
+	 * granularity is used when generating virtual addresses */
+	vha->hw_props.mmu_pagesize = mmu_page_size_kb_lut[vha->mmu_page_size];
+
+	/* Update clock frequency stored in props */
+	vha->hw_props.clock_freq = vha->freq_khz;
+
+	list_add_tail(&ro_session->list, &vha->ro_sessions);
+
+	mutex_unlock(&vha->lock);
+	return ret;
+}
+
 static void vha_clean_onchip_maps(struct vha_session *session, struct vha_buffer *buf)
 {
 	struct vha_onchip_map *onchip_map = NULL, *tmp = NULL;
@@ -868,15 +917,10 @@ static void vha_clean_onchip_maps(struct vha_session *session, struct vha_buffer
 void vha_rm_buf_fence(struct vha_session *session, struct vha_buffer *buf)
 {
 	struct vha_buf_sync_info *sync_info = &buf->sync_info;
-	img_mem_remove_fence(session->mem_ctx, buf->id);
+	if( img_mem_signal_fence(session->mem_ctx, buf->id, -EIO) == 0)
+		session->vha->stats.syncs_out_signalled++;
 	if (sync_info->in_fence) {
-		if (!dma_fence_is_signaled(sync_info->in_fence))
-			dma_fence_remove_callback(sync_info->in_fence, &sync_info->in_sync_cb);
-		if (sync_info->in_sync_file) {
-			fput(sync_info->in_sync_file);
-			sync_info->in_sync_file = NULL;
-		}
-		sync_info->in_sync_fd = VHA_SYNC_NONE;
+		dma_fence_remove_callback(sync_info->in_fence, &sync_info->in_sync_cb);
 		dma_fence_put(sync_info->in_fence);
 		sync_info->in_fence = NULL;
 		memset(&sync_info->in_sync_cb, 0, sizeof(struct dma_fence_cb));
@@ -955,7 +999,9 @@ void vha_rm_session(struct vha_session *session)
 	}
 
 	/* Reset hardware if required. */
-	if ((list_empty(&vha->sessions) && !vha->do_calibration)
+	if ((list_empty(&vha->sessions) &&
+		 list_empty(&vha->ro_sessions) &&
+		 !vha->do_calibration)
 			|| reschedule
 			)
 		vha_dev_stop(vha, reschedule);
@@ -1016,6 +1062,29 @@ void vha_rm_session(struct vha_session *session)
 		vha_chk_cmd_queues(vha, true);
 }
 
+void vha_rm_session_ro(struct vha_session *ro_session)
+{
+	struct vha_dev *vha = ro_session->vha;
+	struct vha_session *cur_ro_session, *tmp_ro_session;
+
+	mutex_lock(&vha->lock);
+
+	/* Remove link from VHA's list. */
+	list_for_each_entry_safe(cur_ro_session, tmp_ro_session,
+				&vha->ro_sessions, list) {
+		if (cur_ro_session == ro_session)
+			list_del(&cur_ro_session->list);
+	}
+
+	/* Reset hardware if required. */
+	if (list_empty(&vha->sessions) &&
+		list_empty(&vha->ro_sessions) &&
+		!vha->do_calibration)
+		vha_dev_stop(vha, false);
+
+	mutex_unlock(&vha->lock);
+}
+
 static int vha_alloc_common(struct vha_dev *vha)
 {
 #if 0
@@ -1029,14 +1098,14 @@ static int vha_alloc_common(struct vha_dev *vha)
 static ssize_t
 BVNC_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
-	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	struct vha_hw_props *props;
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	if (!vha) {
 		WARN_ON(1);
-		return sprintf(buf, "Get vha_dev failed!\n");
+		return 0;
 	}
-	props = &vha->hw_props;
 
+	props = &vha->hw_props;
 	return snprintf(buf, 4*6, "%hu.%hu.%hu.%hu\n",
 			(unsigned short)(props->core_id >> 48),
 			(unsigned short)(props->core_id >> 32),
@@ -1164,16 +1233,20 @@ int vha_add_dev(struct device *dev,
 			__func__, (__force void *)vha->reg_base);
 		goto out_free_dev;
 	}
+	vha->hw_props.memory_efficiency = memory_efficiency;
 
 	if (test_without_bvnc_check)
 		vha->hw_props.skip_bvnc_check = true;
 
 	mutex_init(&vha->lock);
 	spin_lock_init(&vha->irq_lock);
+	INIT_LIST_HEAD(&vha->ro_sessions);
 	INIT_LIST_HEAD(&vha->sessions);
 	for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++)
 		INIT_LIST_HEAD(&vha->sched_sessions[pri]);
 	INIT_LIST_HEAD(&vha->heaps);
+	if (vha_plat_use_bh_thread())
+		init_waitqueue_head(&vha->irq_bh_wq);
 
 	ret = vha_init(vha, heap_configs, heaps);
 	if (ret) {
@@ -1343,6 +1416,15 @@ void vha_rm_dev(struct device *dev)
 	cancel_delayed_work_sync(&vha->dummy_dwork);
 #endif
 #endif
+	if (vha_plat_use_bh_thread()) {
+		if (vha->irq_bh_thread) {
+			vha->irq_bh_stop = true;
+			wake_up_interruptible(&vha->irq_bh_wq);
+			/* Wait for the bottom half thread to finish. */
+			kthread_stop(vha->irq_bh_thread);
+			put_task_struct(vha->irq_bh_thread);
+		}
+	}
 #ifdef VHA_DEVFREQ
 	if (vha->devfreq)
 		vha_devfreq_term(vha);
@@ -1366,6 +1448,7 @@ void vha_rm_dev(struct device *dev)
 	if (ret)
 		dev_err(dev, "%s: failed to remove UM node!\n", __func__);
 
+	list_del(&vha->ro_sessions);
 	list_del(&vha->sessions);
 	for (pri = 0; pri < VHA_MAX_PRIORITIES; pri++)
 		list_del(&vha->sched_sessions[pri]);
@@ -1736,9 +1819,7 @@ int vha_add_buf(struct vha_session *session,
 	buf->attr = attr;
 	buf->status = VHA_BUF_UNFILLED;
 	buf->session = session;
-#ifdef KERNEL_DMA_FENCE_SUPPORT
-	buf->sync_info.in_sync_fd = VHA_SYNC_NONE;
-#endif
+
 	list_add(&buf->list, &session->bufs);
 	INIT_LIST_HEAD(&buf->onchip_maps);
 	if (!(attr & IMG_MEM_ATTR_OCM))
@@ -1911,12 +1992,11 @@ static void _vha_in_buf_sync_cb(struct dma_fence *fence,
 {
 	struct vha_buffer *buf = container_of(cb, struct vha_buffer, sync_info.in_sync_cb);
 
-	vha_set_buf_status(buf->session, buf->id, VHA_BUF_FILLED_BY_SW,
+	if (!fence->error) 
+		vha_set_buf_status(buf->session, buf->id, VHA_BUF_FILLED_BY_SW,
 			VHA_SYNC_NONE, false);
-	fput(buf->sync_info.in_sync_file);
-	dma_fence_put(fence);
-	memset(&buf->sync_info, 0, sizeof(struct vha_buf_sync_info));
-	buf->sync_info.in_sync_fd = VHA_SYNC_NONE;
+
+	buf->session->vha->stats.syncs_in_signalled++;
 }
 #endif
 
@@ -1953,50 +2033,46 @@ int vha_set_buf_status(struct vha_session *session, uint32_t buf_id,
 		buf->flush = true;
 #ifdef KERNEL_DMA_FENCE_SUPPORT
 		if (in_sync_fd > 0) {
-			if (buf->sync_info.in_sync_fd < 0) {
+			if (!buf->sync_info.in_fence) {
 				int ret = 0;
-				struct file *sync_file;
 				struct dma_fence *fence;
-
-				sync_file = fget(in_sync_fd);
-				if (sync_file == NULL) {
-					dev_err(session->vha->dev, "%s: could not get file for fd=%d and buf %d\n",
-						__func__, in_sync_fd, buf_id);
-					return -EINVAL;
-				}
 
 				fence = sync_file_get_fence(in_sync_fd);
 				if (!fence) {
-					fput(sync_file);
 					dev_err(session->vha->dev, "%s: could not get fence for fd=%d and buf %d\n",
 						__func__, in_sync_fd, buf_id);
 					return -EINVAL;
 				}
 
+				buf->sync_info.in_fence = fence;
 				ret = dma_fence_add_callback(fence, &buf->sync_info.in_sync_cb,
 																		_vha_in_buf_sync_cb);
 				if (ret) {
 					if (dma_fence_is_signaled(fence)) {
-						dma_fence_put(fence);
 						buf->status = status;
+						session->vha->stats.syncs_in_signalled++;
+						ret = 0;
 					} else
 						dev_err(session->vha->dev, "%s: could not set cb for fd=%d and buf %x\n",
 										__func__, in_sync_fd, buf_id);
-					fput(sync_file);
+
+					/* Fence not needed any more, release it */
+					dma_fence_put(fence);
+					buf->sync_info.in_fence = NULL;
+					memset(&buf->sync_info.in_sync_cb, 0, sizeof(struct dma_fence_cb));
 					return ret;
 				}
-				buf->sync_info.in_fence = fence;
-				buf->sync_info.in_sync_file = sync_file;
-				buf->sync_info.in_sync_fd = in_sync_fd;
-			} else if (in_sync_fd != buf->sync_info.in_sync_fd) {
-				dev_err(session->vha->dev, "%s: buf %d has already assigned sync file fd=%d\n",
-					__func__, buf_id, in_sync_fd);
+			} else if (buf->sync_info.in_fence) {
+				dev_err(session->vha->dev, "%s: buf %d has already assigned sync fence\n",
+					__func__, buf_id);
 				return -EINVAL;
 			}
 		}
 		else {
-			if (out_sync_sig)
-				img_mem_signal_fence(session->mem_ctx, buf->id);
+			if (out_sync_sig) {
+				if (img_mem_signal_fence(session->mem_ctx, buf->id, 0) == 0)
+					session->vha->stats.syncs_out_signalled++;
+			}
 			buf->status = status;
 		}
 #endif
@@ -2072,68 +2148,59 @@ bool vha_buf_needs_flush(struct vha_session *session, uint32_t buf_id)
 }
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
-struct vha_sync_cb_data {
-	struct dma_fence_cb cb;
-	union {
-		struct sync_file *sync_file;
-		struct file *file;
-	};
-};
-
-static void _vha_out_sync_cb(struct dma_fence *fence, struct dma_fence_cb *cb)
-{
-	struct vha_sync_cb_data *cb_data =
-			container_of(cb, struct vha_sync_cb_data, cb);
-	fput(cb_data->sync_file->file);
-	dma_fence_put(fence);
-	kfree(cb_data);
-}
-
 int vha_create_output_sync(struct vha_session *session, uint32_t buf_id_count,
 		uint32_t *buf_ids)
 {
-	int i;
+	int i = 0;
 	int ret = -ENOMEM;
 	int sync_fd = VHA_SYNC_NONE;
 	struct device *dev = session->vha->dev;
-	struct dma_fence_array *fence_array = NULL;
-	struct vha_sync_cb_data *cb_data = NULL;
-	struct dma_fence **fences =
-			(struct dma_fence **)kmalloc_array(sizeof(struct buffer_fence*),
-																				buf_id_count, GFP_KERNEL);
-	if (fences == NULL) {
-		dev_err(dev, "%s: failed allocating fence container for %u buffers\n",
-			__func__, buf_id_count);
-		return -ENOMEM;
-	}
+	struct sync_file *sync_file;
+	struct dma_fence *out_fence;
 
-	cb_data = kzalloc(sizeof(struct vha_sync_cb_data), GFP_KERNEL);
-	if (cb_data == NULL) {
-		dev_err(dev, "%s: failed allocating fence callback for %u buffers\n",
-			__func__, buf_id_count);
-		kfree(fences);
-		return -ENOMEM;
-	}
-
-	for (i = 0; i < buf_id_count; i++) {
-		fences[i] = img_mem_add_fence(session->mem_ctx, buf_ids[i]);
-		if (!fences[i]) {
+	if (buf_id_count == 0) {
+		dev_err(dev, "%s: failed creating output sync\n", __func__);
+		return -EINVAL;
+	} else if (buf_id_count == 1) {
+		out_fence = img_mem_add_fence(session->mem_ctx, buf_ids[0]);
+		if (!out_fence) {
 			dev_err(dev, "%s: failed allocating fence for buffer id=%u\n",
-				__func__, buf_ids[i]);
+				__func__, buf_ids[0]);
 			goto err_fences;
 		}
+		i = 1;
+	} else {
+		struct dma_fence_array *fence_array = NULL;
+		struct dma_fence **fences = (struct dma_fence **)kmalloc_array(sizeof(struct dma_fence*),
+														buf_id_count, GFP_KERNEL);
+		if (fences == NULL) {
+			dev_err(dev, "%s: failed allocating fence container for %u buffers\n",
+				__func__, buf_id_count);
+			return -ENOMEM;
+		}
+
+		for (i = 0; i < buf_id_count; i++) {
+			fences[i] = img_mem_add_fence(session->mem_ctx, buf_ids[i]);
+			if (!fences[i]) {
+				dev_err(dev, "%s: failed allocating fence for buffer id=%u\n",
+					__func__, buf_ids[i]);
+				goto err_fences;
+			}
+		}
+
+		fence_array = dma_fence_array_create(buf_id_count, fences,
+										dma_fence_context_alloc(1), 1, false);
+		if (fence_array == NULL) {
+			dev_err(dev, "%s: failed allocating fence array for %u buffers\n",
+				__func__, buf_id_count);
+			goto err_fences;
+		}
+		out_fence = &fence_array->base;
 	}
 
-	fence_array = dma_fence_array_create(buf_id_count, fences,
-									dma_fence_context_alloc(1), 1, false);
-	if (fence_array == NULL) {
-		dev_err(dev, "%s: failed allocating fence array for %u buffers\n",
-			__func__, buf_id_count);
-		goto err_fences;
-	}
-
-	cb_data->sync_file = sync_file_create(&fence_array->base);
-	if (cb_data->sync_file == NULL) {
+	/* Attach the out fence to a file */
+	sync_file = sync_file_create(out_fence);
+	if (sync_file == NULL) {
 		dev_err(dev, "%s: failed creating sync file for %u buffers\n",
 					__func__, buf_id_count);
 		goto error_sf;
@@ -2147,51 +2214,25 @@ int vha_create_output_sync(struct vha_session *session, uint32_t buf_id_count,
 		goto error_fd;
 	}
 
-	ret = dma_fence_add_callback(&fence_array->base, &cb_data->cb,
-															_vha_out_sync_cb);
-	if (ret < 0) {
-		dev_err(dev, "%s: failed adding callback file descriptor for %u buffers\n",
-					__func__, buf_id_count);
-		goto error_fd;
-	}
+	fd_install(sync_fd, sync_file->file);
 
-	fd_install(sync_fd, cb_data->sync_file->file);
-	fget(sync_fd);
+	/* References kept by the sync file and out buffs, 
+	   no need to keep the one for the array */
+	dma_fence_put(out_fence);
 
 	return sync_fd;
 
 error_fd:
-	fput(cb_data->sync_file->file);
-	dma_fence_put(&fence_array->base);
+	fput(sync_file->file);
 error_sf:
-	dma_fence_put(&fence_array->base);
+	dma_fence_put(out_fence);
 err_fences:
 	i--;
 	for (; i >= 0; i--) {
-		img_mem_remove_fence(session->mem_ctx, buf_ids[i]);
+		img_mem_signal_fence(session->mem_ctx, buf_ids[i], ret);
 	}
-	kfree(fences);
-	kfree(cb_data);
-	return ret;
-}
 
-/* input sync callback */
-static void _vha_in_sync_cb(struct dma_fence *fence, struct dma_fence_cb *cb)
-{
-	struct vha_sync_cb_data *cb_data =
-			container_of(cb, struct vha_sync_cb_data, cb);
-	fput(cb_data->file);
-	dma_fence_put(fence);
-	kfree(cb_data);
-}
-/* merged input sync callback */
-static void _vha_in_merged_sync_cb(struct dma_fence *fence,
-		struct dma_fence_cb *cb)
-{
-	struct vha_sync_cb_data *cb_data =
-			container_of(cb, struct vha_sync_cb_data, cb);
-	fput(cb_data->sync_file->file);
-	dma_fence_put(fence);
+	return ret;
 }
 
 int vha_merge_input_syncs(struct vha_session *session, uint32_t in_sync_fd_count,
@@ -2201,126 +2242,58 @@ int vha_merge_input_syncs(struct vha_session *session, uint32_t in_sync_fd_count
 	int i, actual_count = 0;
 	int ret = -ENOMEM;
 	int sync_fd = VHA_SYNC_NONE;
-	struct dma_fence_array *fence_array = NULL;
-	struct vha_sync_cb_data *cb_data = NULL;
-	struct vha_sync_cb_data *in_sync_cbs = NULL;
 	struct dma_fence **fences;
-	void *dma_fence_mem;
-	struct file *f;
+	struct dma_fence *in_fence;	
+	struct sync_file *sync_file;
 
 	/* Special cases. */
 	if (in_sync_fd_count == 0) {
 		dev_err(dev, "%s: requested 0 sync_fds to merge\n", __func__);
 		return -EINVAL;
 	} else if (in_sync_fd_count == 1) {
-		struct file *f;
-		struct dma_fence *fence;
-		f = fget(in_sync_fds[0]);
-		if (f == NULL) {
-			dev_err(dev, "%s: could not get file for input sync fd=%d\n",
-							__func__, in_sync_fds[0]);
-			return -EINVAL;
-		}
-		fence = sync_file_get_fence(in_sync_fds[0]);
-		if (!fence) {
-			fput(f);
-			dev_err(dev, "%s: could not get fence for input sync fd=%d\n",
-							__func__, in_sync_fds[0]);
-			return -EINVAL;
-		}
-		cb_data = kmalloc(sizeof(struct vha_sync_cb_data), GFP_KERNEL);
-		if (cb_data == NULL) {
-			fput(f);
-			dma_fence_put(fence);
-			dev_err(dev, "%s: failed allocating callback data for input sync fd=%d\n",
-							__func__, in_sync_fds[0]);
-			return -ENOMEM;
-		}
-		if (dma_fence_add_callback(fence, &cb_data->cb, _vha_in_sync_cb)) {
-			if (dma_fence_is_signaled(fence)) {
-				dev_warn(dev, "%s: input sync fd=%d already signalled\n",
-								__func__, in_sync_fds[0]);
-				ret = -EINVAL;
-			} else {
-				dev_err(dev, "%s: could not add fence callback for input sync fd=%d\n",
-								__func__, in_sync_fds[0]);
-				ret = -EFAULT;
-			}
-			fput(f);
-			dma_fence_put(fence);
-			kfree(cb_data);
-			return ret;
-		}
-		cb_data->file = f;
 		return in_sync_fds[0];
 	}
 
-	dma_fence_mem =
-			kmalloc_array(
-					(sizeof(struct dma_fence*) + sizeof(struct vha_sync_cb_data)),
-					in_sync_fd_count + sizeof(struct vha_sync_cb_data), GFP_KERNEL);
-	if (dma_fence_mem == NULL) {
-		dev_err(dev, "%s: failed allocating fence container for %u buffers\n",
+	fences = (struct dma_fence **)kmalloc_array(sizeof(struct dma_fence*),
+				in_sync_fd_count, GFP_KERNEL);
+	if (fences == NULL) {
+		dev_err(dev, "%s: failed allocating fences for fd=%d\n",
 						__func__, in_sync_fd_count);
 		return -ENOMEM;
 	}
-	fences = (struct dma_fence**)dma_fence_mem;
-	in_sync_cbs = (struct vha_sync_cb_data *)(dma_fence_mem +
-										sizeof(struct dma_fence*) * in_sync_fd_count);
-	cb_data = (struct vha_sync_cb_data *)(dma_fence_mem +
-								(sizeof(struct dma_fence*) + sizeof(struct vha_sync_cb_data)) *
-										in_sync_fd_count);
 
 	for (i = 0; i < in_sync_fd_count; i++) {
 		struct dma_fence *fence;
-		f = fget(in_sync_fds[i]);
-		if (f == NULL) {
-			dev_warn(dev, "%s: could not get file for fd=%d; will not use it\n",
-							__func__, in_sync_fds[i]);
-			continue;
-		}
+
 		fence = sync_file_get_fence(in_sync_fds[i]);
 		if (!fence) {
-			fput(f);
 			dev_warn(dev, "%s: could not get fence for fd=%d; will not use it\n",
 							__func__, in_sync_fds[i]);
 			continue;
 		}
-		if (dma_fence_add_callback(fence, &in_sync_cbs[actual_count].cb,
-															_vha_in_sync_cb)) {
-			if (dma_fence_is_signaled(fence)) {
-				dev_warn(dev, "%s: input sync fd=%d already signalled\n",
-								__func__, in_sync_fds[i]);
-			} else {
-				dev_err(dev, "%s: could not add fence callback for input sync fd=%d;"
-								" will not use it\n", __func__, in_sync_fds[i]);
-			}
-			fput(f);
-			dma_fence_put(fence);
-			continue;
-		}
-		dma_fence_get(fence); /* should be freed in dma_fence_array_release() */
-		in_sync_cbs[actual_count].file = f;
 		fences[actual_count] = fence;
 		actual_count++;
 	}
 	if (actual_count == 0) {
 		dev_err(dev, "%s: failed merging input fences\n", __func__);
-		kfree(dma_fence_mem);
+		kfree(fences);
 		return -EINVAL;
-	}
-
-	fence_array = dma_fence_array_create(actual_count, fences,
+	} else if (actual_count == 1) {
+		in_fence = fences[0];
+	} else {
+		struct dma_fence_array *fence_array = dma_fence_array_create(actual_count, fences,
 									dma_fence_context_alloc(1), 1, false);
-	if (fence_array == NULL) {
-		dev_err(dev, "%s: failed allocating fence array for %u buffers\n",
-						__func__, in_sync_fd_count);
-		kfree(dma_fence_mem);
-		return -ENOMEM;
+		if (fence_array == NULL) {
+			dev_err(dev, "%s: failed allocating fence array for %u buffers\n",
+							__func__, in_sync_fd_count);
+			kfree(fences);
+			return -ENOMEM;
+		}
+		in_fence = &fence_array->base;
 	}
 
-	cb_data->sync_file = sync_file_create(&fence_array->base);
-	if (cb_data->sync_file == NULL) {
+	sync_file = sync_file_create(in_fence);
+	if (sync_file == NULL) {
 		dev_err(dev, "%s: failed creating sync file for %u buffers\n",
 						__func__, in_sync_fd_count);
 		goto error_sf;
@@ -2334,28 +2307,21 @@ int vha_merge_input_syncs(struct vha_session *session, uint32_t in_sync_fd_count
 		goto error_fd;
 	}
 
-	ret = dma_fence_add_callback(&fence_array->base, &cb_data->cb,
-															_vha_in_merged_sync_cb);
-	if (ret < 0) {
-		dev_err(dev, "%s: failed adding callback file descriptor for %u buffers\n",
-						__func__, in_sync_fd_count);
-		goto error_fd;
-	}
+	fd_install(sync_fd, sync_file->file);
 
-	fd_install(sync_fd, cb_data->sync_file->file);
-	fget(sync_fd);
+	/* Reference kept by the sync file only*/
+	dma_fence_put(in_fence);
 
 	return sync_fd;
 
 error_fd:
-	fput(cb_data->sync_file->file);
-	dma_fence_put(&fence_array->base);
+	fput(sync_file->file);
 error_sf:
 	for (i = 0; i < actual_count; i++) {
-		fput(in_sync_cbs[actual_count].file);
-		dma_fence_put(fences[actual_count]);
+		dma_fence_set_error(fences[i], -EIO);
+		dma_fence_signal(fences[i]);		
 	}
-	dma_fence_put(&fence_array->base);
+	dma_fence_put(in_fence);
 	return ret;
 }
 
@@ -2520,12 +2486,13 @@ int vha_add_cmd(struct vha_session *session, struct vha_cmd *cmd)
 
 int vha_suspend_dev(struct device *dev)
 {
-	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	int ret;
+	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	if (!vha) {
 		WARN_ON(1);
 		return -EFAULT;
 	}
+
 	mutex_lock(&vha->lock);
 	dev_dbg(dev, "%s: taking a nap!\n", __func__);
 

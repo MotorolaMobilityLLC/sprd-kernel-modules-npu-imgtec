@@ -56,6 +56,7 @@
 /* Memory context : one per process */
 struct mem_ctx {
 	unsigned id;
+	unsigned dev_id;
 	struct idr buffers;
 	struct list_head mmu_ctxs;
 	/* Used to track memory usage for all buffers and
@@ -97,6 +98,7 @@ struct mmu_ctx {
 };
 
 #ifdef KERNEL_DMA_FENCE_SUPPORT
+#define NUM_FENCES_PER_BUF 10
 struct buffer_fence {
 	struct dma_fence fence;
 	spinlock_t lock;
@@ -123,7 +125,7 @@ struct buffer {
 	void *priv;
 	unsigned map_flags;
 #ifdef KERNEL_DMA_FENCE_SUPPORT
-	struct buffer_fence *fence;
+	struct buffer_fence *fences[NUM_FENCES_PER_BUF];
 #endif
 	struct buffer_pcache pcache;
 };
@@ -146,7 +148,7 @@ struct heap_ops {
 				 size_t size, enum img_mem_attr attr,
 				 struct buffer *buffer);
 	int (*import)(struct device *device, struct heap *heap,
-					size_t size, enum img_mem_attr attr, uint64_t buf_fd,
+					size_t size, enum img_mem_attr attr, int buf_fd,
 					struct page **pages, struct buffer *buffer);
 	int (*export)(struct device *device, struct heap *heap,
 					size_t size, enum img_mem_attr attr, struct buffer *buffer,
