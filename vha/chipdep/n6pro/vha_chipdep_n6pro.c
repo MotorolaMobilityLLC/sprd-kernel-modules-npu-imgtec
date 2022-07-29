@@ -43,6 +43,7 @@ struct npu_regmap{
 	struct regmap *pmu_apb_regs;
 };
 static struct npu_regmap ai_regs;
+static struct regulator *vddai = NULL;
 
 static int get_qos_array_length(QOS_REG_T array[])
 {
@@ -112,31 +113,30 @@ static int vha_init_regs(struct device *dev)
 		return -EINVAL;
 	}
 
+	if (!vddai) {
+		vddai = devm_regulator_get(dev, "npu");
+		if (IS_ERR_OR_NULL(vddai)) {
+			dev_err_once(dev, "failed to get npu-supply\n");
+			return PTR_ERR(vddai);
+		}
+	}
 	return 0;
 }
 
-static struct regulator *vddai = NULL;
-static int vddai_enable(struct device *dev)
+static int vddai_enable()
 {
 	int ret = 0;
-	if (!vddai) {
-		vddai = regulator_get(dev, "vddai");
-		if (IS_ERR_OR_NULL(vddai)) {
-			ret = PTR_ERR(vddai);
-			return ret;
-		}
-	}
-	if (!regulator_is_enabled(vddai)) {
+	if (!vddai)
+		ret = -EINVAL;
+	else
 		ret = regulator_enable(vddai);
-	}
 	return ret;
 }
 
-static void vddai_disable(struct device *dev)
+static void vddai_disable()
 {
-	if (regulator_is_enabled(vddai)) {
+	if (vddai)
 		regulator_disable(vddai);
-	}
 }
 
 static void aipll_force_off(uint8_t val)
@@ -298,16 +298,9 @@ static int vha_clockdomain_unsetup(struct device *dev)
 
 int vha_chip_init(struct device *dev)
 {
-	int ret;
 	device_set_wakeup_capable(dev, true);
 	device_wakeup_enable(dev);
 	vha_init_regs(dev);
-	ret = vddai_enable(dev);
-	if (ret) {
-		dev_err(dev, "failed to enable vddai:%d\n", ret);
-		return ret;
-	}
-	udelay(400);
 	vha_powerdomain_setup(dev);
 	vha_clockdomain_init(dev);
 #ifdef VHA_DEVFREQ
@@ -331,7 +324,7 @@ int vha_chip_runtime_resume(struct device *dev)
 {
 	int ret;
 	aipll_force_off(0);
-	ret = vddai_enable(dev);
+	ret = vddai_enable();
 	if (ret) {
 		dev_err(dev, "failed to enable vddai:%d\n", ret);
 		return ret;
@@ -354,7 +347,7 @@ int vha_chip_runtime_suspend(struct device *dev)
 #endif
 	vha_clockdomain_unsetup(dev);
 	vha_powerdomain_unsetup();
-	vddai_disable(dev);
+	vddai_disable();
 	aipll_force_off(1);
 
 	return 0;
