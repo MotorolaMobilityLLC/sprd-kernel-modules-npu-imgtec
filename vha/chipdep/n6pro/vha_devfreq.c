@@ -359,9 +359,9 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 {
 	struct vha_dev *vha = vha_dev_get_drvdata(dev);
 	struct vha_devfreq_metrics diff;
-	int temp;
+	int temp, ret;
 
-	if (!vha || !npu_dvfs_ctx.npu_tz)
+	if (!vha)
 		goto out;
 
 	vha_get_dvfs_metrics(vha, &vha->last_devfreq_metrics, &diff);
@@ -370,7 +370,15 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 	state->current_frequency = npu_dvfs_ctx.last_freq_khz * 1000UL;
 	state->private_data = NULL;
 
-	npu_dvfs_ctx.npu_tz->ops->get_temp(npu_dvfs_ctx.npu_tz, &temp);
+	if (!npu_dvfs_ctx.cooling_device || IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz) ||
+			!npu_dvfs_ctx.npu_tz->ops->get_temp)
+		goto out;
+
+	ret = npu_dvfs_ctx.npu_tz->ops->get_temp(npu_dvfs_ctx.npu_tz, &temp);
+	if (ret) {
+		dev_warn(dev, "failed to get npu temp\n");
+		goto out;
+	}
 	dev_dbg(dev, "cur_temp = %d\n", temp);
 	down(npu_dvfs_ctx.sem);
 	if (temp >= HIGH_TEMPERATURE) {
@@ -446,7 +454,7 @@ int vha_devfreq_init(struct vha_dev *vha)
 	}
 
 	npu_dvfs_ctx.npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
-	if (!npu_dvfs_ctx.npu_tz) {
+	if (IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz)) {
 		dev_err(vha->dev, "Failed to get ai thermal zone\n");
 		ret = -EFAULT;
 		goto get_ai_thermal_zone_failed;
