@@ -95,7 +95,7 @@ int vha_plat_dt_hw_init(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	int ret;
-	uint64_t dma_mask;
+	uint64_t dma_mask = 0xffffffff;
 
 	dev_dbg(dev, "%s dma_get_mask : %#llx\n", __func__, dma_get_mask(dev));
 	if (dev->dma_mask) {

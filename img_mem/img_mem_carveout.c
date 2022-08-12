@@ -517,6 +517,8 @@ static void carveout_mmap_close(struct vm_area_struct *vma)
 		return;
 
 	buffer_data = buffer->priv;
+	if (!buffer_data)
+		return;
 
 	pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",
 			__func__, __LINE__, buffer->id, buffer, vma);

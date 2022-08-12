@@ -210,6 +210,8 @@ static void dmabuf_mmap_close(struct vm_area_struct *vma)
 		return;
 
 	data = buffer->priv;
+	if (!data)
+		return;
 
 	pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",
 			__func__, __LINE__, buffer->id, buffer, vma);

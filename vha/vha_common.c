@@ -1196,7 +1196,7 @@ int vha_add_dev(struct device *dev,
 	vha = devm_kzalloc(dev, sizeof(struct vha_dev), GFP_KERNEL);
 	if (!vha) {
 		ret = -ENOMEM;
-		goto out_free_dev;
+		goto out_free_common;
 	}
 
 	vha_common->vha_dev = vha;
@@ -1362,6 +1362,7 @@ out_add_dev:
 	vha_deinit();
 out_free_dev:
 	devm_kfree(dev, vha);
+out_free_common:
 	devm_kfree(dev, vha_common);
 out_validate_params:
 	return ret;

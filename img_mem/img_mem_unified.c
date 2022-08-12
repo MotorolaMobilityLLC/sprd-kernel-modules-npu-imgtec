@@ -752,6 +752,9 @@ static void unified_mmap_close(struct vm_area_struct *vma)
 		return;
 
 	buffer_data = buffer->priv;
+	if (!buffer_data)
+		return;
+
 	sgt = buffer_data->sgt;
 
 	pr_debug("%s:%d buffer %d (0x%p) vma:%p\n",
@@ -937,6 +940,7 @@ static int unified_map_km(struct heap *heap, struct buffer *buffer)
 		return -ENOMEM;
 	}
 
+	memset(pages, 0, num_pages * sizeof(struct page *));
 	prot = PAGE_KERNEL;
 	/* CACHED by default */
 	if (buffer_data->mattr & IMG_MEM_ATTR_WRITECOMBINE)
