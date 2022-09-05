@@ -7,14 +7,16 @@
 #define __VHA_DEVFREQ_H_
 
 #ifdef VHA_DEVFREQ
-void vha_devfreq_suspend(struct device *dev);
-void vha_devfreq_resume(struct device *dev);
+
+void vha_devfreq_suspend(void);
+void vha_devfreq_resume(void);
 int vha_dvfs_ctx_init(struct device *dev);
 int vha_dvfs_ctx_deinit(struct device *dev);
-int vha_devfreq_init(struct vha_dev *vha);
-void vha_devfreq_term(struct vha_dev *vha);
-void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active);
+int vha_devfreq_init(struct device *dev);
+void vha_devfreq_term(struct device *dev);
+void vha_update_dvfs_state(bool npu_active);
 int vha_set_max_freq(int max);
+
 #endif
 
 #endif

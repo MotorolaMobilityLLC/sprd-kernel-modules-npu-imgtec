@@ -28,34 +28,44 @@
 #include "vha_devfreq.h"
 #include "vha_cooling.h"
 
-#define VHA_POLL_MS           100
+#define VHA_POLL_MS           30
 #define VHA_UPTHRESHOLD       85
 #define VHA_DOWNDIFFERENTIAL  10
-#define VHA_PM_TIME_SHIFT     8
 #define NNA_DEFAULT_FREQ      307200
 #define HIGH_TEMPERATURE      65000
 #define LOW_TEMPERATURE       60000
 
-struct vha_ops {
-	int (*set_freq) (u32 freq_khz);
+struct npu_ops {
+	int (*set_freq) (uint32_t freq_khz);
 	int (*disable_idle) (void);
-	int (*get_max_state) (u32 *max_state);
-	int (*get_opp) (u32 index, u32 *freq_khz, u32 *volt);
-	int (*set_volts) (u32 high_temp);
+	int (*get_max_state) (uint32_t *max_state);
+	int (*get_opp) (uint32_t index, uint32_t *freq_khz, uint32_t *volt);
+	int (*set_volts) (uint32_t high_temp);
+};
+
+struct npu_dvfs_state {
+	ktime_t start_stamp;
+	ktime_t busy_stamp;
+	unsigned long busy_time;
+	bool npu_active;
+	spinlock_t lock;
 };
 
 struct npu_dvfs_context {
 	bool npu_on;
 	int npu_dvfs_on;
 	int max_on;
-	bool dvfs_init;
 	bool high_temp;
 	struct semaphore *sem;
-	struct vha_ops ops;
+	struct npu_ops ops;
 	uint32_t last_freq_khz;
 	uint32_t max_freq_khz;
 	uint32_t max_state;
 	struct thermal_zone_device *npu_tz;
+	struct npu_dvfs_state cur_state;
+	struct devfreq_dev_profile npu_dp;
+	struct devfreq *devfreq;
+	struct devfreq_simple_ondemand_data data;
 };
 
 DEFINE_SEMAPHORE(npu_dvfs_sem);
@@ -64,15 +74,13 @@ static struct npu_dvfs_context npu_dvfs_ctx=
 	.npu_on = false,
 	.npu_dvfs_on = 0,
 	.max_on = 0,
-	.dvfs_init = false,
 	.max_freq_khz = 0,
 	.max_state = 0,
 	.high_temp = false,
-
+	.cur_state.npu_active = false,
 	.sem=&npu_dvfs_sem,
 };
 
-static struct devfreq_simple_ondemand_data *data;
 
 static void vha_set_freq(unsigned long freq_khz)
 {
@@ -246,60 +254,39 @@ int vha_dvfs_ctx_deinit(struct device *dev)
 	return 0;
 }
 
-static void vha_pm_get_dvfs_utilisation(struct vha_dev *vha, ktime_t now)
+void vha_update_dvfs_state(bool npu_active)
 {
-	ktime_t diff;
-	u32 ns_time;
-
-	diff = ktime_sub(now, vha->cur_state.time_period_start);
-	if (ktime_to_ns(diff) < 0)
-		return;
-
-	ns_time = (u32)(ktime_to_ns(diff) >> VHA_PM_TIME_SHIFT);
-	if (vha->cur_state.vha_active)
-		vha->cur_state.value.time_busy += ns_time;
-	else
-		vha->cur_state.value.time_idle += ns_time;
-
-	vha->cur_state.time_period_start = now;
-}
-
-void vha_update_dvfs_state(struct vha_dev *vha, bool vha_active)
-{
-	ktime_t now;
 	unsigned long flags;
-	if (!vha)
+	ktime_t cur = ktime_get();
+
+	if (!npu_dvfs_ctx.devfreq)
 		return;
 
-	spin_lock_irqsave(&vha->cur_state.lock, flags);
-	now = ktime_get();
-	vha_pm_get_dvfs_utilisation(vha, now);
-	vha->cur_state.vha_active = vha_active;
+	spin_lock_irqsave(&npu_dvfs_ctx.cur_state.lock, flags);
+	//if npu is active and no busy_stamp then set busy_stamp to current
+	if (npu_active && !npu_dvfs_ctx.cur_state.busy_stamp)
+		npu_dvfs_ctx.cur_state.busy_stamp = cur;
 
-	spin_unlock_irqrestore(&vha->cur_state.lock, flags);
-}
+	if (!npu_active) {
+		//if npu is not active and has busy_stamp then calculate busy_time
+		if (npu_dvfs_ctx.cur_state.busy_stamp)
+			npu_dvfs_ctx.cur_state.busy_time = ktime_us_delta(cur,
+				npu_dvfs_ctx.cur_state.busy_stamp);
+		//reset busy_stamp
+		npu_dvfs_ctx.cur_state.busy_stamp = 0;
+	}
 
-static void vha_devfreq_exit(struct device *dev)
-{
-	struct vha_dev *vha = vha_dev_get_drvdata(dev);
-	struct devfreq_dev_profile *dp;
-
-	if (!vha)
-		return;
-
-	dp = vha->devfreq->profile;
-	kfree(dp->freq_table);
+	npu_dvfs_ctx.cur_state.npu_active = npu_active;
+	spin_unlock_irqrestore(&npu_dvfs_ctx.cur_state.lock, flags);
 }
 
 static int vha_devfreq_target(struct device *dev, unsigned long *freq, u32 flags)
 {
 	struct dev_pm_opp *opp;
-	unsigned long nominal_freq;
 	unsigned long exact_freq;
 
-	nominal_freq = *freq;
 	/* get appropriate opp*/
-	opp = devfreq_recommended_opp(dev, &nominal_freq, flags);
+	opp = devfreq_recommended_opp(dev, freq, flags);
 	if (IS_ERR_OR_NULL(opp)) {
 		dev_err(dev, "Failed to get opp (%ld)\n", PTR_ERR(opp));
 		return PTR_ERR(opp);
@@ -318,7 +305,7 @@ static int vha_devfreq_target(struct device *dev, unsigned long *freq, u32 flags
 up_out:
 	up(npu_dvfs_ctx.sem);
 out:
-	*freq = npu_dvfs_ctx.last_freq_khz * 1000UL;
+	*freq = exact_freq;
 	return 0;
 }
 
@@ -328,40 +315,33 @@ static int vha_devfreq_cur_freq(struct device *dev, unsigned long *freq)
 	return 0;
 }
 
-static void vha_get_dvfs_metrics(struct vha_dev *vha,
-				struct vha_devfreq_metrics *last,
-				struct vha_devfreq_metrics *diff)
-{
-	struct vha_devfreq_metrics *cur = &vha->cur_state.value;
-	unsigned long flags;
-	spin_lock_irqsave(&vha->cur_state.lock, flags);
-
-	vha_pm_get_dvfs_utilisation(vha, ktime_get());
-	memset(diff, 0, sizeof(*diff));
-
-	diff->time_busy = cur->time_busy - last->time_busy;
-	diff->time_idle = cur->time_idle - last->time_idle;
-
-	*last = *cur;
-
-	spin_unlock_irqrestore(&vha->cur_state.lock, flags);
-	return;
-}
-
 static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *state)
 {
-	struct vha_dev *vha = vha_dev_get_drvdata(dev);
-	struct vha_devfreq_metrics diff;
 	int temp, ret;
+	unsigned long flags;
+	ktime_t cur;
 
-	if (!vha)
-		goto out;
+	if (!npu_dvfs_ctx.devfreq)
+		return -EINVAL;
 
-	vha_get_dvfs_metrics(vha, &vha->last_devfreq_metrics, &diff);
-	state->busy_time = diff.time_busy;
-	state->total_time = diff.time_busy + diff.time_idle;
+	memset(state, 0, sizeof(*state));
+	cur = ktime_get();
+	spin_lock_irqsave(&npu_dvfs_ctx.cur_state.lock, flags);
 	state->current_frequency = npu_dvfs_ctx.last_freq_khz * 1000UL;
-	state->private_data = NULL;
+	if (npu_dvfs_ctx.cur_state.start_stamp) {
+		if (npu_dvfs_ctx.cur_state.busy_stamp)
+			npu_dvfs_ctx.cur_state.busy_time = ktime_us_delta(cur,
+				npu_dvfs_ctx.cur_state.busy_stamp);
+		state->busy_time = npu_dvfs_ctx.cur_state.busy_time;
+		state->total_time = ktime_us_delta(cur, npu_dvfs_ctx.cur_state.start_stamp);
+	}
+	//reset start_stamp and busy_time for next window
+	npu_dvfs_ctx.cur_state.start_stamp = cur;
+	npu_dvfs_ctx.cur_state.busy_time = 0;
+	//if npu is active, update busy_stamp for next window
+	if (npu_dvfs_ctx.cur_state.npu_active)
+		npu_dvfs_ctx.cur_state.busy_stamp = cur;
+	spin_unlock_irqrestore(&npu_dvfs_ctx.cur_state.lock, flags);
 
 	if (IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz) ||
 			!npu_dvfs_ctx.npu_tz->ops->get_temp)
@@ -390,108 +370,99 @@ out:
 	return 0;
 }
 
-int vha_devfreq_init(struct vha_dev *vha)
+int vha_devfreq_init(struct device *dev)
 {
 	struct devfreq_dev_profile *dp;
-	struct devfreq_simple_ondemand_data *data;
 
 	int ret = 0, i;
 	uint32_t freq_khz, volt;
 
-	npu_dvfs_ctx.npu_on = true;
-
 	for (i = 0; i < npu_dvfs_ctx.max_state; i++) {
 		npu_dvfs_ctx.ops.get_opp(i, &freq_khz, &volt);
-		ret = dev_pm_opp_add(vha->dev, freq_khz * 1000UL, volt);
+		ret = dev_pm_opp_add(dev, freq_khz * 1000UL, volt);
 		if (ret) {
-			dev_err(vha->dev, "failed to add dev_pm_opp: %d\n", ret);
-			goto dev_pm_opp_add_failed;
+			dev_err(dev, "failed to add dev_pm_opp: %d\n", ret);
+			return ret;
 		}
 	}
 
-	dp = &vha->devfreq_profile;
+	dp = &npu_dvfs_ctx.npu_dp;
 	dp->polling_ms = VHA_POLL_MS;
 	dp->initial_freq = npu_dvfs_ctx.last_freq_khz * 1000UL;
 	dp->target = vha_devfreq_target;
 	dp->get_cur_freq = vha_devfreq_cur_freq;
 	dp->get_dev_status = vha_devfreq_status;
-	dp->exit = vha_devfreq_exit;
 
-	data = vmalloc(sizeof(struct devfreq_simple_ondemand_data));
-	data->upthreshold = VHA_UPTHRESHOLD;
-	data->downdifferential = VHA_DOWNDIFFERENTIAL;
+	npu_dvfs_ctx.data.upthreshold = VHA_UPTHRESHOLD;
+	npu_dvfs_ctx.data.downdifferential = VHA_DOWNDIFFERENTIAL;
 
-	vha->devfreq = devm_devfreq_add_device(vha->dev, dp, "simple_ondemand", data);
-	if (IS_ERR(vha->devfreq)) {
-		dev_err(vha->dev, "add devfreq device fail\n");
-		ret = (int)PTR_ERR(vha->devfreq);
+	npu_dvfs_ctx.devfreq = devm_devfreq_add_device(dev, dp, "simple_ondemand",
+			&npu_dvfs_ctx.data);
+	if (IS_ERR(npu_dvfs_ctx.devfreq)) {
+		dev_err(dev, "add devfreq device fail\n");
+		ret = (int)PTR_ERR(npu_dvfs_ctx.devfreq);
 		goto devfreq_add_device_failed;
 	}
 
-	vha->devfreq->scaling_max_freq = dp->freq_table[dp->max_state - 1];
-	vha->devfreq->scaling_min_freq = dp->freq_table[0];
+	npu_dvfs_ctx.devfreq->scaling_max_freq = dp->freq_table[dp->max_state - 1];
+	npu_dvfs_ctx.devfreq->scaling_min_freq = dp->freq_table[0];
 
 	npu_dvfs_ctx.max_freq_khz = dp->freq_table[dp->max_state - 1] / 1000UL;
 	npu_dvfs_ctx.npu_dvfs_on = 1;
 
-	ret = devfreq_register_opp_notifier(vha->dev, vha->devfreq);
+	ret = devfreq_register_opp_notifier(dev, npu_dvfs_ctx.devfreq);
 	if (ret) {
-		dev_err(vha->dev, "Failed to register OPP notifier (%d)\n", ret);
+		dev_err(dev, "Failed to register OPP notifier (%d)\n", ret);
 		goto devfreq_register_opp_notifier_failed;
 	}
 
-	vha_cooling_register(vha->devfreq);
+	vha_cooling_register(npu_dvfs_ctx.devfreq);
 
 	npu_dvfs_ctx.npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
 	if (IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz)) {
-		dev_err(vha->dev, "Failed to get ai thermal zone\n");
+		dev_err(dev, "Failed to get ai thermal zone\n");
 		ret = -EFAULT;
 		goto get_ai_thermal_zone_failed;
 	}
 
-	npu_dvfs_ctx.dvfs_init = true;
 	return ret;
 
 get_ai_thermal_zone_failed:
 	vha_cooling_unregister();
-	devfreq_unregister_opp_notifier(vha->dev, vha->devfreq);
+	devfreq_unregister_opp_notifier(dev, npu_dvfs_ctx.devfreq);
 devfreq_register_opp_notifier_failed:
-	devm_devfreq_remove_device(vha->dev, vha->devfreq);
-	vha->devfreq = NULL;
+	devm_devfreq_remove_device(dev, npu_dvfs_ctx.devfreq);
+	npu_dvfs_ctx.devfreq = NULL;
 	npu_dvfs_ctx.npu_dvfs_on = 0;
 devfreq_add_device_failed:
-	kfree(dp->freq_table);
-	vfree(data);
-dev_pm_opp_add_failed:
-	npu_dvfs_ctx.npu_on = false;
+	dev_pm_opp_of_remove_table(dev);
 
 	return ret;
-
 }
 
-void vha_devfreq_term(struct vha_dev *vha)
+void vha_devfreq_term(struct device *dev)
 {
-	dev_dbg(vha->dev, "Term NPU devfreq\n");
+	if (!npu_dvfs_ctx.devfreq)
+		return;
+
+	dev_dbg(dev, "Term NPU devfreq\n");
 
 	vha_cooling_unregister();
 
-	devfreq_unregister_opp_notifier(vha->dev, vha->devfreq);
-	npu_dvfs_ctx.dvfs_init = false;
-	npu_dvfs_ctx.npu_on = false;
+	dev_pm_opp_of_remove_table(dev);
 
-	vfree(data);
+	devfreq_unregister_opp_notifier(dev, npu_dvfs_ctx.devfreq);
+	npu_dvfs_ctx.npu_on = false;
 }
 
-void vha_devfreq_suspend(struct device *dev)
+void vha_devfreq_suspend(void)
 {
-	struct vha_dev *vha = NULL;
-
-	vha = vha_dev_get_drvdata(dev);
-	if (!vha)
-		return;
-
-	if (npu_dvfs_ctx.dvfs_init) {
-		devfreq_suspend_device(vha->devfreq);
+	unsigned long flags;
+	if (npu_dvfs_ctx.devfreq) {
+		devfreq_suspend_device(npu_dvfs_ctx.devfreq);
+		spin_lock_irqsave(&npu_dvfs_ctx.cur_state.lock, flags);
+		npu_dvfs_ctx.cur_state.busy_time = 0;
+		spin_unlock_irqrestore(&npu_dvfs_ctx.cur_state.lock, flags);
 		down(npu_dvfs_ctx.sem);
 		npu_dvfs_ctx.npu_on = false;
 		up(npu_dvfs_ctx.sem);
@@ -499,21 +470,22 @@ void vha_devfreq_suspend(struct device *dev)
 	return;
 }
 
-void vha_devfreq_resume(struct device *dev)
+void vha_devfreq_resume(void)
 {
-	struct vha_dev *vha = NULL;
+	unsigned long flags;
+	ktime_t cur = ktime_get();
 
-	vha = vha_dev_get_drvdata(dev);
-	if (!vha)
-		return;
-
-	if (npu_dvfs_ctx.dvfs_init) {
+	if (npu_dvfs_ctx.devfreq) {
 		down(npu_dvfs_ctx.sem);
 		npu_dvfs_ctx.npu_on = true;
 		npu_dvfs_ctx.ops.disable_idle();
 		vha_set_freq(npu_dvfs_ctx.last_freq_khz);
 		up(npu_dvfs_ctx.sem);
-		devfreq_resume_device(vha->devfreq);
+		spin_lock_irqsave(&npu_dvfs_ctx.cur_state.lock, flags);
+		npu_dvfs_ctx.cur_state.start_stamp = cur;
+		npu_dvfs_ctx.cur_state.busy_stamp = 0;
+		spin_unlock_irqrestore(&npu_dvfs_ctx.cur_state.lock, flags);
+		devfreq_resume_device(npu_dvfs_ctx.devfreq);
 	}
 	return;
 }

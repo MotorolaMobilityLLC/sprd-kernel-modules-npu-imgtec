@@ -57,7 +57,6 @@
 #include <linux/workqueue.h>
 #include <linux/irq.h>
 #include <linux/spinlock.h>
-#include <linux/devfreq.h>
 /* struct timespec64 */
 #include <linux/time64.h>
 
@@ -530,18 +529,6 @@ struct vha_apm_work {
 #define core_id_quad(core_id) \
     (core_id >> 48), (core_id >> 32) & 0xffff, (core_id >> 16) & 0xffff, (core_id & 0xffff)
 
-struct vha_devfreq_metrics {
-	u32 time_busy;
-	u32 time_idle;
-};
-
-struct vha_pm_metrics_state {
-	ktime_t time_period_start;
-	bool vha_active;
-	spinlock_t lock;
-	struct vha_devfreq_metrics value;
-};
-
 /* represents a single VHA core, containing a number of CNN devices */
 struct vha_dev {
 	unsigned int               id;
@@ -684,10 +671,6 @@ struct vha_dev {
 	struct delayed_work        dummy_dwork;
 #endif
 #endif /* CONFIG_VHA_DUMMY_SIMULATE_HW_PROCESSING_TIME */
-	struct devfreq_dev_profile devfreq_profile;
-	struct devfreq *devfreq;
-	struct vha_devfreq_metrics last_devfreq_metrics;
-	struct vha_pm_metrics_state cur_state;
 };
 
 #ifdef CONFIG_HW_MULTICORE

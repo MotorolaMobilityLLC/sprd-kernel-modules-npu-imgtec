@@ -314,7 +314,7 @@ int vha_chip_runtime_resume(struct device *dev)
 	vha_clockdomain_setup(dev);
 	vha_set_qos();
 #ifdef VHA_DEVFREQ
-	vha_devfreq_resume(dev);
+	vha_devfreq_resume();
 #endif
 
 	return 0;
@@ -323,7 +323,7 @@ int vha_chip_runtime_resume(struct device *dev)
 int vha_chip_runtime_suspend(struct device *dev)
 {
 #ifdef VHA_DEVFREQ
-	vha_devfreq_suspend(dev);
+	vha_devfreq_suspend();
 #endif
 	vha_clockdomain_unsetup(dev);
 	vha_powerdomain_unsetup();

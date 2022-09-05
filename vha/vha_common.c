@@ -1347,9 +1347,8 @@ int vha_add_dev(struct device *dev,
 #endif
 
 #ifdef VHA_DEVFREQ
-	if (vha_devfreq_init(vha)) {
+	if (vha_devfreq_init(dev)) {
 		dev_warn(dev, "%s: init devfreq failed\n", __func__);
-		vha->devfreq = NULL;
 	}
 #endif
 
@@ -1427,8 +1426,7 @@ void vha_rm_dev(struct device *dev)
 		}
 	}
 #ifdef VHA_DEVFREQ
-	if (vha->devfreq)
-		vha_devfreq_term(vha);
+	vha_devfreq_term(dev);
 #endif
 	vha_free_common(vha);
 #ifdef CONFIG_HW_MULTICORE

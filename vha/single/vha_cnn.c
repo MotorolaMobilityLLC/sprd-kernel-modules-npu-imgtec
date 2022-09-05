@@ -327,8 +327,7 @@ hw_kick:
 	GETNSTIMEOFDAY(&cmd->hw_proc_start);
 	vha->stats.hw_proc_start = cmd->hw_proc_start;
 #ifdef VHA_DEVFREQ
-	if (vha->devfreq)
-		vha_update_dvfs_state(vha, true);
+	vha_update_dvfs_state(true);
 #endif
 	/* Need to generate proper pdump */
 	if (cmd->queued &&

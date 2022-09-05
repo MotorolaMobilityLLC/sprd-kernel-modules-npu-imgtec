@@ -444,8 +444,7 @@ irqreturn_t vha_handle_irq(struct device *dev)
 			vha->stats.hw_proc_end_prev = vha->stats.hw_proc_end;
 			GETNSTIMEOFDAY(&vha->stats.hw_proc_end);
 #ifdef VHA_DEVFREQ
-			if (vha->devfreq)
-				vha_update_dvfs_state(vha, false);
+			vha_update_dvfs_state(false);
 #endif
 		} else {
 			/* Command may have been aborted before this handler is executed */
