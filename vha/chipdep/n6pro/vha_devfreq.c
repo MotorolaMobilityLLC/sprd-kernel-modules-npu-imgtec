@@ -23,15 +23,10 @@
 #include <linux/thermal.h>
 #include <linux/version.h>
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5,15,0)
-#include <linux/sprd_npu_cooling.h>
-#else
-#include <linux/unisoc_npu_cooling.h>
-#endif
-
 #include "vha_common.h"
 #include "vha_chipdep.h"
 #include "vha_devfreq.h"
+#include "vha_cooling.h"
 
 #define VHA_POLL_MS           100
 #define VHA_UPTHRESHOLD       85
@@ -54,7 +49,6 @@ struct npu_dvfs_context {
 	int npu_dvfs_on;
 	int max_on;
 	bool dvfs_init;
-	bool cooling_device;
 	bool high_temp;
 	struct semaphore *sem;
 	struct vha_ops ops;
@@ -71,7 +65,6 @@ static struct npu_dvfs_context npu_dvfs_ctx=
 	.npu_dvfs_on = 0,
 	.max_on = 0,
 	.dvfs_init = false,
-	.cooling_device = false,
 	.max_freq_khz = 0,
 	.max_state = 0,
 	.high_temp = false,
@@ -370,7 +363,7 @@ static int vha_devfreq_status(struct device *dev, struct devfreq_dev_status *sta
 	state->current_frequency = npu_dvfs_ctx.last_freq_khz * 1000UL;
 	state->private_data = NULL;
 
-	if (!npu_dvfs_ctx.cooling_device || IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz) ||
+	if (IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz) ||
 			!npu_dvfs_ctx.npu_tz->ops->get_temp)
 		goto out;
 
@@ -447,11 +440,7 @@ int vha_devfreq_init(struct vha_dev *vha)
 		goto devfreq_register_opp_notifier_failed;
 	}
 
-	ret = npu_cooling_device_register(vha->devfreq);
-	if (ret) {
-		dev_err(vha->dev, "Failed to register npu cooling device\n");
-		goto npu_cooling_device_register_failed;
-	}
+	vha_cooling_register(vha->devfreq);
 
 	npu_dvfs_ctx.npu_tz = thermal_zone_get_zone_by_name("ai0-thmzone");
 	if (IS_ERR_OR_NULL(npu_dvfs_ctx.npu_tz)) {
@@ -460,13 +449,11 @@ int vha_devfreq_init(struct vha_dev *vha)
 		goto get_ai_thermal_zone_failed;
 	}
 
-	npu_dvfs_ctx.cooling_device = true;
 	npu_dvfs_ctx.dvfs_init = true;
 	return ret;
 
 get_ai_thermal_zone_failed:
-	npu_cooling_device_unregister();
-npu_cooling_device_register_failed:
+	vha_cooling_unregister();
 	devfreq_unregister_opp_notifier(vha->dev, vha->devfreq);
 devfreq_register_opp_notifier_failed:
 	devm_devfreq_remove_device(vha->dev, vha->devfreq);
@@ -486,10 +473,7 @@ void vha_devfreq_term(struct vha_dev *vha)
 {
 	dev_dbg(vha->dev, "Term NPU devfreq\n");
 
-	if (npu_dvfs_ctx.cooling_device)
-		npu_cooling_device_unregister();
-
-	npu_dvfs_ctx.cooling_device = false;
+	vha_cooling_unregister();
 
 	devfreq_unregister_opp_notifier(vha->dev, vha->devfreq);
 	npu_dvfs_ctx.dvfs_init = false;

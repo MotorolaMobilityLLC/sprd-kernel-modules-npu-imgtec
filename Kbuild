@@ -34,6 +34,12 @@ ccflags-y                += -DOSID=0
 ccflags-y                += -DVHA_DEVFREQ
 ccflags-y                += -DVHA_USE_LO_PRI_SUB_SEGMENTS
 ccflags-y                += -DDEFAULT_SYMBOL_NAMESPACE=VHA_CORE
+ifdef CONFIG_SPRD_NPU_COOLING_DEVICE
+  ccflags-y                += -DSPRD_NPU_COOLING
+else ifdef CONFIG_UNISOC_NPU_COOLING_DEVICE
+  ccflags-y                += -DUNISOC_NPU_COOLING
+endif
+
 #
 # Final Objects
 #
