@@ -226,6 +226,8 @@ int vha_dvfs_ctx_init(struct device *dev)
 	npu_dvfs_ctx.ops.get_opp = ops->get_opp;
 	npu_dvfs_ctx.ops.set_volts = ops->set_volts;
 
+	spin_lock_init(&npu_dvfs_ctx.cur_state.lock);
+
 	ret = sysfs_create_group(&(dev->kobj), &dev_attr_group);
 	if (ret) {
 		dev_err(dev, "sysfs create fail: %d\n", ret);
