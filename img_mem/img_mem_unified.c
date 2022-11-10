@@ -64,6 +64,7 @@
 
 static int trace_physical_pages;
 static int trace_mmap_fault;
+static int orders[3] = {8, 4, 0};
 
 struct buffer_data {
 	struct sg_table *sgt;
@@ -489,7 +490,7 @@ static int unified_alloc(struct device *device, struct heap *heap,
 	struct page *page, *tmp_page;
 	struct list_head pages_list;
 	int pages = 0;
-	int ret;
+	int ret, i;
 	int min_order = heap->options.unified.min_order;
 	int max_order = heap->options.unified.max_order;
 
@@ -513,9 +514,9 @@ static int unified_alloc(struct device *device, struct heap *heap,
 		 * When system already run out of chunks with specific order,
 		 * try with lower, but not less than min_order constraint.
 		 */
-		max_order = min(max_order, get_order(size));
-		for (order = max_order; order >= min_order; order--) {
+		for(i = 0; i < sizeof(orders) / sizeof(orders[0]); i++) {
 			int page_order;
+			order = min(orders[i], get_order(size));
 
 			page = alloc_pages(heap->options.unified.gfp_type |
 					__GFP_COMP | __GFP_NOWARN, order);
