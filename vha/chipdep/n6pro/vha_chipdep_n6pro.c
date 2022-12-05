@@ -58,7 +58,7 @@ static void qos_parameters_set(QOS_REG_T array[])
 	length = get_qos_array_length(array);
 	for (i = 0; i < length; i++) {
 		addr = ioremap(array[i].base_addr, 4);
-		writel(readl(addr) & (~array[i].mask_value) | array[i].set_value, addr);
+		writel((readl(addr) & (~array[i].mask_value)) | array[i].set_value, addr);
 		iounmap(addr);
 	}
 }
