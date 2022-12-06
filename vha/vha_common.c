@@ -1972,7 +1972,11 @@ void vha_chk_cmd_queues(struct vha_dev *vha, bool threaded)
 		 * so it is not necessary to do any kind of rescheduling,
 		 * as it will be executed anyway!
 		 */
-		queue_work(vha->cmd_wq, &vha->worker);  /* call asynchronously */
+/// Begin Modification of UNISOC ///
+		/* the queue_work is slower than schedule_work as tested */
+		schedule_work(&vha->worker);
+		//queue_work(vha->cmd_wq, &vha->worker);  /* call asynchronously */
+/// End Modification of UNISOC ///
 	} else {
 		/* Direct calls must be always invoked
 		 * with vha_dev.lock == locked
