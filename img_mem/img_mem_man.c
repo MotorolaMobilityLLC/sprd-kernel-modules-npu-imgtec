@@ -738,7 +738,7 @@ int img_mem_import(struct device *device, struct mem_ctx *ctx, int heap_id,
 	if (cpu_ptr)
 		_img_mem_put_pages(size, pages);
 
-	pr_info("%s fd %d / cpu_ptr %#llx heap %d (%s) buffer %d size %zu\n", __func__,
+	pr_debug("%s fd %d / cpu_ptr %#llx heap %d (%s) buffer %d size %zu\n", __func__,
 		buf_fd, cpu_ptr, heap_id, get_heap_name(heap->type), *buf_id, size);
 
 	return 0;
