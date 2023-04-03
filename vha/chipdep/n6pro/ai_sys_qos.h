@@ -1,3 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2021 Unisoc Inc.
+ */
+
 #ifndef __AI_SYS_QOS_H_
 #define __AI_SYS_QOS_H_
 

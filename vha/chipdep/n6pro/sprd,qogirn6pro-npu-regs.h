@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Copyright (C) 2021 Unisoc Inc.
+ */
 
 /*********************************** ai_apb REGS, phy_addr=0x27000000 ************************************/
 #define REG_AI_APB_APB_EB                                             0x0000
