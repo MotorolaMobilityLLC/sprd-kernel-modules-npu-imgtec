@@ -34,6 +34,8 @@
 #include "sprd,qogirn6pro-npu-regs.h"
 #include "sprd,qogirn6pro-npu-mask.h"
 
+#define MASK_AI_SOFT_RST_SEL 0x100
+
 struct npu_regmap{
 	struct regmap *ai_apb_regs;
 	struct regmap *pmu_apb_regs;
@@ -251,14 +253,34 @@ static int vha_clockdomain_init(struct device *dev)
 	return 0;
 }
 
+static inline void ai_soft_rst(void)
+{
+	regmap_update_bits(ai_regs.pmu_apb_regs, REG_PMU_APB_SOFT_RST_SEL_0,
+				MASK_AI_SOFT_RST_SEL, MASK_AI_SOFT_RST_SEL);
+	regmap_update_bits(ai_regs.pmu_apb_regs, REG_PMU_APB_SYS_SOFT_RST_0,
+				MASK_PMU_APB_AI_SOFT_RST, MASK_PMU_APB_AI_SOFT_RST);
+	udelay(50);
+	regmap_update_bits(ai_regs.pmu_apb_regs, REG_PMU_APB_SYS_SOFT_RST_0,
+				MASK_PMU_APB_AI_SOFT_RST, 0);
+	udelay(50);
+}
+
 static int vha_clockdomain_setup(struct device *dev)
 {
 	int num_clks = ARRAY_SIZE(clks);
-	int ret = 0;
+	int ret;
 
-	ret = clk_bulk_prepare_enable(num_clks, clks);
+	ret = clk_bulk_prepare_enable(2, &clks[0]);
 	if (ret) {
-		dev_err(dev, "clk_bulk_prepare_enable failed, ret %d\n", ret);
+		dev_err(dev, "aon enable ai failed: %d\n", ret);
+		return ret;
+	}
+
+	ai_soft_rst();
+
+	ret = clk_bulk_prepare_enable(num_clks - 2, &clks[2]);
+	if (ret) {
+		dev_err(dev, "ai apb enable failed: %d\n", ret);
 		return ret;
 	}
 
@@ -281,7 +303,6 @@ int vha_chip_init(struct device *dev)
 	device_set_wakeup_capable(dev, true);
 	device_wakeup_enable(dev);
 	vha_init_regs(dev);
-	vha_powerdomain_setup(dev);
 	vha_clockdomain_init(dev);
 #ifdef VHA_DEVFREQ
 	vha_dvfs_ctx_init(dev);
